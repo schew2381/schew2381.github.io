@@ -15,6 +15,32 @@ A normal index build can take a single consistent snapshot, scan the table, and 
 
 PostgreSQL's answer: two table scans with a state transition between them.
 
+## The overview
+
+```
+ indisready=false                          indisready=true
+ indisvalid=false                          indisvalid=false
+ ◄──────────────────────────────────────── ──────────────────────────────────────────►
+
+ Txn 1           Txn 2                     Txn 3              Txn 4          Txn 5
+ ┌──────────┐   ┌─────────────────────┐   ┌──────────────┐   ┌───────────┐  ┌──────┐
+ │ Create    │   │ First table scan    │   │ Second table │   │ Wait for  │  │ Set  │
+ │ catalog   │   │ (build index from   │   │ scan (find & │   │ old       │  │index │
+ │ entry     │   │  all visible rows)  │   │ insert rows  │   │ snapshots │  │valid │
+ │           │   │                     │   │ missed by    │   │           │  │      │
+ │           │   │ Set indisready=true │   │ first scan)  │   │           │  │      │
+ └─────┬─────┘   └──────────┬──────────┘   └──────┬───────┘   └─────┬─────┘  └──┬───┘
+       │                    │                      │                 │            │
+    COMMIT              COMMIT                  COMMIT           COMMIT       COMMIT
+       │                    │                      │                 │
+       ▼                    ▼                      ▼                 ▼
+   Wait for            Wait for               (reference         Wait for
+   old writers         txns that saw           snapshot           txns with older
+   to finish           indisready=false        taken here)        snapshots
+```
+
+During the first scan, concurrent writes **skip the index entirely** — `indisready` is false. After the first scan commits with `indisready=true`, all new DML starts maintaining the index. The second scan then catches the gap: rows written during the first scan that never made it into the index.
+
 ## The five transactions
 
 The entire operation spans [five separate transactions](https://github.com/postgres/postgres/blob/master/src/backend/commands/indexcmds.c#L1628-L1835) with three wait-for-transactions barriers between them. Two important flags on [`pg_index`](https://github.com/postgres/postgres/blob/master/src/include/catalog/pg_index.h) control the index's lifecycle:
