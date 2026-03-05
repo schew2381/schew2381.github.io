@@ -1,8 +1,8 @@
 ---
 title: "How PostgreSQL Builds Indexes Without Blocking Writes"
 date: 2026-03-04 18:00:00 -0800
-categories: [PostgreSQL, Internals]
-tags: [postgres, indexes, concurrency, locks]
+categories: [postgres, internals]
+tags: [postgres, index, database, locks]
 ---
 
 When you run `CREATE INDEX` on a production table, PostgreSQL takes a `SHARE` lock for the entire duration. That lock blocks all writes. For a large table, this can mean minutes or hours of downtime.
