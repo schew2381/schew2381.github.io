@@ -5,13 +5,13 @@ categories: [postgres, internals]
 tags: [postgres, index, database, locks]
 ---
 
-`CREATE INDEX` takes a `SHARE` lock on the table for the entire build. That blocks all writes — minutes or hours of downtime for large tables.
+`CREATE INDEX` takes a `SHARE` lock on the table for the entire build. That blocks all writes, which could be minutes or hours of downtime for large tables.
 
 `CREATE INDEX CONCURRENTLY` avoids this by splitting the work across multiple transactions with weaker locks. The internal mechanism is non-trivial. This post traces through the [source code](https://github.com/postgres/postgres/blob/master/src/backend/catalog/index.c#L3284-L3346) to explain exactly what happens.
 
 ## The core problem
 
-A normal index build takes a consistent snapshot, scans the table, and builds the index. Allowing concurrent writes breaks this — rows can be inserted, updated, or deleted mid-scan. PostgreSQL solves this with two table scans and a state transition between them.
+A normal index build takes a consistent snapshot, scans the table, and builds the index. Allowing concurrent writes breaks this because rows can be inserted, updated, or deleted mid-scan. PostgreSQL solves this with two table scans and a state transition between them.
 
 ## The overview
 
@@ -37,7 +37,7 @@ A normal index build takes a consistent snapshot, scans the table, and builds th
    to finish           indisready=false        taken here)        snapshots
 ```
 
-During the first scan, concurrent writes **skip the index entirely** — `indisready` is false. After the first scan commits with `indisready=true`, all new DML starts maintaining the index. The second scan catches the gap: rows written during the first scan that never made it into the index.
+During the first scan, concurrent writes **skip the index entirely** because `indisready` is false. After the first scan commits with `indisready=true`, all new DML starts maintaining the index. The second scan catches the gap: rows written during the first scan that never made it into the index.
 
 ## The five transactions
 
@@ -54,11 +54,11 @@ Both start as `false`.
 indisready=false, indisvalid=false
 ```
 
-[Creates the index entry](https://github.com/postgres/postgres/blob/master/src/backend/commands/indexcmds.c#L1628-L1652) in `pg_index` and `pg_class`. The index is visible in the catalog but inert — nothing reads from it, nothing writes to it. Commit.
+[Creates the index entry](https://github.com/postgres/postgres/blob/master/src/backend/commands/indexcmds.c#L1628-L1652) in `pg_index` and `pg_class`. The index is visible in the catalog but inert so nothing reads from it, nothing writes to it. Commit.
 
 ### Wait 1: Drain old writers
 
-[`WaitForLockers()`](https://github.com/postgres/postgres/blob/master/src/backend/commands/indexcmds.c#L1692) blocks until every transaction that had the table open *before* the index existed has finished. After this, all active transactions see the new index in the catalog. This is required for HOT chain safety — no new HOT updates can break the index's key columns.
+[`WaitForLockers()`](https://github.com/postgres/postgres/blob/master/src/backend/commands/indexcmds.c#L1692) blocks until every transaction that had the table open *before* the index existed has finished. After this, all active transactions see the new index in the catalog. This is required for HOT chain safety so no new HOT updates can break the index's key columns.
 
 ### Transaction 2: First table scan
 
@@ -79,7 +79,7 @@ Concurrent DML **ignores the index completely** during the first scan. Rows writ
 
 ### Wait 2: Drain transactions that missed the index
 
-[`WaitForLockers()`](https://github.com/postgres/postgres/blob/master/src/backend/commands/indexcmds.c#L1739) again — this time waiting for all transactions that saw `indisready=false`. After this, every active transaction's DML is maintaining the index.
+[`WaitForLockers()`](https://github.com/postgres/postgres/blob/master/src/backend/commands/indexcmds.c#L1739) again, this time waiting for all transactions that saw `indisready=false`. After this, every active transaction's DML is maintaining the index.
 
 ### Transaction 3: Second table scan (validation)
 
@@ -129,7 +129,7 @@ The "wait for all transactions" barriers use **virtual transaction ID locks**:
 1. Snapshot the list of all running virtual xids
 2. Acquire a `ShareLock` on each one
 3. Each running transaction holds an `ExclusiveLock` on its own virtual xid
-4. SHARE conflicts with EXCLUSIVE — the request blocks until that transaction ends
+4. SHARE conflicts with EXCLUSIVE so the request blocks until that transaction ends
 
 This is why `CREATE INDEX CONCURRENTLY` can appear to hang: it waits for *every* open transaction, including ones touching completely unrelated tables. These waits are visible in `pg_stat_activity` via `pg_blocking_pids()`.
 
@@ -172,7 +172,7 @@ The [source code](https://github.com/postgres/postgres/blob/master/src/backend/c
  */
 ```
 
-The B-tree rechecks whether the conflicting tuple is still live before reporting the error — this avoids false positives from concurrent UPDATEs where old and new versions of the *same* row both appear.
+The B-tree rechecks whether the conflicting tuple is still live before reporting the error. This avoids false positives from concurrent UPDATEs where old and new versions of the *same* row both appear.
 
 If both rows are genuinely live duplicates, `CREATE INDEX CONCURRENTLY` **fails** and leaves an invalid index:
 
@@ -191,7 +191,7 @@ The race window only exists during the first scan. Once the second scan begins, 
 
 ## Lock strength
 
-The only table-level lock held throughout is `ShareUpdateExclusiveLock` — one of the weakest modes. It conflicts only with DDL and other concurrent index builds, not with reads or writes.
+The only table-level lock held throughout is `ShareUpdateExclusiveLock`, one of the weakest modes. It conflicts only with DDL and other concurrent index builds, not with reads or writes.
 
 | Lock Mode | Blocks Reads | Blocks Writes | Blocks DDL |
 |---|---|---|---|
