@@ -1763,9 +1763,30 @@
   const courseSearchIndex = searchEntries();
 
   function matchingSearchEntries(query) {
-    const words = query.toLowerCase().trim().split(/\s+/).filter(Boolean);
+    const normalizedQuery = query.toLowerCase().trim();
+    const words = normalizedQuery.split(/\s+/).filter(Boolean);
     if (!words.length) return courseSearchIndex.slice(0, 12);
-    return courseSearchIndex.filter((entry) => words.every((word) => entry.terms.toLowerCase().includes(word))).slice(0, 20);
+    return courseSearchIndex
+      .map((entry, index) => {
+        const title = entry.title.toLowerCase();
+        const description = entry.description.toLowerCase();
+        const matches = words.every((word) => entry.terms.toLowerCase().includes(word));
+        const score =
+          title === normalizedQuery
+            ? 0
+            : title.startsWith(normalizedQuery)
+              ? 1
+              : words.every((word) => title.includes(word))
+                ? 2
+                : words.every((word) => description.includes(word))
+                  ? 3
+                  : 4;
+        return { entry, index, matches, score };
+      })
+      .filter(({ matches }) => matches)
+      .sort((left, right) => left.score - right.score || left.index - right.index)
+      .slice(0, 20)
+      .map(({ entry }) => entry);
   }
 
   function renderSearchResults(query = "") {
