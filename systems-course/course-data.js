@@ -1,8 +1,19 @@
 window.COURSE = {
   version: 1,
+  contentRevision: "2026-07-15",
   title: "Below the Pod",
   subtitle: "From Linux primitives to Kubernetes placement",
   totalMinutes: 607,
+  verified: {
+    date: "July 15, 2026",
+    scope: [
+      "Linux kernel docs + man-pages 6.18",
+      "Kubernetes v1.36",
+      "Firecracker v1.16.1",
+      "Cloud Hypervisor v53.0",
+      "Kata Containers v3.32.0"
+    ]
+  },
   stackLayers: [
     {
       id: "cluster",
@@ -76,7 +87,7 @@ window.COURSE = {
           title: "What the kernel does",
           duration: 22,
           summary: "The kernel is the privileged program that turns hardware into controlled services for processes.",
-          prediction: "A Go program calls os.Read. Which instruction crosses the privilege boundary: the Go call, the libc wrapper, or the syscall instruction?",
+          prediction: "A Go program calls f.Read on an *os.File. Which step crosses the privilege boundary: the Go method, the runtime syscall wrapper, or the architecture syscall instruction?",
           core: [
             "A Linux process executes normal instructions in user mode. It cannot program a disk controller, replace a page table, or schedule another process directly. The kernel runs in a more privileged CPU mode and owns those operations.",
             "A system call is a deliberate request from a process. A page fault is a CPU exception caused by the current instruction. A hardware interrupt arrives from outside that instruction stream. All three can transfer control to kernel code, but their causes and return paths differ.",
@@ -90,7 +101,7 @@ window.COURSE = {
           ],
           kernel: [
             "Entry code saves enough userspace state to return later, switches to a kernel stack, validates arguments, and dispatches the requested operation. A blocking call may put the task to sleep so another runnable task can use the CPU.",
-            "Drivers translate generic kernel requests into device operations. DMA lets a device transfer bytes to or from memory without asking the CPU to copy each byte. Completion usually arrives through an interrupt or a polled queue."
+            "Drivers translate generic kernel requests into device operations. DMA lets a device transfer bytes to or from memory without asking the CPU to copy each byte. A completion may wake a waiting task, schedule deferred work, or be collected by polling."
           ],
           bridge: { title: "Why Kubernetes engineers care", text: "Every Pod eventually becomes processes that compete through one node kernel. CPU limits, memory faults, network rules, and storage mounts work only because the kernel enforces them." },
           failure: { title: "Common model error", text: "A container does not contain a second Linux kernel in the usual runtime model. A VM does. That one boundary explains many isolation and compatibility differences later in the course." },
@@ -190,7 +201,7 @@ window.COURSE = {
           core: [
             "A new network namespace begins with its own loopback interface and network stack state. Physical or virtual interfaces can move into it. A veth pair acts like a cable whose two endpoints can live in different namespaces.",
             "Container networking commonly places one veth endpoint in the Pod namespace and the peer in the host namespace. The host side connects through a bridge, routes, an eBPF datapath, or another CNI implementation. IP address management and routing make the Pod reachable.",
-            "All containers in a normal Pod share the Pod network namespace, so they share an IP address, port space, routes, and localhost. They can still run separate processes, mounts, and container cgroups."
+            "All containers in a normal hostNetwork:false Pod share the sandbox network namespace, so they share an IP address, port space, routes, and localhost. A hostNetwork Pod instead uses the node network namespace."
           ],
           mechanics: [
             { title: "Namespace", text: "An ownership boundary for network devices, routes, firewall rules, port numbers, and protocol state." },
@@ -200,7 +211,7 @@ window.COURSE = {
           ],
           kernel: [
             "A network device lives in exactly one network namespace at a time. Namespace file descriptors let a privileged manager create state in another namespace through setns or netlink without keeping a shell inside it.",
-            "Conntrack entries, Netfilter rules, sockets, and interface indices are namespace-scoped. Packet capture location therefore changes what headers and translations are visible."
+            "Conntrack entries, Netfilter rules, sockets, and interface indices are namespace-scoped. The runtime creates the sandbox namespace, then CNI ADD and IPAM attach and configure it. Packet capture location changes what headers and translations are visible."
           ],
           bridge: { title: "The Pod IP is kernel state", text: "Kubernetes defines the network model, while the runtime and CNI implementation create Linux interfaces, namespaces, routes, tunnels, rules, or eBPF programs that realize it." },
           failure: { title: "Capture at the right boundary", text: "A packet can have different addresses before and after NAT, encapsulation, or namespace crossing. Record the namespace and interface with every tcpdump result." },
@@ -231,7 +242,7 @@ window.COURSE = {
           summary: "Netfilter provides packet-processing hooks; iptables and nftables are user-facing rule systems that configure those hooks through different models.",
           prediction: "The iptables command exists on a modern node. Does that prove the kernel uses the old xtables backend?",
           core: [
-            "Netfilter exposes hooks as packets enter, route through, leave, or reach local protocol stacks. Rules can filter, modify, count, log, or translate packets. Conntrack records flow state used by stateful filtering and NAT.",
+            "Netfilter exposes hooks as packets enter, route through, leave, or reach local protocol stacks. Rules can filter, modify, count, log, or translate packets. NAT chooses a binding on the first tracked packet, then conntrack applies the relationship to later packets and the reply direction.",
             "iptables commands traditionally program protocol-specific tables and ordered chains through the xtables interface. nftables uses one nf_tables engine, typed expressions, sets, maps, transactions, and a unified rule language across address families.",
             "Many systems provide an iptables-nft compatibility frontend. The command still looks like iptables while it programs nftables. Separate the command syntax, kernel backend, and Kubernetes data-plane mode when debugging."
           ],
@@ -243,14 +254,14 @@ window.COURSE = {
           ],
           kernel: [
             "Ordered linear rules can become expensive as rule counts grow. Nftables sets and maps let one lookup replace many nearly identical rules. Transactions update a ruleset atomically instead of exposing partial intermediate state.",
-            "Kube-proxy can implement Service virtual IPs with iptables, IPVS, nftables, or another supported mode depending on Kubernetes version and configuration. Some CNIs replace that path with eBPF."
+            "Kube-proxy nftables mode is stable, requires Linux 5.13 or newer, and is the current upstream direction. IPVS mode is deprecated because it did not match every Service edge case. Some CNI data planes replace kube-proxy with eBPF or another implementation."
           ],
           bridge: { title: "A Service is an API plus a data plane", text: "The Service object and EndpointSlices describe intent. A node component or CNI implementation programs rules, maps, or load-balancer state that sends packets to current backends." },
           failure: { title: "Rule counters need context", text: "A zero counter can mean the packet took another hook, namespace, address family, backend, or fast path. Confirm the actual packet path before editing rules." },
           codebase: {
             title: "E2B uses both tools",
             text: "The sandbox network path uses iptables NAT and an nftables firewall. The split makes command, backend, and policy boundaries visible in real code.",
-            url: "https://github.com/e2b-dev/infra/blob/main/packages/orchestrator/pkg/sandbox/network/firewall.go",
+            url: "https://github.com/e2b-dev/infra/blob/643d726f0ff4f3fd8ac0c1592812ffa88e62e2d3/packages/orchestrator/pkg/sandbox/network/firewall.go",
             label: "E2B nftables firewall"
           },
           visual: { type: "flow", title: "Outbound packet hooks", nodes: [["Pod veth", "ingress"], ["prerouting", "DNAT?"], ["forward", "filter"], ["postrouting", "SNAT?"], ["node NIC", "leave"]] },
@@ -262,7 +273,7 @@ window.COURSE = {
           },
           sources: [
             ["nftables manual", "https://www.netfilter.org/projects/nftables/manpage.html"],
-            ["Netfilter hooks", "https://wiki.nftables.org/wiki-nftables/index.php/Netfilter_hooks"],
+            ["Linux conntrack settings", "https://docs.kernel.org/networking/nf_conntrack-sysctl.html"],
             ["Kubernetes virtual IPs", "https://kubernetes.io/docs/reference/networking/virtual-ips/"]
           ]
         },
@@ -276,12 +287,12 @@ window.COURSE = {
           core: [
             "An L4 load balancer chooses a backend from network and transport information such as source and destination addresses, ports, protocol, and connection state. It can handle TCP or UDP without understanding HTTP paths.",
             "An L7 proxy terminates or parses an application protocol. An HTTP proxy can route by host, path, method, header, or cookie, retry selected requests, enforce protocol policy, and emit request-level metrics. That requires more CPU, memory, buffering, and protocol responsibility.",
-            "Kubernetes Services provide stable endpoints for Pods and are commonly implemented at L4. Gateway API or Ingress implementations add protocol-aware routing. A cloud LoadBalancer Service can also place an external provider in front of the node path."
+            "Kubernetes Services provide stable endpoints for Pods and are commonly implemented at L4. Gateway API defines application-aware HTTPRoute and GRPCRoute, transport-level TCPRoute, and TLSRoute for TLS handshake metadata. The Ingress API is frozen, so new routing features are developed through Gateway API."
           ],
           mechanics: [
             { title: "Connection selection", text: "A backend is chosen from an address and port tuple, then connection state keeps later packets consistent." },
             { title: "Request selection", text: "An L7 proxy can choose again per request when the protocol and connection reuse allow it." },
-            { title: "TLS passthrough", text: "An L4 path forwards encrypted bytes and may inspect limited handshake metadata such as SNI only with explicit support." },
+            { title: "TLS passthrough", text: "A path can forward encrypted application bytes while parsing ClientHello metadata such as SNI. That decision is TLS-aware rather than purely opaque L4 routing." },
             { title: "TLS termination", text: "An L7 proxy decrypts traffic, owns certificates, and can inspect or modify application messages." }
           ],
           kernel: [
@@ -305,8 +316,9 @@ window.COURSE = {
           },
           sources: [
             ["Kubernetes Services", "https://kubernetes.io/docs/concepts/services-networking/service/"],
-            ["Gateway API HTTP routing", "https://gateway-api.sigs.k8s.io/guides/http-routing/"],
-            ["Gateway API TCP routing", "https://gateway-api.sigs.k8s.io/guides/tcp/" ]
+            ["Gateway API HTTP routing", "https://gateway-api.sigs.k8s.io/guides/user-guides/http-routing/"],
+            ["Gateway API TCP routing", "https://gateway-api.sigs.k8s.io/guides/user-guides/tcp/"],
+            ["Gateway API TLS routing", "https://gateway-api.sigs.k8s.io/guides/user-guides/tls-routing/"]
           ]
         }
       ],
@@ -355,8 +367,8 @@ window.COURSE = {
           prediction: "Two eBPF programs contain identical instructions but use different program types. Must the verifier allow the same helpers and context reads?",
           core: [
             "An eBPF toolchain compiles a restricted program into BPF instructions and metadata. A loader creates maps, asks the bpf syscall to load the program, receives verifier output, and attaches the accepted program to a supported hook.",
-            "Program type defines the context, helpers, return-value meaning, and attach points. XDP sees packets early in a network driver path. Tracepoints observe defined events. cgroup hooks apply policy to members. LSM programs participate in security decisions.",
-            "Maps store state shared between BPF programs and userspace. Common choices include hash maps, arrays, per-CPU maps, ring buffers, and LRU maps. Concurrency, key lifetime, update mode, memory charge, and read consistency still need design."
+            "Program type defines the context, helpers, return-value meaning, and attach-point family. An expected attach type further narrows some program families. XDP sees packets early in a network driver path, while tracepoint, cgroup, and LSM types have different contracts.",
+            "Maps store state shared between BPF programs and userspace. Common choices include shared hash maps, per-CPU maps, arrays, ring buffers, and LRU maps. Concurrency, cross-CPU ordering, key lifetime, update mode, memory charge, and read consistency still need design."
           ],
           mechanics: [
             { title: "Verifier", text: "Symbolically explores paths and tracks register, pointer, range, stack, and lifetime state against program rules." },
@@ -366,7 +378,7 @@ window.COURSE = {
           ],
           kernel: [
             "The verifier rejects uninitialized reads, invalid pointer arithmetic, out-of-bounds access, unsafe lifetime use, and paths it cannot prove within its model. Bounded loops are possible when the verifier can establish safe bounds.",
-            "CO-RE uses BTF type information and relocation so one compiled object can adapt field offsets across compatible kernels. Capability and unprivileged-BPF policy still control who may load each program type."
+            "CO-RE uses BTF type information and relocation so one compiled object can adapt field offsets across compatible kernels. File descriptors, pins, attachments, links, and bindings hold references to BPF objects. BPF tokens can delegate selected commands, map types, program types, and attach types from a privileged manager."
           ],
           bridge: { title: "Kubernetes datapaths and observability", text: "CNI implementations can attach eBPF at traffic hooks, while tracing agents use it to connect kernel events with cgroup and Pod identity. The Kubernetes API remains separate from the kernel program." },
           failure: { title: "Verified means accepted properties", text: "The verifier enforces defined safety rules for a kernel and program type. It does not prove business logic, policy intent, low overhead, or freedom from kernel defects." },
@@ -431,7 +443,7 @@ window.COURSE = {
       title: "Placement, interference, and devices",
       shortTitle: "Fleet scheduling",
       duration: 70,
-      color: "#ff624a",
+      color: "#b93828",
       soft: "#ffebe7",
       description: "Filter and score nodes from requests, pack resources deliberately, then confront the runtime interference that placement math cannot see.",
       outcomes: [
@@ -450,8 +462,8 @@ window.COURSE = {
           prediction: "A node uses 10% of its CPU but already has CPU requests equal to allocatable capacity. Is a new requested CPU guaranteed to fit?",
           core: [
             "The scheduler processes one pending Pod through a scheduling cycle. Filter plugins remove nodes that violate resource, affinity, topology, taint, volume, or policy requirements. Score plugins rank the remaining nodes. The selected node is reserved and bound through the framework's later extension points.",
-            "For ordinary CPU and memory capacity, the scheduler adds Pod requests and compares them with node allocatable resources. Live utilization does not replace that check. Extended resources, huge pages, volumes, ports, and topology add other fit dimensions.",
-            "Bin packing intentionally prefers nodes that are already more allocated so other nodes remain empty or less fragmented. NodeResourcesFit supports strategies such as MostAllocated and RequestedToCapacityRatio. Spreading pursues a different operating goal."
+            "For ordinary CPU and memory capacity, the scheduler adds effective Pod requests and compares them with node allocatable resources. Pod-level CPU, memory, and huge-page resources are beta and enabled by default in Kubernetes v1.36. Live utilization does not replace the request check.",
+            "NodeResourcesFit defaults to LeastAllocated with equal CPU and memory weights. MostAllocated and RequestedToCapacityRatio enable bin-packing behavior only when an operator configures them. Spreading and packing pursue different operating goals."
           ],
           mechanics: [
             { title: "Filter", text: "A hard feasibility test. One failed required condition removes the node from this scheduling attempt." },
@@ -493,7 +505,7 @@ window.COURSE = {
           mechanics: [
             { title: "Contention", text: "Concurrent demand exceeds a shared resource's useful capacity, increasing wait time or reducing work per unit time." },
             { title: "Interference", text: "One workload changes another's performance even when neither violates its visible resource limit." },
-            { title: "PSI", text: "The kernel measures time that some or all non-idle tasks are stalled on CPU, memory, or I/O pressure." },
+            { title: "PSI", text: "some means at least one task is stalled; full means all non-idle tasks in the measured scope are stalled together. System-level CPU full remains zero for compatibility." },
             { title: "Tail latency", text: "Rare slow requests often expose queueing and reclaim effects hidden by averages." }
           ],
           kernel: [
@@ -531,11 +543,11 @@ window.COURSE = {
           core: [
             "PCIe devices can read and write system memory through DMA. An IOMMU translates and restricts device DMA addresses, providing the memory-isolation boundary needed for safe assignment. Interrupt remapping and platform topology are part of the same trust problem.",
             "VFIO exposes an IOMMU-protected device to userspace so a VMM can map device regions, configure DMA mappings, and receive interrupts. Whole-device passthrough gives a guest direct use but reduces host sharing and can complicate reset, migration, and observability.",
-            "Sharing models differ. SR-IOV creates hardware virtual functions. Mediated devices partition through a host driver. NVIDIA MIG divides supported GPUs into isolated GPU instances but is not the same mechanism as PCIe SR-IOV. Kubernetes device plugins and Dynamic Resource Allocation advertise and assign these resources."
+            "Sharing models differ. SR-IOV creates hardware virtual functions. Mediated devices partition through a host driver. NVIDIA MIG divides supported GPUs into isolated GPU instances but is not PCIe SR-IOV. Device plugins and the GA Dynamic Resource Allocation core advertise and assign devices; CDI can describe how a runtime injects an allocated device into a container."
           ],
           mechanics: [
             { title: "IOMMU group", text: "The smallest set of devices the platform can isolate safely for DMA assignment." },
-            { title: "VFIO", text: "A kernel framework exposes protected device access and DMA mapping to a userspace VMM." },
+            { title: "VFIO and iommufd", text: "VFIO device cdevs can use iommufd as the modern device-centric I/O address-space and DMA mapping interface." },
             { title: "Device plugin", text: "A node agent advertises extended resources and passes allocation details to kubelet and the runtime." },
             { title: "DRA", text: "Kubernetes APIs coordinate structured device claims, classes, allocation, and scheduling information." }
           ],
@@ -628,7 +640,7 @@ window.COURSE = {
             { title: "VM exit", text: "A transition from guest execution to the host when an operation needs virtualization handling." }
           ],
           kernel: [
-            "Address translation can involve guest virtual to guest physical mappings plus host mappings from guest physical to host physical memory. Hardware nested page tables cache the combined result but still add miss and invalidation costs.",
+            "Hardware walks guest and second-stage page tables. TLBs and paging-structure caches retain resulting or intermediate translations, but misses and invalidations can cost more than in a single-stage mapping.",
             "A vCPU is usually represented by a host thread. Host scheduling, cgroups, affinity, NUMA placement, and oversubscription therefore influence guest timing."
           ],
           bridge: { title: "Container versus VM", text: "An ordinary container shares the host kernel. A VM runs a guest kernel. Kata combines a container workflow with a VM boundary, which makes both models necessary." },
@@ -864,7 +876,7 @@ window.COURSE = {
       title: "Cloud VMMs and Kata",
       shortTitle: "Cloud VMMs",
       duration: 57,
-      color: "#d2537a",
+      color: "#a63359",
       soft: "#f9e5ec",
       description: "Compare a minimal microVM, a cloud-focused VMM, and a Kubernetes runtime that wraps containers in VM isolation.",
       outcomes: [
@@ -883,7 +895,7 @@ window.COURSE = {
           prediction: "Firecracker uses KVM and virtio. Does that make it a kernel module or a userspace process?",
           core: [
             "One Firecracker process encapsulates one microVM. An API thread handles configuration, a VMM thread owns the machine and device model, and one host thread per vCPU enters KVM_RUN.",
-            "The guest receives a minimal set of devices centered on virtio block, network, vsock, balloon, and limited legacy support. Host TAP devices back network interfaces, while host files or configured backends provide block storage.",
+            "Firecracker v1.16.1 supports virtio block, network, vsock, balloon, RNG, pmem, and virtio-mem devices. Memory hotplug is supported. PCI virtio block, pmem, and network hotplug are a developer preview with explicit guest coordination.",
             "The jailer adds process isolation through chroot, namespaces, cgroups, privilege dropping, and resource setup. KVM supplies the virtualization boundary, while seccomp and the jailer reduce the host process's reach."
           ],
           mechanics: [
@@ -912,9 +924,10 @@ window.COURSE = {
             explanation: "Each vCPU has a host thread that enters the KVM_RUN loop."
           },
           sources: [
-            ["Firecracker design", "https://github.com/firecracker-microvm/firecracker/blob/main/docs/design.md"],
-            ["Firecracker getting started", "https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md"],
-            ["Firecracker jailer", "https://github.com/firecracker-microvm/firecracker/blob/main/docs/jailer.md"]
+            ["Firecracker v1.16.1 release", "https://github.com/firecracker-microvm/firecracker/releases/tag/v1.16.1"],
+            ["Firecracker device hotplug", "https://github.com/firecracker-microvm/firecracker/blob/v1.16.1/docs/device-hotplug.md"],
+            ["Firecracker memory hotplug", "https://github.com/firecracker-microvm/firecracker/blob/v1.16.1/docs/memory-hotplug.md"],
+            ["Firecracker design", "https://github.com/firecracker-microvm/firecracker/blob/v1.16.1/docs/design.md"]
           ]
         },
         {
@@ -922,10 +935,10 @@ window.COURSE = {
           number: "22",
           title: "Cloud Hypervisor",
           duration: 17,
-          summary: "Cloud Hypervisor is a Rust, KVM-based VMM for modern cloud workloads with a broader feature set than a minimal microVM model.",
+          summary: "Cloud Hypervisor is a Rust VMM for modern 64-bit cloud workloads that runs on KVM or Microsoft Hypervisor with backend-dependent feature coverage.",
           prediction: "A workload needs CPU hotplug, virtio-fs, and VFIO passthrough. Which direction fits better: a minimal fixed microVM or a cloud VMM with those device features?",
           core: [
-            "Cloud Hypervisor focuses on Linux and Windows cloud guests on KVM. It shares rust-vmm components with other VMMs while pursuing general cloud VM features such as CPU, memory, and device hotplug.",
+            "Cloud Hypervisor focuses on modern 64-bit Linux and Windows cloud guests on KVM or Microsoft Hypervisor. It shares rust-vmm components with other VMMs while supporting CPU, memory, and PCI hotplug with backend-dependent coverage.",
             "Its device model includes virtio block, network, fs, pmem, vsock, balloon, and console paths, with vhost-user and VFIO options. An HTTP API and command-line interface control VM lifecycle and devices.",
             "Compared with Firecracker, Cloud Hypervisor accepts more device and lifecycle scope for workloads that need resizing, filesystem sharing, hotplug, confidential-computing features, or passthrough. Compared with QEMU, it supports a narrower set of architectures and legacy devices."
           ],
@@ -949,6 +962,7 @@ window.COURSE = {
             explanation: "Cloud Hypervisor targets broader cloud VM device and lifecycle needs, including hotplug and VFIO."
           },
           sources: [
+            ["Cloud Hypervisor v53.0", "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/tag/v53.0"],
             ["Cloud Hypervisor project", "https://github.com/cloud-hypervisor/cloud-hypervisor"],
             ["Cloud Hypervisor docs", "https://www.cloudhypervisor.org/docs/"],
             ["Cloud Hypervisor hotplug", "https://github.com/cloud-hypervisor/cloud-hypervisor/blob/main/docs/hotplug.md"]
@@ -962,9 +976,9 @@ window.COURSE = {
           summary: "Kata integrates a lightweight VM boundary into a container runtime workflow so Kubernetes can select it through RuntimeClass.",
           prediction: "A two-container Kata Pod starts. Does Kata normally create one VM per container or one VM for the Pod sandbox?",
           core: [
-            "Kata implements a containerd or CRI-compatible runtime path that creates a VM for the Pod sandbox. The configured VMM can be QEMU, Cloud Hypervisor, Firecracker, or another supported backend. A guest kernel boots inside that VM.",
+            "Kata implements a containerd or CRI-compatible runtime path that creates a VM for the Pod sandbox. Kata 3.32.0 supports QEMU, Cloud Hypervisor, Firecracker, and its built-in Dragonball VMM. The release guide recommends Dragonball for most runtime-rs users.",
             "A Kata agent runs in the guest and creates the workload containers inside the VM. The host runtime shim communicates with the agent, commonly over vsock, and carries lifecycle requests plus standard I/O between the container manager and guest.",
-            "Kubernetes selects the runtime through RuntimeClass. From the control plane, the object remains a Pod. On the node, the implementation changes from host-kernel containers to containers inside a guest-kernel boundary."
+            "Kubernetes selects the runtime through RuntimeClass. From the control plane, the object remains a Pod. Kata pins VMM versions, so standalone Firecracker or Cloud Hypervisor features do not automatically exist through a given Kata release."
           ],
           mechanics: [
             { title: "Runtime shim", text: "Connects containerd's shim API to Kata lifecycle and VMM management." },
@@ -986,8 +1000,10 @@ window.COURSE = {
             explanation: "The Kata agent runs inside the guest and manages workload containers for the host runtime."
           },
           sources: [
-            ["Kata architecture", "https://github.com/kata-containers/kata-containers/blob/main/docs/design/architecture/README.md"],
-            ["Kata virtualization", "https://github.com/kata-containers/kata-containers/blob/main/docs/design/virtualization.md"],
+            ["Kata 3.32.0 release", "https://github.com/kata-containers/kata-containers/releases/tag/3.32.0"],
+            ["Kata architecture", "https://github.com/kata-containers/kata-containers/blob/3.32.0/docs/design/architecture/README.md"],
+            ["Kata virtualization", "https://github.com/kata-containers/kata-containers/blob/3.32.0/docs/design/virtualization.md"],
+            ["Kata pinned component versions", "https://github.com/kata-containers/kata-containers/blob/3.32.0/versions.yaml"],
             ["Kubernetes RuntimeClass", "https://kubernetes.io/docs/concepts/containers/runtime-class/"]
           ]
         }
@@ -1116,8 +1132,8 @@ window.COURSE = {
           summary: "Larger pages extend TLB reach and shrink page-table work, but increase allocation, fragmentation, and waste risks.",
           prediction: "How many 4 KiB pages cover the same memory as one 2 MiB huge page?",
           core: [
-            "A page-table entry and TLB entry cover one page. Increasing the page size lets the same number of translation entries cover more memory. One 2 MiB page spans 512 ordinary 4 KiB pages.",
-            "HugeTLB uses an explicitly managed pool and hugetlbfs or mapping flags. Transparent Huge Pages let the kernel promote eligible memory without the application reserving a pool. The mechanisms have different allocation and fallback behavior.",
+            "Translation structures cache mappings at supported page sizes. Increasing the page size can let the same number of translation entries cover more memory. One 2 MiB page spans 512 ordinary 4 KiB pages.",
+            "HugeTLB uses an explicitly managed pool and hugetlbfs or mapping flags. Transparent Huge Pages can use PMD-sized mappings and, on supported systems, multi-size PTE-mapped anonymous THP such as 16, 32, or 64 KiB. The mechanisms have different allocation and fallback behavior.",
             "Large pages need contiguous physical memory and can waste space when only a small part is used. Compaction, pool sizing, NUMA distribution, page faults, snapshot tracking, and cgroup accounting all affect the result."
           ],
           mechanics: [
@@ -1171,10 +1187,10 @@ window.COURSE = {
           ],
           kernel: [
             "Modern kernels can create UFFD through the syscall for permitted user-mode faults or through /dev/userfaultfd with filesystem-controlled access. Feature negotiation matters because supported events and operations vary.",
-            "A handler must track remove, remap, fork, and write-protect behavior when it manages a changing address space. Fault resolution needs page-aligned ranges even when the triggering address points inside a page."
+            "A handler must track remove, unmap, remap, fork, and write-protect behavior when it manages a changing address space. Fault resolution needs page-aligned ranges even when the triggering address points inside a page."
           ],
           bridge: { title: "Firecracker snapshot restore", text: "Firecracker can register guest-memory ranges, pass the UFFD and memory layout to an external handler, and let that handler supply snapshot pages as the guest touches them." },
-          failure: { title: "Handler liveness is memory liveness", text: "A missing-page fault can wait forever if the external handler disappears. Production designs need supervision, timeouts around setup, and a recycle path." },
+          failure: { title: "Handler liveness is memory liveness", text: "A missing-page fault can wait while the UFFD object remains registered but its handler stops servicing events. Closing the last UFFD descriptor unregisters ranges and flushes unread events, so supervision must distinguish a stalled handler from closed ownership." },
           codebase: {
             title: "E2B demand-loads guest memory",
             text: "The E2B UFFD path maps the memory layout, receives page faults, fetches the corresponding bytes, and resolves the page for Firecracker.",
@@ -1249,15 +1265,15 @@ window.COURSE = {
           number: "13",
           title: "Block devices",
           duration: 23,
-          summary: "A block device exposes addressable sectors and request semantics; a filesystem turns that space into files and directories.",
+          summary: "A block device exposes logical blocks and request semantics; a filesystem turns that space into files and directories.",
           prediction: "ext4 issues a read for logical block 900. Must the backing implementation be a physical disk?",
           core: [
-            "A Linux block device accepts reads and writes at byte or sector offsets with alignment and size constraints determined by the device stack. The kernel can stack devices for partitioning, encryption, RAID, network transport, or logical volumes.",
-            "A filesystem owns metadata that maps file offsets to filesystem blocks. VFS presents a common file API, while ext4 or another filesystem translates operations into page-cache work, journal updates, and block requests.",
+            "A Linux block device accepts reads and writes with alignment and size constraints determined by its logical and physical block sizes. The kernel can stack devices for partitioning, encryption, RAID, network transport, or logical volumes.",
+            "A filesystem owns metadata that maps file offsets to filesystem blocks. Buffered I/O and many mmap faults meet in the page cache, while direct I/O can bypass page-cache data. Ext4 or another filesystem translates misses and writes into journal and block work.",
             "NBD makes a userspace or remote implementation appear as /dev/nbdN. The kernel block layer sends protocol requests over sockets. The userspace server returns bytes or errors, while the mounted filesystem remains unaware of S3 or the Go process behind the device."
           ],
           mechanics: [
-            { title: "Sector", text: "The device addressing unit exposed through the block interface, distinct from filesystem blocks and memory pages." },
+            { title: "Block and sector units", text: "Device logical and physical blocks, filesystem blocks, memory pages, and the 512-byte accounting sector used in block statistics are distinct units." },
             { title: "Filesystem", text: "On-disk metadata and kernel code map names and file offsets onto blocks with consistency rules." },
             { title: "NBD", text: "The kernel forwards block commands over a socket so another process can implement the device." },
             { title: "CSI", text: "Kubernetes calls a storage driver to create, publish, mount, and unpublish volumes. CSI is not the data path itself." }
@@ -1296,13 +1312,13 @@ window.COURSE = {
           prediction: "An application places eight reads in the submission queue. Must they complete in submission order?",
           core: [
             "An io_uring instance exposes a submission queue and a completion queue through shared mappings. Userspace prepares submission queue entries, publishes them, and tells the kernel how much work is ready. The kernel posts completion queue entries with results.",
-            "Batching can reduce syscall traffic and keep multiple device requests in flight. Registered files or buffers, polling modes, linked operations, multishot requests, and fixed resources change particular costs. None of them means every operation avoids copying or blocking.",
+            "Batching can reduce syscall traffic and keep multiple device requests in flight. Independent operations may complete in any order. Links add selected ordering or failure relationships. None of these features means every operation avoids copying or blocking.",
             "The useful unit is the full workload. Queue depth can improve throughput on capable storage while increasing tail latency or CPU work. Kernel version, filesystem, page cache state, device, operation type, and cancellation behavior all matter."
           ],
           mechanics: [
             { title: "SQE", text: "One operation description, including opcode, file, buffer, offset, flags, and user_data." },
             { title: "CQE", text: "One completion result. user_data lets the application match it to its own operation state." },
-            { title: "Batch", text: "Several SQEs can be published before one io_uring_enter call, reducing entry overhead." },
+            { title: "Batch and SQPOLL", text: "Several SQEs can precede one io_uring_enter call. With IORING_SETUP_SQPOLL, a kernel polling thread can observe active submissions without that entry call on the common path." },
             { title: "Queue depth", text: "Multiple in-flight operations let hardware and the kernel overlap work, subject to contention and ordering needs." }
           ],
           kernel: [
@@ -1321,7 +1337,8 @@ window.COURSE = {
           sources: [
             ["io_uring(7)", "https://man7.org/linux/man-pages/man7/io_uring.7.html"],
             ["io_uring_setup(2)", "https://man7.org/linux/man-pages/man2/io_uring_setup.2.html"],
-            ["io_uring project manual", "https://www.man7.org/linux/man-pages/man7/io_uring.7.html"]
+            ["io_uring SQ polling", "https://man7.org/linux/man-pages/man7/io_uring_sqpoll.7.html"],
+            ["io_uring linked requests", "https://man7.org/linux/man-pages/man7/io_uring_linked_requests.7.html"]
           ]
         }
       ],
@@ -1364,7 +1381,7 @@ window.COURSE = {
       title: "From processes to Pods",
       shortTitle: "Processes to Pods",
       duration: 55,
-      color: "#078f7e",
+      color: "#006f63",
       soft: "#daf4ee",
       description: "Build a container from Linux controls, then follow the control plane until those controls exist on a node.",
       outcomes: [
@@ -1393,7 +1410,7 @@ window.COURSE = {
             { title: "Lifecycle", text: "The runtime creates the environment, starts PID 1 for the container, reports status, and tears resources down." }
           ],
           kernel: [
-            "clone and unshare create or join namespace membership. setns joins an existing namespace through a file descriptor. Mount operations prepare the rootfs, while cgroup filesystem writes place the process in a resource domain.",
+            "clone and unshare create new namespace contexts. setns joins an existing namespace through a file descriptor. Mount operations prepare the rootfs, while cgroup operations place the process in a resource domain.",
             "Namespace isolation is selective. A process still reaches the shared host kernel through syscalls. Kernel attack surface and ABI compatibility therefore matter for ordinary containers."
           ],
           bridge: { title: "Image versus container", text: "The image is inert content and configuration. The container is the running process environment created from it." },
@@ -1470,8 +1487,8 @@ window.COURSE = {
           summary: "Cgroups organize processes into resource domains that the kernel can account for, protect, weight, and limit.",
           prediction: "A Pod requests 500m CPU and has a 1 CPU limit. Which value influences placement, and which value can throttle runtime execution?",
           core: [
-            "A cgroup is a kernel-managed hierarchy of processes. Controllers attach resource behavior to that hierarchy. CPU controls distribute time, memory controls account and protect pages, cpusets constrain CPU and NUMA placement, and I/O controls shape block access.",
-            "Kubernetes sends resource settings through the kubelet and container runtime. The runtime writes the matching cgroup files. CPU limits can become bandwidth quotas. Memory limits can trigger cgroup-local reclaim and OOM handling. CPU requests often influence relative weight, while the scheduler uses requests for node placement.",
+            "A cgroup is one node in a kernel-managed hierarchy. Controllers attach resource behavior to that node and its descendants. CPU controls distribute time, memory controls account and protect pages, cpusets constrain CPU and NUMA placement, and I/O controls shape block access.",
+            "Kubernetes sends resource settings through kubelet and the container runtime. The runtime or systemd cgroup driver materializes requested controls in the kernel hierarchy, and kubelet plus the runtime must use compatible drivers. CPU limits can become bandwidth quotas, while memory limits drive reclaim and cgroup-local OOM handling.",
             "Cgroup v1 allowed separate controller hierarchies, which made process membership and delegation hard to reason about. Cgroup v2 uses one unified hierarchy, consistent controller rules, better delegation, and newer interfaces such as memory.low, memory.high, and pressure metrics."
           ],
           mechanics: [
@@ -1481,11 +1498,11 @@ window.COURSE = {
             { title: "Limits", text: "cpu.max and memory.max impose hard ceilings with different runtime behavior when the ceiling is reached." }
           ],
           kernel: [
-            "In v2, a process belongs to exactly one cgroup in the unified hierarchy. Controllers enabled in cgroup.subtree_control distribute resources among children. Parent constraints remain effective below the parent.",
+            "In v2, a process belongs to one cgroup in the unified hierarchy. Threaded subtrees can place individual threads for controllers that support threaded mode. Controllers enabled in cgroup.subtree_control distribute resources among children.",
             "CPU quota throttling happens over periods, so a workload can use a burst and then wait even when another CPU appears idle. Memory is not throttled in the same way. Reclaim, memory.high pressure, OOM selection, and eviction policies produce different failure shapes."
           ],
           bridge: { title: "Requests are not limits", text: "The scheduler adds requests when it checks node capacity. Runtime limits become kernel controls after placement. A low request and high real usage can still create contention." },
-          failure: { title: "Version boundary", text: "Do not map a v1 filename directly onto v2. The hierarchy and several controller semantics changed, even when the resource goal sounds similar." },
+          failure: { title: "Version boundary", text: "Kubernetes deprecated cgroup v1 in v1.35. In v1.36, kubelet refuses cgroup v1 by default unless an operator disables failCgroupV1. Do not map a v1 filename directly onto v2." },
           codebase: {
             title: "Firecracker inside a cgroup",
             text: "E2B creates a v2 cgroup, enables controllers, and starts Firecracker inside that resource domain with CLONE_INTO_CGROUP. The linked manager does not itself write CPU or memory limits.",
@@ -1550,7 +1567,7 @@ window.COURSE = {
       title: "CPU time, caches, and concurrency",
       shortTitle: "CPU + concurrency",
       duration: 60,
-      color: "#e9a83c",
+      color: "#805400",
       soft: "#fff2d6",
       description: "Connect runnable tasks, cache lines, NUMA distance, and atomic progress to the latency seen by a Pod.",
       outcomes: [
@@ -1621,7 +1638,7 @@ window.COURSE = {
           ],
           bridge: { title: "Noisy neighbors below CPU usage", text: "Two Pods can each stay within quota while contending for shared cache capacity or memory bandwidth. CPU percentage alone misses this boundary." },
           failure: { title: "Measurement rule", text: "Padding and pinning can help or waste memory. Measure the workload on the target CPU topology before treating either as a default fix." },
-          visual: { type: "flow", title: "One load through the hierarchy", nodes: [["load", "address"], ["L1", "closest"], ["L2", "private/shared"], ["LLC", "shared"], ["DRAM", "remote"]] },
+          visual: { type: "flow", title: "One load through the hierarchy", nodes: [["load", "address"], ["L1", "closest"], ["L2", "private/shared"], ["LLC", "shared"], ["DRAM", "local or remote"]] },
           check: {
             question: "What makes false sharing possible?",
             choices: ["Two variables share a cache line", "Two threads share a PID", "A page is file-backed", "A Pod has two containers"],
@@ -1654,7 +1671,7 @@ window.COURSE = {
           ],
           kernel: [
             "mbind and set_mempolicy change policies for address ranges or tasks. Page migration can move existing pages, but migration itself consumes bandwidth and may race with ongoing access.",
-            "A device also has locality through its PCIe and IOMMU attachment. A Pod with a local CPU set but a remote GPU or NIC can still cross an inter-socket link on the hot path."
+            "A device has locality through its PCIe and root-complex attachment. An IOMMU maps and isolates DMA addresses rather than establishing the device's NUMA home. A remote GPU or NIC can still cross an inter-socket link on the hot path."
           ],
           bridge: { title: "Kubernetes topology", text: "CPU Manager, Memory Manager, Device Manager, and Topology Manager cooperate after node placement. Requests alone do not express every locality requirement." },
           failure: { title: "Common model error", text: "More free memory on a remote NUMA node does not make remote access free. Capacity and locality are separate scheduling dimensions." },
@@ -1681,7 +1698,7 @@ window.COURSE = {
           core: [
             "A blocking algorithm may stop all progress when the thread holding a required lock stops. A lock-free algorithm guarantees that some operation completes in a finite number of system steps. One unlucky thread may still starve. Wait-free strengthens the guarantee so every operation completes within a bounded number of its own steps.",
             "Compare-and-swap reads a memory location, compares it with an expected value, and conditionally writes a replacement as one atomic operation. Algorithms build retry loops around that primitive. The loop still creates contention and cache-line traffic.",
-            "Correctness needs more than atomic fields. The design must define a linearization point, obey the language memory model, reclaim removed memory safely, and handle patterns such as ABA where a value changes away and back."
+            "Correctness needs more than atomic fields. A linearizable design must define a linearization point. It must also obey the language memory model, reclaim removed memory safely, and handle patterns such as ABA where a value changes away and back."
           ],
           mechanics: [
             { title: "CAS", text: "Update only when the observed value still matches the expected value, otherwise retry with fresh state." },
@@ -1717,10 +1734,10 @@ window.COURSE = {
       ],
       lab: {
         id: "scheduler-workbench",
-        title: "Run queues and cache warmth",
+        title: "Run queues and locality",
         kind: "scheduler",
         badge: "Browser model",
-        intro: "Change task weights, quotas, affinity, and working sets. Run the timeline and watch throughput, throttling, and cache warmth move separately.",
+        intro: "Change task weights, quotas, affinity, and working sets. Run the timeline and compare service share, throttling, and an explicitly illustrative locality score.",
         notebook: [
           {
             title: "Read scheduling state",

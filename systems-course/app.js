@@ -9,11 +9,13 @@
   );
   const lessonById = new Map(allLessons.map((entry) => [entry.lesson.id, entry]));
   const moduleById = new Map(course.modules.map((module) => [module.id, module]));
+  const passingScore = 75;
   const storageKey = `below-the-pod:v${course.version}`;
   const defaultState = {
     completedLessons: [],
     completedLabs: [],
     quizScores: {},
+    codeDrafts: {},
     capstoneComplete: false,
     depth: "core",
     lastRoute: "home"
@@ -25,12 +27,14 @@
   let activeIncident = { evidence: [], hypothesis: null };
   let activeSearchIndex = 0;
   let toastTimer;
+  let hasRenderedRoute = false;
 
   const view = document.querySelector("#course-view");
   const moduleNav = document.querySelector("#module-nav");
   const drawer = document.querySelector("#context-drawer");
   const breadcrumbs = document.querySelector("#breadcrumbs");
   const searchDialog = document.querySelector("#search-dialog");
+  const searchTrigger = document.querySelector("#search-trigger");
   const searchInput = document.querySelector("#search-input");
   const searchResults = document.querySelector("#search-results");
   const depthSelect = document.querySelector("#depth-select");
@@ -44,7 +48,8 @@
         ...saved,
         completedLessons: Array.isArray(saved.completedLessons) ? saved.completedLessons : [],
         completedLabs: Array.isArray(saved.completedLabs) ? saved.completedLabs : [],
-        quizScores: saved.quizScores && typeof saved.quizScores === "object" ? saved.quizScores : {}
+        quizScores: saved.quizScores && typeof saved.quizScores === "object" ? saved.quizScores : {},
+        codeDrafts: saved.codeDrafts && typeof saved.codeDrafts === "object" ? saved.codeDrafts : {}
       };
     } catch {
       return structuredClone(defaultState);
@@ -100,10 +105,28 @@
     return module.lessons.filter((lesson) => state.completedLessons.includes(lesson.id)).length;
   }
 
+  function quizPassed(module) {
+    return (state.quizScores[module.id] || 0) >= passingScore;
+  }
+
+  function moduleProgress(module) {
+    const total = module.lessons.length + 2;
+    const complete = completedLessonCount(module) + Number(state.completedLabs.includes(module.id)) + Number(quizPassed(module));
+    return { total, complete, percent: Math.round((complete / total) * 100) };
+  }
+
   function moduleComplete(module) {
     return (
       completedLessonCount(module) === module.lessons.length &&
       state.completedLabs.includes(module.id) &&
+      quizPassed(module)
+    );
+  }
+
+  function moduleStarted(module) {
+    return (
+      completedLessonCount(module) > 0 ||
+      state.completedLabs.includes(module.id) ||
       Object.hasOwn(state.quizScores, module.id)
     );
   }
@@ -113,9 +136,19 @@
     const complete =
       state.completedLessons.length +
       state.completedLabs.length +
-      Object.keys(state.quizScores).length +
+      course.modules.filter(quizPassed).length +
       Number(state.capstoneComplete);
     return { total, complete, percent: Math.round((complete / total) * 100) };
+  }
+
+  function nextCourseRoute() {
+    for (const module of course.modules) {
+      const lesson = module.lessons.find((item) => !state.completedLessons.includes(item.id));
+      if (lesson) return routeFor("lesson", lesson.id);
+      if (!state.completedLabs.includes(module.id)) return routeFor("lab", module.id);
+      if (!quizPassed(module)) return routeFor("quiz", module.id);
+    }
+    return "capstone";
   }
 
   function moduleStyle(module) {
@@ -149,6 +182,8 @@
     moduleNav.innerHTML = course.modules
       .map((module) => {
         const complete = moduleComplete(module);
+        const started = moduleStarted(module);
+        const status = complete ? "Complete" : started ? "In progress" : "Not started";
         return `
           <button
             class="module-nav-button"
@@ -158,7 +193,7 @@
           >
             <span class="nav-index">${module.number}</span>
             <span class="nav-label">${escapeHTML(module.shortTitle)}</span>
-            <span class="nav-status ${complete ? "complete" : ""}" aria-label="${complete ? "Complete" : "In progress"}"></span>
+            <span class="nav-status ${complete ? "complete" : started ? "started" : ""}" aria-label="${status}"></span>
           </button>
         `;
       })
@@ -187,8 +222,8 @@
   }
 
   function renderHome() {
-    const nextLesson = allLessons.find(({ lesson }) => !state.completedLessons.includes(lesson.id)) || allLessons[0];
     const stats = progressStats();
+    const courseComplete = stats.complete === stats.total;
     renderBreadcrumbs([{ label: "Course home" }]);
 
     view.innerHTML = `
@@ -196,21 +231,22 @@
         <section class="hero-grid" aria-labelledby="home-title">
           <div class="hero-copy">
             <span class="eyebrow">Interactive systems course</span>
+            <span class="freshness-stamp">Source audit · ${escapeHTML(course.verified.date)}</span>
             <h1 class="hero-title" id="home-title"><span>Below</span><span>the Pod</span></h1>
             <p class="hero-lede">
               Start with the Kubernetes objects you know, then trace execution down to syscalls,
               page tables, KVM, virtio queues, block requests, and CPU cache lines.
             </p>
             <div class="hero-actions">
-              <button class="primary-button" type="button" data-route="${routeFor("lesson", nextLesson.lesson.id)}">
-                ${stats.complete ? "Continue course" : "Start the systems trace"}
+              <button class="primary-button" type="button" data-route="${nextCourseRoute()}">
+                ${courseComplete ? "Review the capstone" : stats.complete ? "Continue course" : "Start the systems trace"}
               </button>
-              <button class="secondary-button" type="button" data-route="module/kernel-boundary">View course map</button>
+              <button class="secondary-button" type="button" data-route="module/kernel-boundary">Open module 1</button>
             </div>
             <ul class="hero-facts" aria-label="Course facts">
-              <li>30 lessons</li>
-              <li>10 workbenches</li>
-              <li>10 retrieval checks</li>
+              <li>${allLessons.length} lessons</li>
+              <li>${course.modules.length} workbenches</li>
+              <li>${course.modules.length} retrieval checks</li>
               <li>1 incident capstone</li>
             </ul>
           </div>
@@ -237,6 +273,36 @@
           </div>
         </section>
 
+        <section aria-labelledby="routes-title">
+          <div class="section-heading">
+            <span class="eyebrow">Choose an entry point</span>
+            <h2 id="routes-title">Follow the dependency order or start at your working boundary</h2>
+            <p>The full path starts with Linux. The shorter routes assume you already know the earlier layers and keep every lesson available in the course map.</p>
+          </div>
+          <div class="route-grid">
+            <button class="route-card" type="button" data-route="lesson/kernel">
+              <span>Full foundation</span>
+              <strong>Linux to Kubernetes</strong>
+              <small>Start with privilege, processes, memory, files, and devices.</small>
+            </button>
+            <button class="route-card" type="button" data-route="lesson/container">
+              <span>Runtime trace</span>
+              <strong>Container to kernel</strong>
+              <small>Start where an OCI bundle becomes processes and isolation policy.</small>
+            </button>
+            <button class="route-card" type="button" data-route="lesson/virtual-machines">
+              <span>Virtualization trace</span>
+              <strong>Guest to hardware</strong>
+              <small>Start with VMs, then follow KVM, virtio, VMMs, and Kata.</small>
+            </button>
+            <button class="route-card" type="button" data-route="lesson/kubernetes-scheduling">
+              <span>Fleet trace</span>
+              <strong>Placement to pressure</strong>
+              <small>Start with scheduler decisions, interference, and device assignment.</small>
+            </button>
+          </div>
+        </section>
+
         <section aria-labelledby="course-shape-title">
           <div class="section-heading">
             <span class="eyebrow">Learning model</span>
@@ -247,6 +313,9 @@
             <div class="brief-stat"><strong>${course.modules.length}</strong><span>ordered modules</span></div>
             <div class="brief-stat"><strong>${formatMinutes(course.totalMinutes)}</strong><span>with labs</span></div>
             <div class="brief-stat"><strong>${stats.percent}%</strong><span>saved on this device</span></div>
+          </div>
+          <div class="source-audit" aria-label="Source audit scope">
+            ${course.verified.scope.map((item) => `<span>${escapeHTML(item)}</span>`).join("")}
           </div>
         </section>
 
@@ -262,7 +331,7 @@
         </section>
 
         <section class="path-note" aria-labelledby="capstone-note-title">
-          <strong>XI</strong>
+          <strong>CAP</strong>
           <div>
             <h3 id="capstone-note-title">Capstone: trace one sandbox incident</h3>
             <p>Scheduler placement concentrates cold caches on one node. Use pressure, cgroup, NBD, mmap, and S3 evidence to prove the bottleneck.</p>
@@ -276,13 +345,14 @@
   }
 
   function renderModuleCard(module) {
-    const complete = completedLessonCount(module);
-    const percent = Math.round((complete / module.lessons.length) * 100);
+    const lessonsComplete = completedLessonCount(module);
+    const progress = moduleProgress(module);
     return `
       <button
         class="module-card"
         type="button"
         data-route="${routeFor("module", module.id)}"
+        aria-label="Open module ${module.number}: ${escapeAttr(module.title)}"
         style="${moduleStyle(module)}"
       >
         <span>
@@ -298,8 +368,8 @@
             ${module.lessons.map((lesson) => `<span>${escapeHTML(lesson.title)}</span>`).join("")}
           </span>
           <span class="card-progress">
-            <span class="card-progress-track"><span style="width:${percent}%"></span></span>
-            ${complete}/${module.lessons.length} lessons
+            <span class="card-progress-track"><span style="width:${progress.percent}%"></span></span>
+            ${progress.complete}/${progress.total} checkpoints · ${lessonsComplete}/${module.lessons.length} lessons
           </span>
         </span>
       </button>
@@ -326,7 +396,9 @@
   }
 
   function renderModule(module) {
-    const complete = completedLessonCount(module);
+    const lessonsComplete = completedLessonCount(module);
+    const progress = moduleProgress(module);
+    const score = state.quizScores[module.id];
     renderBreadcrumbs([
       { label: "Course home", route: "home" },
       { label: `Module ${module.number}` }
@@ -372,8 +444,9 @@
 
         <section aria-labelledby="lesson-lane-title">
           <div class="section-heading">
-            <span class="eyebrow">${complete}/${module.lessons.length} lessons complete</span>
+            <span class="eyebrow">${progress.complete}/${progress.total} module checkpoints complete</span>
             <h2 id="lesson-lane-title">Lessons</h2>
+            <p>${lessonsComplete} of ${module.lessons.length} lessons complete. Finish the workbench and score ${passingScore}% or higher on the retrieval check to complete this module.</p>
           </div>
           <div class="lesson-lane">
             ${module.lessons
@@ -416,7 +489,7 @@
               <p>Answer a short set drawn from this module. Every choice includes a mechanism-level explanation.</p>
             </div>
             <button class="secondary-button" type="button" data-route="${routeFor("quiz", module.id)}">
-              ${Object.hasOwn(state.quizScores, module.id) ? `Retry · best ${state.quizScores[module.id]}%` : "Start check"}
+              ${score === undefined ? "Start check" : quizPassed(module) ? `Passed · best ${score}%` : `Retry · best ${score}%`}
             </button>
           </article>
         </section>
@@ -430,20 +503,29 @@
       <div class="inline-visual" style="${moduleStyle(module)}">
         <div class="visual-head">
           <h3>${escapeHTML(lesson.visual.title)}</h3>
-          <span>Select each boundary</span>
+          <span>Trace each owner</span>
         </div>
-        <div class="flow-diagram">
+        <div class="flow-diagram" role="group" aria-label="${escapeAttr(lesson.visual.title)}">
           ${lesson.visual.nodes
             .map(
               ([name, label], index) => `
                 ${index ? '<span class="flow-arrow" aria-hidden="true">→</span>' : ""}
-                <button class="flow-node ${index === 0 ? "active" : ""}" type="button" data-flow-step="${index}">
+                <button
+                  class="flow-node ${index === 0 ? "active" : ""}"
+                  type="button"
+                  data-flow-step="${index}"
+                  aria-pressed="${index === 0}"
+                >
                   <strong>${escapeHTML(name)}</strong>
                   <small>${escapeHTML(label)}</small>
                 </button>
               `
             )
             .join("")}
+        </div>
+        <div class="flow-readout" aria-live="polite">
+          <span>Step 1 of ${lesson.visual.nodes.length}</span>
+          <p><strong>${escapeHTML(lesson.visual.nodes[0][0])}</strong> · ${escapeHTML(lesson.visual.nodes[0][1])}.</p>
         </div>
       </div>
     `;
@@ -549,6 +631,17 @@
           <p class="micro-feedback" id="micro-feedback" aria-live="polite">Choose an answer to reveal the mechanism.</p>
         </section>
 
+        <section class="lesson-completion" aria-labelledby="lesson-completion-title">
+          <div>
+            <span class="eyebrow">Checkpoint</span>
+            <h2 id="lesson-completion-title">Record this lesson</h2>
+            <p data-lesson-completion-status>${isComplete ? "This lesson counts toward module completion." : "Mark it complete when you can explain the boundary in your own words."}</p>
+          </div>
+          <button class="primary-button ${isComplete ? "complete" : ""}" type="button" data-complete-lesson="${lesson.id}">
+            ${isComplete ? "✓ Lesson complete" : "Mark lesson complete"}
+          </button>
+        </section>
+
         <section class="lesson-sources-inline" aria-labelledby="lesson-sources-title">
           <span class="eyebrow">Primary sources</span>
           <h2 id="lesson-sources-title">Continue with the source material</h2>
@@ -627,19 +720,20 @@
 
     if (["module", "quiz", "lab"].includes(route.type) && moduleById.has(route.id)) {
       const module = moduleById.get(route.id);
-      const percent = Math.round((completedLessonCount(module) / module.lessons.length) * 100);
+      const progress = moduleProgress(module);
+      const score = state.quizScores[module.id];
       drawer.innerHTML = `
         <div class="drawer-inner" style="${moduleStyle(module)}">
           <section class="drawer-section">
             <span class="eyebrow">Module ${module.number}</span>
             <h2>${escapeHTML(module.title)}</h2>
-            <div class="drawer-meter" style="--value:${percent * 3.6}deg"><strong>${percent}%</strong></div>
-            <p>${completedLessonCount(module)} of ${module.lessons.length} lessons complete.</p>
+            <div class="drawer-meter" style="--value:${progress.percent * 3.6}deg"><strong>${progress.percent}%</strong></div>
+            <p>${progress.complete} of ${progress.total} module checkpoints complete.</p>
           </section>
           <section class="drawer-section">
             <h3>Practice status</h3>
             <p>${state.completedLabs.includes(module.id) ? "Workbench complete." : "Workbench not complete."}</p>
-            <p>${Object.hasOwn(state.quizScores, module.id) ? `Best check score: ${state.quizScores[module.id]}%.` : "Retrieval check not attempted."}</p>
+            <p>${score === undefined ? "Retrieval check not attempted." : quizPassed(module) ? `Retrieval check passed at ${score}%.` : `Best check score: ${score}%. Pass at ${passingScore}%.`}</p>
           </section>
         </div>
       `;
@@ -696,7 +790,16 @@
     renderNav(activeModuleId);
     renderDrawer(route);
     updateProgress();
+    document.title = route.type === "home" ? `${course.title} | Systems crash course` : `${view.querySelector("h1")?.textContent || course.title} | ${course.title}`;
     window.scrollTo({ top: 0, behavior: "auto" });
+    if (hasRenderedRoute) {
+      const heading = view.querySelector("h1");
+      if (heading) {
+        heading.tabIndex = -1;
+        heading.focus({ preventScroll: true });
+      }
+    }
+    hasRenderedRoute = true;
   }
 
   function questionsFor(module) {
@@ -734,13 +837,13 @@
         <div class="quiz-view" style="${moduleStyle(module)}">
           <header class="quiz-header">
             <span class="eyebrow">Module ${module.number} · retrieval check</span>
-            <h1>Model checked.</h1>
-            <p>The score is saved on this device. Retry now or return after another pass through the module.</p>
+            <h1>${score >= passingScore ? "Check passed." : "Keep building the model."}</h1>
+            <p>Your best score is saved on this device. A score of ${passingScore}% or higher completes the retrieval checkpoint.</p>
           </header>
           <section class="quiz-result" aria-labelledby="quiz-result-title">
             <strong>${score}%</strong>
             <h2 id="quiz-result-title">${correct} of ${activeQuiz.questions.length} mechanisms identified</h2>
-            <p>${score >= 80 ? "You can now explain the main boundaries without the diagrams." : "Review the missed boundaries, then retrieve the model again."}</p>
+            <p>${score >= passingScore ? "You can now explain the main boundaries without the diagrams." : "Review the missed boundaries, then retrieve the model again."}</p>
             <div class="quiz-actions">
               <button class="secondary-button" type="button" data-route="${routeFor("module", module.id)}">Review module</button>
               <button class="primary-button" type="button" data-quiz-retry>Retry check</button>
@@ -757,7 +860,7 @@
         <header class="quiz-header">
           <span class="eyebrow">Module ${module.number} · retrieval check</span>
           <h1>Explain it without the diagram.</h1>
-          <p>Choose once, inspect the mechanism, then move forward. A score records the attempt, not mastery.</p>
+          <p>Choose once, inspect the mechanism, then move forward. Pass at ${passingScore}% to complete this checkpoint.</p>
         </header>
         <div class="quiz-shell">
           <section class="quiz-question-card" aria-labelledby="quiz-question">
@@ -823,7 +926,7 @@
       storage: { path: "nbd", step: 0 },
       virtio: { step: 0, nested: false },
       "vmm-selector": { broadDevices: false, hotplug: false, fastStart: true, vmBoundary: true },
-      network: { scenario: "clusterip", step: 0 },
+      network: { scenario: "clusterip", step: 0, payload: 1450, overhead: 50, mtu: 1500 },
       ebpf: { program: "map", step: 0 },
       binpack: { strategy: "best", placed: 0, reveal: false }
     };
@@ -929,8 +1032,8 @@
   function renderEventStepper(labState) {
     const events = {
       syscall: [
-        ["Process", "executes a library wrapper"],
-        ["CPU gate", "changes privilege level"],
+        ["Process", "calls a userspace wrapper"],
+        ["Syscall entry", "executes the architecture entry instruction"],
         ["Kernel", "validates the request"],
         ["VFS", "dispatches to the file path"],
         ["Process", "resumes with a result"]
@@ -938,7 +1041,7 @@
       fault: [
         ["Load", "references a virtual address"],
         ["MMU", "finds no usable translation"],
-        ["Exception", "enters the fault handler"],
+        ["Exception", "enters the demand-page fault handler"],
         ["Kernel", "maps or rejects the page"],
         ["Load", "restarts after resolution"]
       ],
@@ -946,8 +1049,8 @@
         ["Device", "finishes asynchronous work"],
         ["Interrupt", "notifies a CPU"],
         ["Driver", "acknowledges completion"],
-        ["Kernel", "wakes a blocked task"],
-        ["Process", "becomes runnable"]
+        ["Kernel", "may wake a waiter or schedule deferred work"],
+        ["Completion", "is now visible to a consumer"]
       ]
     };
     const steps = events[labState.event];
@@ -960,7 +1063,7 @@
           <label><span>Event</span>
             <select data-lab-field="event">
               <option value="syscall" ${labState.event === "syscall" ? "selected" : ""}>System call</option>
-              <option value="fault" ${labState.event === "fault" ? "selected" : ""}>Page fault</option>
+              <option value="fault" ${labState.event === "fault" ? "selected" : ""}>Demand-page fault</option>
               <option value="interrupt" ${labState.event === "interrupt" ? "selected" : ""}>Device interrupt</option>
             </select>
           </label>
@@ -1035,15 +1138,15 @@
     const quotaShare = Math.min(1, labState.quota / 100);
     const runtimeShare = Math.min(weightShare, quotaShare);
     const busy = Math.max(1, Math.round(runtimeShare * 12));
-    const warmth = Math.max(5, Math.min(100, (labState.affinity ? 105 : 72) - labState.workingSet * 8));
+    const locality = Math.max(5, Math.min(100, (labState.affinity ? 105 : 72) - labState.workingSet * 8));
     const throttled = quotaShare < weightShare;
     return workbenchShell(
       `
         <h2>Tune one runnable task</h2>
-        <p>Weight decides proportional service under contention. Quota is a hard ceiling. Affinity can preserve cache state.</p>
+        <p>The toy model has one runnable workload and one continuously runnable competitor with weight 100 on one logical CPU. Weight divides contested service, while quota sets a ceiling.</p>
         <div class="control-group">
           <label><span>CPU weight · ${labState.weight}</span><input type="range" min="10" max="300" step="10" value="${labState.weight}" data-lab-field="weight"></label>
-          <label><span>Quota · ${labState.quota}% of one CPU</span><input type="range" min="25" max="200" step="25" value="${labState.quota}" data-lab-field="quota"></label>
+          <label><span>Quota · ${labState.quota}% of one CPU</span><input type="range" min="25" max="100" step="25" value="${labState.quota}" data-lab-field="quota"></label>
           <label><span>Working set · ${labState.workingSet} MiB</span><input type="range" min="1" max="12" value="${labState.workingSet}" data-lab-field="workingSet"></label>
           <label class="toggle-control"><span>Keep CPU affinity</span><input type="checkbox" data-lab-toggle="affinity" ${labState.affinity ? "checked" : ""}></label>
         </div>
@@ -1058,7 +1161,7 @@
         <div class="timeline-track">
           ${Array.from({ length: 12 }, (_, index) => `<span class="timeline-slot ${index < busy ? "busy" : ""}">${index < busy ? "run" : "wait"}</span>`).join("")}
         </div>
-        <div class="sandbox-score"><strong>cache warmth ${warmth}%</strong><span class="score-track"><span style="width:${warmth}%"></span></span></div>
+        <div class="sandbox-score"><strong>illustrative locality ${locality}%</strong><span class="score-track"><span style="width:${locality}%"></span></span></div>
         <div class="stage-readout"><strong>Result:</strong> about ${Math.round(runtimeShare * 100)}% of one contended CPU in this simplified period. ${throttled ? "The quota becomes the limiting control." : "Competition and weight set the smaller share."}</div>
       `
     );
@@ -1093,17 +1196,17 @@
           ${Array.from({ length: totalPages }, (_, index) => `<span class="page-cell ${index < labState.resident ? "resident" : ""} ${index === labState.fault ? "faulting" : ""}">${index}</span>`).join("")}
         </div>
         <div class="sandbox-score"><strong>${labState.resident}/${totalPages} resident</strong><span class="score-track"><span style="width:${(labState.resident / totalPages) * 100}%"></span></span></div>
-        <div class="stage-readout"><strong>Translation model:</strong> 64 TLB entries cover about ${tlbCoverageMiB < 1 ? `${Math.round(tlbCoverageMiB * 1024)} KiB` : `${tlbCoverageMiB.toFixed(0)} MiB`} at this page size. ${labState.resolver === "uffd" ? "UFFD moves selected fault resolution to a registered userspace handler." : "The kernel resolves the fault from zero-fill, a file, swap, or an error path."}</div>
+        <div class="stage-readout"><strong>Toy translation model:</strong> If one TLB level held 64 entries for this page size, it would cover about ${tlbCoverageMiB < 1 ? `${Math.round(tlbCoverageMiB * 1024)} KiB` : `${tlbCoverageMiB.toFixed(0)} MiB`}. Real CPUs have architecture-specific TLB levels and capacities. ${labState.resolver === "uffd" ? "UFFD moves selected fault resolution to a registered userspace handler." : "The kernel resolves the fault from zero-fill, a file, swap, or an error path."}</div>
       `
     );
   }
 
   function renderStorageWorkbench(labState) {
     const paths = {
-      buffered: [["read()", "userspace call"], ["VFS", "file lookup"], ["Page cache", "cached file pages"], ["Block layer", "bio and request"], ["Device", "storage completion"]],
-      mmap: [["Load", "memory instruction"], ["Page fault", "missing file page"], ["Page cache", "file-backed page"], ["Block layer", "fill on miss"], ["Resume", "restart the load"]],
+      buffered: [["read()", "userspace call"], ["VFS", "file lookup"], ["Page-cache miss", "cold buffered read"], ["Block layer", "bio and request"], ["Device", "storage completion"]],
+      mmap: [["Load", "first access"], ["Page fault", "PTE not present"], ["Page-cache miss", "file page absent"], ["Block layer", "fill the page"], ["Resume", "restart the load"]],
       nbd: [["ext4", "filesystem read"], ["/dev/nbd", "kernel client"], ["Socket", "NBD request"], ["Go handler", "userspace server"], ["mmap / S3", "cache or range fetch"]],
-      io_uring: [["Submit", "write SQ entries"], ["SQ", "shared ring"], ["Kernel I/O", "operation runs"], ["CQ", "completion entry"], ["Resume", "consume result"]]
+      io_uring: [["Submit", "write SQ entries"], ["SQ", "shared ring"], ["Kernel I/O", "operation runs"], ["CQ", "completion entry"], ["Consumer", "reaps the CQE"]]
     };
     const nodes = paths[labState.path];
     const step = Math.min(labState.step, nodes.length - 1);
@@ -1144,7 +1247,7 @@
     return workbenchShell(
       `
         <h2>Move one virtqueue request</h2>
-        <p>Shared guest memory carries descriptors. Notifications coordinate ownership; the device model still performs the host-side work.</p>
+        <p>Shared guest memory carries descriptors. Notifications coordinate ownership, while the backend performs work in the VMM, the host kernel through vhost, or a separate vhost-user process.</p>
         <div class="control-group">
           <label class="toggle-control"><span>Add an L1 hypervisor</span><input type="checkbox" data-lab-toggle="nested" ${labState.nested ? "checked" : ""}></label>
         </div>
@@ -1173,23 +1276,28 @@
       ["vmBoundary", "Hardware VM boundary"]
     ];
     const candidates = [
-      { name: "QEMU + KVM", detail: "Broad machine and device coverage", traits: { broadDevices: 2, hotplug: 2, fastStart: 0, vmBoundary: 1 } },
-      { name: "Firecracker", detail: "Purpose-built microVM device surface", traits: { broadDevices: 0, hotplug: 0, fastStart: 2, vmBoundary: 1 } },
-      { name: "Cloud Hypervisor", detail: "Cloud-focused VMM with virtio devices", traits: { broadDevices: 1, hotplug: 1, fastStart: 1, vmBoundary: 1 } },
-      { name: "Kata + selected VMM", detail: "Container delivery with a guest kernel", traits: { broadDevices: 1, hotplug: 1, fastStart: 0, vmBoundary: 1 } },
-      { name: "runc", detail: "Host-kernel container boundary", traits: { broadDevices: 1, hotplug: 1, fastStart: 2, vmBoundary: 0 } }
+      { name: "QEMU + KVM", detail: "Broad machine and device coverage", traits: { broadDevices: true, hotplug: true, fastStart: false, vmBoundary: true } },
+      { name: "Firecracker 1.16", detail: "Small machine model; PCI hotplug is preview", traits: { broadDevices: false, hotplug: "preview", fastStart: true, vmBoundary: true } },
+      { name: "Cloud Hypervisor", detail: "Cloud VMM with CPU, memory, and PCI hotplug", traits: { broadDevices: false, hotplug: true, fastStart: true, vmBoundary: true } },
+      { name: "Dragonball", detail: "Kata runtime-rs default VMM with device, CPU, and memory hotplug", traits: { broadDevices: false, hotplug: true, fastStart: true, vmBoundary: true } },
+      { name: "Kata + selected VMM", detail: "Container delivery; capabilities depend on the pinned VMM", traits: { broadDevices: "conditional", hotplug: "conditional", fastStart: false, vmBoundary: true } },
+      { name: "runc", detail: "Host-kernel container delivery, not a VMM", traits: { broadDevices: false, hotplug: false, fastStart: true, vmBoundary: false } }
     ];
-    const scored = candidates
-      .map((candidate) => ({
-        ...candidate,
-        score: requirements.reduce((score, [key]) => score + (labState[key] ? candidate.traits[key] : 0), 0)
-      }))
-      .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
-    const best = scored[0];
+    const assessed = candidates
+      .map((candidate) => {
+        const selected = requirements.filter(([key]) => labState[key]);
+        const missing = selected.filter(([key]) => candidate.traits[key] === false).map(([, label]) => label);
+        const caveats = selected
+          .filter(([key]) => ["preview", "conditional"].includes(candidate.traits[key]))
+          .map(([key, label]) => `${label}: ${candidate.traits[key]}`);
+        return { ...candidate, missing, caveats, eligible: missing.length === 0 };
+      })
+      .sort((left, right) => Number(right.eligible) - Number(left.eligible) || left.caveats.length - right.caveats.length || left.name.localeCompare(right.name));
+    const eligible = assessed.filter((candidate) => candidate.eligible);
     return workbenchShell(
       `
         <h2>State the requirements</h2>
-        <p>This is a fit model, not a universal ranking. Security depends on configuration, host hardening, and the complete runtime path.</p>
+        <p>Checked items are hard requirements. Unsupported candidates are filtered, while preview and version-dependent support remain visible as caveats.</p>
         <div class="toggle-list">
           ${requirements.map(([key, label]) => `<label class="toggle-control"><span>${escapeHTML(label)}</span><input type="checkbox" data-lab-toggle="${key}" ${labState[key] ? "checked" : ""}></label>`).join("")}
         </div>
@@ -1197,18 +1305,33 @@
       `,
       `
         <div class="primitive-rack">
-          ${scored.map((candidate, index) => `<div class="primitive-card ${index === 0 ? "active" : ""}"><strong>${escapeHTML(candidate.name)} · ${candidate.score}</strong><small>${escapeHTML(candidate.detail)}</small></div>`).join("")}
+          ${assessed
+            .map(
+              (candidate) => `
+                <div class="primitive-card ${candidate.eligible ? "active" : ""}">
+                  <strong>${escapeHTML(candidate.name)} · ${candidate.eligible ? candidate.caveats.length ? "conditional" : "eligible" : "filtered"}</strong>
+                  <small>${escapeHTML(candidate.detail)}${candidate.missing.length ? ` Missing: ${escapeHTML(candidate.missing.join(", "))}.` : ""}${candidate.caveats.length ? ` Caveat: ${escapeHTML(candidate.caveats.join(", "))}.` : ""}</small>
+                </div>
+              `
+            )
+            .join("")}
         </div>
-        <div class="stage-readout"><strong>Closest fit:</strong> ${escapeHTML(best.name)} for the selected properties. Kata is a container runtime architecture that delegates VM work to a VMM; it is not itself another VMM.</div>
+        <div class="stage-readout"><strong>Eligible set:</strong> ${eligible.length ? escapeHTML(eligible.map((candidate) => candidate.name).join(", ")) : "None"}. Choose host-kernel container delivery or Kata first, then evaluate the actual VMM and pinned version.</div>
       `
     );
   }
 
   function renderNetworkWorkbench(labState) {
+    const transportHeaders = 40;
+    const packetSize = labState.payload + transportHeaders + labState.overhead;
+    const fitsMTU = packetSize <= labState.mtu;
     const scenarios = {
       pod: [["Source Pod", "process in a netns"], ["veth / CNI", "namespace boundary"], ["Node path", "route or data plane"], ["veth / CNI", "destination boundary"], ["Target Pod", "socket receives bytes"]],
       clusterip: [["Pod socket", "destination is a Service IP"], ["Pod netns", "route leaves namespace"], ["Service data plane", "selects an endpoint"], ["Node network", "forwards rewritten traffic"], ["Endpoint Pod", "reply follows connection state"]],
       outbound: [["Pod", "private source address"], ["Pod netns", "default route"], ["Node", "forwarding path"], ["SNAT", "source may be rewritten"], ["Remote", "sees translated source"]],
+      cni: [["Runtime", "creates sandbox netns"], ["CNI ADD", "receives namespace path"], ["IPAM", "allocates address"], ["Plugin", "creates link and routes"], ["Runtime", "starts containers after setup"]],
+      conntrack: [["First packet", "enters a Netfilter hook"], ["Conntrack", "creates flow state"], ["NAT", "chooses one translation"], ["Reply", "matches reverse direction"], ["Later packets", "reuse established mapping"]],
+      mtu: [["Application", `${labState.payload} byte payload`], ["TCP + IPv4", `adds ${transportHeaders} bytes without options`], ["Overlay", `adds ${labState.overhead} bytes`], ["Output path", `${packetSize} bytes versus ${labState.mtu} MTU`], ["Result", fitsMTU ? "packet fits" : "needs PMTU feedback, segmentation, or drop handling"]],
       l4: [["Client", "opens a transport flow"], ["L4 balancer", "uses IP, port, and protocol"], ["Backend flow", "connection is forwarded"], ["Service", "handles bytes"], ["Reply", "flow state returns traffic"]],
       l7: [["Client", "sends an application request"], ["Proxy", "terminates transport"], ["L7 policy", "reads host, path, or method"], ["Backend request", "new or pooled connection"], ["Response", "proxy returns application data"]]
     };
@@ -1224,16 +1347,28 @@
               <option value="pod" ${labState.scenario === "pod" ? "selected" : ""}>Pod to Pod</option>
               <option value="clusterip" ${labState.scenario === "clusterip" ? "selected" : ""}>ClusterIP Service</option>
               <option value="outbound" ${labState.scenario === "outbound" ? "selected" : ""}>Outbound NAT</option>
+              <option value="cni" ${labState.scenario === "cni" ? "selected" : ""}>CNI lifecycle</option>
+              <option value="conntrack" ${labState.scenario === "conntrack" ? "selected" : ""}>First and established packets</option>
+              <option value="mtu" ${labState.scenario === "mtu" ? "selected" : ""}>Overlay MTU</option>
               <option value="l4" ${labState.scenario === "l4" ? "selected" : ""}>L4 balancing</option>
               <option value="l7" ${labState.scenario === "l7" ? "selected" : ""}>L7 proxying</option>
             </select>
           </label>
+          ${
+            labState.scenario === "mtu"
+              ? `
+                <label><span>Payload · ${labState.payload} bytes</span><input type="range" min="1200" max="1600" step="10" value="${labState.payload}" data-lab-field="payload"></label>
+                <label><span>Overlay overhead · ${labState.overhead} bytes</span><input type="range" min="0" max="100" step="10" value="${labState.overhead}" data-lab-field="overhead"></label>
+                <label><span>Path MTU · ${labState.mtu} bytes</span><input type="range" min="1280" max="9000" step="10" value="${labState.mtu}" data-lab-field="mtu"></label>
+              `
+              : ""
+          }
         </div>
         <div class="simulation-actions"><button type="button" data-lab-action="next">Advance packet</button><button type="button" data-lab-action="reset">Reset</button></div>
       `,
       `
         <div class="packet-path">${nodes.map(([name, detail], index) => `<div class="packet-node ${index === step ? "active" : ""}"><strong>${escapeHTML(name)}</strong><small>${escapeHTML(detail)}</small></div>`).join("")}</div>
-        <div class="stage-readout"><strong>${escapeHTML(nodes[step][0])}:</strong> ${escapeHTML(nodes[step][1])}. The exact Kubernetes data plane may use nftables, iptables compatibility, IPVS, eBPF, or a cloud implementation.</div>
+        <div class="stage-readout"><strong>${escapeHTML(nodes[step][0])}:</strong> ${escapeHTML(nodes[step][1])}. ${labState.scenario === "mtu" ? `${fitsMTU ? "Fits" : "Exceeds"} the modeled path MTU by ${Math.abs(labState.mtu - packetSize)} bytes.` : "Record the namespace, interface, addresses, hook, and owner at this boundary."}</div>
       `
     );
   }
@@ -1324,12 +1459,12 @@
     return workbenchShell(
       `
         <h2>Place requested resources</h2>
-        <p>Filter first, then score. Runtime use is hidden until placement is complete so requests and observed demand stay separate.</p>
+        <p>This teaching heuristic scores only remaining CPU after hard multidimensional filtering. Real NodeResourcesFit defaults to a weighted LeastAllocated score across configured resources.</p>
         <div class="control-group">
           <label><span>CPU scoring model</span>
             <select data-lab-field="strategy">
-              <option value="best" ${labState.strategy === "best" ? "selected" : ""}>Tightest feasible CPU fit</option>
-              <option value="spread" ${labState.strategy === "spread" ? "selected" : ""}>Most CPU headroom</option>
+              <option value="best" ${labState.strategy === "best" ? "selected" : ""}>Tight CPU fit heuristic</option>
+              <option value="spread" ${labState.strategy === "spread" ? "selected" : ""}>CPU headroom heuristic</option>
             </select>
           </label>
         </div>
@@ -1377,14 +1512,14 @@
         </div>
         <div class="code-lab-grid">
           <div class="code-editor-wrap">
-            <textarea class="code-editor" id="code-editor-${escapeAttr(challenge.id)}" spellcheck="false" aria-label="JavaScript solution">${escapeHTML(challenge.starter)}</textarea>
+            <textarea class="code-editor" id="code-editor-${escapeAttr(challenge.id)}" spellcheck="false" aria-label="JavaScript solution">${escapeHTML(state.codeDrafts[challenge.id] ?? challenge.starter)}</textarea>
           </div>
           <aside class="test-panel">
             <h3>Tests</h3>
             <ul class="test-list" id="test-list-${escapeAttr(challenge.id)}">
               ${challenge.tests.map((test) => `<li class="test-item"><span>○</span><span>${escapeHTML(test.label)}</span></li>`).join("")}
             </ul>
-            <div class="test-output" id="test-output-${escapeAttr(challenge.id)}">Edit the function, then run the tests.</div>
+            <div class="test-output" id="test-output-${escapeAttr(challenge.id)}" role="status" aria-live="polite" aria-atomic="true">Edit the function, then run the tests.</div>
           </aside>
         </div>
       </section>
@@ -1407,7 +1542,7 @@
         const result = results?.[index];
         const status = result ? (result.pass ? "pass" : "fail") : "";
         const mark = result ? (result.pass ? "✓" : "×") : "○";
-        const detail = result && !result.pass ? `<br>received ${escapeHTML(result.actual || result.error || "error")}` : "";
+        const detail = result && !result.pass ? `<br>expected ${escapeHTML(test.expected)} · received ${escapeHTML(result.actual ?? result.error ?? "error")}` : "";
         return `<li class="test-item ${status}"><span>${mark}</span><span>${escapeHTML(test.label)}${detail}</span></li>`;
       })
       .join("");
@@ -1422,7 +1557,7 @@
     if (!/^[A-Za-z_$][\w$]*$/.test(challenge.functionName)) return;
 
     button.disabled = true;
-    updateCodeResults(challenge, null, "Running in an isolated worker...");
+    updateCodeResults(challenge, null, "Running locally in a browser worker...");
 
     const source = `
       "use strict";
@@ -1488,8 +1623,27 @@
         return;
       }
       const passed = data.results.filter((result) => result.pass).length;
-      updateCodeResults(challenge, data.results, `${passed} of ${challenge.tests.length} tests passed.`);
-      if (passed === challenge.tests.length) showToast("All browser tests passed.");
+      const failedIndex = data.results.findIndex((result) => !result.pass);
+      const failedSummary =
+        failedIndex >= 0
+          ? ` First failure: ${challenge.tests[failedIndex].label}. Expected ${challenge.tests[failedIndex].expected}; received ${data.results[failedIndex].actual ?? data.results[failedIndex].error ?? "error"}.`
+          : "";
+      updateCodeResults(challenge, data.results, `${passed} of ${challenge.tests.length} tests passed.${failedSummary}`);
+      if (passed === challenge.tests.length) {
+        const route = parseRoute();
+        const module = route.type === "lab" ? moduleById.get(route.id) : null;
+        if (module && !state.completedLabs.includes(module.id)) {
+          state.completedLabs.push(module.id);
+          saveState();
+          const completionButton = document.querySelector(`[data-complete-lab="${CSS.escape(module.id)}"]`);
+          if (completionButton) {
+            completionButton.classList.add("complete");
+            completionButton.textContent = "✓ Workbench complete";
+          }
+          refreshCourseChrome();
+        }
+        showToast("All browser tests passed. Workbench complete.");
+      }
     };
 
     worker.onerror = (event) => {
@@ -1597,7 +1751,7 @@
       ]),
       {
         type: "Capstone",
-        index: "XI",
+        index: "CAP",
         title: course.capstone.title,
         description: course.capstone.summary,
         route: "capstone",
@@ -1622,6 +1776,7 @@
           .map(
             (entry, index) => `
               <button
+                id="search-option-${index}"
                 class="search-result ${index === activeSearchIndex ? "active" : ""}"
                 type="button"
                 role="option"
@@ -1636,6 +1791,12 @@
           )
           .join("")
       : '<p class="empty-state">No matching concept. Try a boundary such as KVM, cgroup, or NBD.</p>';
+    const activeId = matches.length ? `search-option-${activeSearchIndex}` : "";
+    if (activeId) searchInput.setAttribute("aria-activedescendant", activeId);
+    else searchInput.removeAttribute("aria-activedescendant");
+    if (activeId) {
+      requestAnimationFrame(() => document.querySelector(`#${activeId}`)?.scrollIntoView({ block: "nearest" }));
+    }
   }
 
   function openSearch() {
@@ -1643,11 +1804,14 @@
     searchInput.value = "";
     renderSearchResults();
     searchDialog.showModal();
+    searchInput.setAttribute("aria-expanded", "true");
     requestAnimationFrame(() => searchInput.focus());
   }
 
   function closeSearch() {
     if (searchDialog.open) searchDialog.close();
+    searchInput.setAttribute("aria-expanded", "false");
+    searchInput.removeAttribute("aria-activedescendant");
   }
 
   async function copyText(value) {
@@ -1672,6 +1836,7 @@
     renderNav(moduleId);
     renderDrawer(route);
     updateProgress();
+    document.title = route.type === "home" ? `${course.title} | Systems crash course` : `${view.querySelector("h1")?.textContent || course.title} | ${course.title}`;
   }
 
   function handleLabAction(action) {
@@ -1700,6 +1865,11 @@
     }
 
     renderLabWorkbench(module);
+    requestAnimationFrame(() => {
+      const matchingAction = document.querySelector(`[data-lab-action="${CSS.escape(action)}"]`);
+      const focusTarget = matchingAction && !matchingAction.disabled ? matchingAction : document.querySelector('[data-lab-action="reveal"], [data-lab-action="reset"]');
+      focusTarget?.focus({ preventScroll: true });
+    });
   }
 
   document.addEventListener("click", (event) => {
@@ -1726,7 +1896,21 @@
 
     const flowButton = event.target.closest("[data-flow-step]");
     if (flowButton) {
-      flowButton.parentElement.querySelectorAll("[data-flow-step]").forEach((button) => button.classList.toggle("active", button === flowButton));
+      const route = parseRoute();
+      const lesson = lessonById.get(route.id)?.lesson;
+      const step = Number(flowButton.dataset.flowStep);
+      const visual = flowButton.closest(".inline-visual");
+      visual.querySelectorAll("[data-flow-step]").forEach((button) => {
+        const active = button === flowButton;
+        button.classList.toggle("active", active);
+        button.setAttribute("aria-pressed", String(active));
+      });
+      const node = lesson?.visual?.nodes[step];
+      const readout = visual.querySelector(".flow-readout");
+      if (node && readout) {
+        readout.innerHTML = `<span>Step ${step + 1} of ${lesson.visual.nodes.length}</span><p><strong>${escapeHTML(node[0])}</strong> · ${escapeHTML(node[1])}.</p>`;
+        announce(`Step ${step + 1}: ${node[0]}, ${node[1]}.`);
+      }
       return;
     }
 
@@ -1754,6 +1938,15 @@
       state.completedLessons = complete ? state.completedLessons.filter((item) => item !== id) : [...state.completedLessons, id];
       saveState();
       refreshCourseChrome();
+      document.querySelectorAll(`[data-complete-lesson="${CSS.escape(id)}"]`).forEach((button) => {
+        button.classList.toggle("complete", !complete);
+        button.textContent = complete ? "Mark lesson complete" : "✓ Lesson complete";
+      });
+      document.querySelectorAll("[data-lesson-completion-status]").forEach((status) => {
+        status.textContent = complete
+          ? "Mark it complete when you can explain the boundary in your own words."
+          : "This lesson counts toward module completion.";
+      });
       showToast(complete ? "Lesson marked incomplete." : "Lesson complete.");
       return;
     }
@@ -1761,8 +1954,10 @@
     const quizAnswer = event.target.closest("[data-quiz-answer]");
     if (quizAnswer && activeQuiz && !activeQuiz.revealed) {
       activeQuiz.selected = Number(quizAnswer.dataset.quizAnswer);
-      const module = moduleById.get(activeQuiz.moduleId);
-      if (module) renderQuiz(module);
+      quizAnswer.closest(".quiz-options").querySelectorAll(".quiz-option").forEach((option) => {
+        const input = option.querySelector("[data-quiz-answer]");
+        option.classList.toggle("selected", input === quizAnswer);
+      });
       return;
     }
 
@@ -1775,7 +1970,11 @@
       activeQuiz.revealed = true;
       activeQuiz.answers[activeQuiz.index] = { selected: activeQuiz.selected, correct: activeQuiz.selected === question.answer };
       const module = moduleById.get(activeQuiz.moduleId);
-      if (module) renderQuiz(module);
+      if (module) {
+        renderQuiz(module);
+        requestAnimationFrame(() => document.querySelector("[data-quiz-next]")?.focus());
+        announce(`${activeQuiz.selected === question.answer ? "Correct." : "Not quite."} ${question.explanation}`);
+      }
       return;
     }
 
@@ -1790,11 +1989,19 @@
         saveState();
         renderQuiz(module);
         refreshCourseChrome();
+        requestAnimationFrame(() => {
+          const heading = view.querySelector("h1");
+          if (heading) {
+            heading.tabIndex = -1;
+            heading.focus({ preventScroll: true });
+          }
+        });
       } else {
         activeQuiz.index += 1;
         activeQuiz.selected = null;
         activeQuiz.revealed = false;
         renderQuiz(module);
+        requestAnimationFrame(() => document.querySelector("[data-quiz-answer]")?.focus());
       }
       return;
     }
@@ -1805,6 +2012,7 @@
       if (!module) return;
       activeQuiz = newQuiz(module);
       renderQuiz(module);
+      requestAnimationFrame(() => document.querySelector("[data-quiz-answer]")?.focus());
       return;
     }
 
@@ -1848,6 +2056,8 @@
       const editor = challenge ? document.querySelector(`#code-editor-${challenge.id}`) : null;
       if (challenge && editor) {
         editor.value = challenge.starter;
+        delete state.codeDrafts[challenge.id];
+        saveState();
         updateCodeResults(challenge, null, "Starter restored. Edit the function, then run the tests.");
       }
       return;
@@ -1855,14 +2065,20 @@
 
     const evidenceButton = event.target.closest("[data-evidence]");
     if (evidenceButton) {
-      activeIncident.evidence = [evidenceButton.dataset.evidence];
+      const evidenceId = evidenceButton.dataset.evidence;
+      activeIncident.evidence = [evidenceId];
       renderCapstone();
+      requestAnimationFrame(() => {
+        document.querySelector(`[data-evidence="${CSS.escape(evidenceId)}"]`)?.focus({ preventScroll: true });
+        announce("Evidence selected. Review its detail, then test a hypothesis.");
+      });
       return;
     }
 
     const hypothesisButton = event.target.closest("[data-hypothesis]");
     if (hypothesisButton) {
-      activeIncident.hypothesis = hypothesisButton.dataset.hypothesis;
+      const hypothesisId = hypothesisButton.dataset.hypothesis;
+      activeIncident.hypothesis = hypothesisId;
       const hypothesis = course.capstone.hypotheses.find((item) => item.id === activeIncident.hypothesis);
       if (hypothesis?.correct) {
         state.capstoneComplete = true;
@@ -1870,6 +2086,10 @@
       }
       renderCapstone();
       refreshCourseChrome();
+      requestAnimationFrame(() => {
+        document.querySelector(`[data-hypothesis="${CSS.escape(hypothesisId)}"]`)?.focus({ preventScroll: true });
+        announce(hypothesis ? `${hypothesis.correct ? "Causal chain found." : "Evidence does not support this."} ${hypothesis.reason}` : "Hypothesis selected.");
+      });
       return;
     }
 
@@ -1898,7 +2118,19 @@
       if (key === "strategy") Object.assign(labState, { placed: 0, reveal: false });
     }
     if (toggle) labState[toggle.dataset.labToggle] = toggle.checked;
+    const focusSelector = field
+      ? `[data-lab-field="${CSS.escape(field.dataset.labField)}"]`
+      : `[data-lab-toggle="${CSS.escape(toggle.dataset.labToggle)}"]`;
     renderLabWorkbench(module);
+    requestAnimationFrame(() => document.querySelector(focusSelector)?.focus({ preventScroll: true }));
+  });
+
+  document.addEventListener("input", (event) => {
+    const editor = event.target.closest(".code-editor");
+    if (!editor) return;
+    const challengeId = editor.id.replace(/^code-editor-/, "");
+    state.codeDrafts[challengeId] = editor.value;
+    saveState();
   });
 
   depthSelect.addEventListener("change", () => {
@@ -1908,11 +2140,16 @@
     announce(`${depthSelect.options[depthSelect.selectedIndex].text} selected.`);
   });
 
-  document.querySelector("#search-trigger").addEventListener("click", openSearch);
-  document.querySelector("#search-close").addEventListener("click", closeSearch);
+  searchTrigger.addEventListener("click", openSearch);
+  document.querySelector("#search-close").addEventListener("click", () => {
+    closeSearch();
+    searchTrigger.focus();
+  });
   searchInput.addEventListener("input", () => {
     activeSearchIndex = 0;
     renderSearchResults(searchInput.value);
+    const count = matchingSearchEntries(searchInput.value).length;
+    announce(`${count} course ${count === 1 ? "result" : "results"}.`);
   });
   searchInput.addEventListener("keydown", (event) => {
     const matches = matchingSearchEntries(searchInput.value);
@@ -1928,22 +2165,54 @@
       event.preventDefault();
       closeSearch();
       goToRoute(matches[activeSearchIndex].route);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      closeSearch();
+      searchTrigger.focus();
     }
   });
   searchDialog.addEventListener("click", (event) => {
-    if (event.target === searchDialog) closeSearch();
+    if (event.target === searchDialog) {
+      closeSearch();
+      searchTrigger.focus();
+    }
+  });
+  searchDialog.addEventListener("cancel", (event) => {
+    event.preventDefault();
+    closeSearch();
+    searchTrigger.focus();
   });
 
   const mobileMapButton = document.querySelector("#mobile-map-trigger");
   const mobileMapCloseButton = document.querySelector("#mobile-map-close");
   const courseRail = document.querySelector(".course-rail");
+  const courseStage = document.querySelector(".course-stage");
+  const contextDrawer = document.querySelector(".context-drawer");
+  const skipLinkElement = document.querySelector(".skip-link");
   const mobileMedia = window.matchMedia("(max-width: 760px)");
 
   function syncMobileMapAccess() {
-    const hidden = mobileMedia.matches && !document.body.classList.contains("map-open");
-    courseRail.inert = hidden;
-    if (hidden) courseRail.setAttribute("aria-hidden", "true");
+    const mobile = mobileMedia.matches;
+    const open = mobile && document.body.classList.contains("map-open");
+    courseRail.inert = mobile && !open;
+    courseStage.inert = open;
+    contextDrawer.inert = open;
+    skipLinkElement.inert = open;
+    if (mobile && !open) courseRail.setAttribute("aria-hidden", "true");
     else courseRail.removeAttribute("aria-hidden");
+    for (const element of [courseStage, contextDrawer]) {
+      if (open) element.setAttribute("aria-hidden", "true");
+      else element.removeAttribute("aria-hidden");
+    }
+    if (open) skipLinkElement.setAttribute("aria-hidden", "true");
+    else skipLinkElement.removeAttribute("aria-hidden");
+    if (open) {
+      courseRail.setAttribute("role", "dialog");
+      courseRail.setAttribute("aria-modal", "true");
+    } else {
+      courseRail.removeAttribute("role");
+      courseRail.removeAttribute("aria-modal");
+    }
   }
 
   function setMobileMap(open) {
@@ -1961,7 +2230,7 @@
     setMobileMap(false);
     mobileMapButton.focus();
   });
-  mobileMedia.addEventListener("change", syncMobileMapAccess);
+  mobileMedia.addEventListener("change", () => setMobileMap(false));
 
   document.querySelector("#reset-progress").addEventListener("click", () => {
     if (!window.confirm("Reset lesson, workbench, quiz, and capstone progress on this device?")) return;
@@ -1977,12 +2246,25 @@
   });
 
   document.addEventListener("keydown", (event) => {
+    const editor = event.target.closest(".code-editor");
+    if (editor && (event.metaKey || event.ctrlKey) && event.key === "Enter") {
+      event.preventDefault();
+      runCodeChallenge(editor.id.replace(/^code-editor-/, ""));
+      return;
+    }
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
       event.preventDefault();
-      searchDialog.open ? closeSearch() : openSearch();
+      if (searchDialog.open) {
+        closeSearch();
+        searchTrigger.focus();
+      } else {
+        if (document.body.classList.contains("map-open")) setMobileMap(false);
+        openSearch();
+      }
     }
     if (event.key === "Escape" && document.body.classList.contains("map-open")) {
       setMobileMap(false);
+      mobileMapButton.focus();
     }
   });
 
@@ -1996,6 +2278,7 @@
         .filter(([id, score]) => moduleIds.has(id) && Number.isFinite(Number(score)))
         .map(([id, score]) => [id, Math.max(0, Math.min(100, Number(score)))])
     );
+    if (!state.codeDrafts || typeof state.codeDrafts !== "object") state.codeDrafts = {};
     if (!new Set(["core", "kernel", "code"]).has(state.depth)) state.depth = "core";
     if (typeof state.capstoneComplete !== "boolean") state.capstoneComplete = false;
   }

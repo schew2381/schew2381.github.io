@@ -22,7 +22,7 @@
       href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap"
       rel="stylesheet"
     >
-    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="styles.css?v=20260715">
   </head>
   <body>
     <a class="skip-link" href="#course-view">Skip to the lesson</a>
@@ -104,7 +104,17 @@
       </div>
       <label class="search-field" for="search-input">
         <span aria-hidden="true">⌕</span>
-        <input id="search-input" type="search" placeholder="Try cgroups, virtio, or noisy neighbor" autocomplete="off">
+        <input
+          id="search-input"
+          type="search"
+          role="combobox"
+          aria-autocomplete="list"
+          aria-controls="search-results"
+          aria-expanded="false"
+          aria-label="Search course concepts"
+          placeholder="Try cgroups, virtio, or noisy neighbor"
+          autocomplete="off"
+        >
       </label>
       <div class="search-results" id="search-results" role="listbox"></div>
       <p class="search-help"><kbd>↑</kbd><kbd>↓</kbd> move <kbd>Enter</kbd> open <kbd>Esc</kbd> close</p>
@@ -113,7 +123,8 @@
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
     <div class="sr-only" id="live-region" aria-live="polite"></div>
 
-    <script src="course-data.js" defer></script>
-    <script src="app.js" defer></script>
+    <script src="course-data.js?v=20260715" defer></script>
+    <script src="course-modernization.js?v=20260715" defer></script>
+    <script src="app.js?v=20260715" defer></script>
   </body>
 </html>
