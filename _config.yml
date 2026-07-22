@@ -145,6 +145,7 @@ pwa:
     # shares the same domain name as the current website.
     deny_paths:
       - "/systems-course"
+      - "/decagon"
       # - "/example"  # URLs match `<SITE_URL>/example/*` will not be cached by the PWA
 
 paginate: 10

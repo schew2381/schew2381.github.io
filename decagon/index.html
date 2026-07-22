@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#132b3a">
+    <meta
+      name="description"
+      content="An interactive Decagon infrastructure interview course for an AI model gateway and a distributed web crawler."
+    >
+    <meta property="og:title" content="Decagon Infra Interview Lab">
+    <meta
+      property="og:description"
+      content="Build, benchmark, and defend an AI model gateway and a distributed web crawler."
+    >
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://schew2381.github.io/decagon/">
+    <meta property="og:image" content="https://schew2381.github.io/decagon/social-preview.png">
+    <meta
+      property="og:image:alt"
+      content="Blueprint of an AI model gateway and web crawler for the Decagon infrastructure interview lab."
+    >
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:image" content="https://schew2381.github.io/decagon/social-preview.png">
+    <meta
+      name="twitter:image:alt"
+      content="Blueprint of an AI model gateway and web crawler for the Decagon infrastructure interview lab."
+    >
+    <title>Decagon Infra Interview Lab</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+      href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;600;700&amp;family=IBM+Plex+Mono:wght@400;500;600&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;display=swap"
+      rel="stylesheet"
+    >
+    <link rel="stylesheet" href="styles.css?v=20260721-1">
+  </head>
+  <body>
+    <a class="skip-link" href="#course-view">Skip to the current exercise</a>
+
+    <div class="course-shell decagon-shell" id="app">
+      <aside class="course-rail" id="course-rail" aria-label="Interview course map">
+        <button class="brand-lockup" type="button" data-route="home" aria-label="Decagon interview lab home">
+          <span class="brand-mark decagon-mark" aria-hidden="true">
+            <span></span>
+            <span></span>
+            <span></span>
+          </span>
+          <span class="brand-copy">
+            <strong>Decagon</strong>
+            <small>Infra interview lab</small>
+          </span>
+        </button>
+        <button class="mobile-map-close" id="mobile-map-close" type="button" aria-label="Close interview map">×</button>
+
+        <section class="rail-progress" aria-labelledby="progress-label">
+          <div class="progress-copy">
+            <span id="progress-label">Interview readiness</span>
+            <strong id="progress-percent">0%</strong>
+          </div>
+          <div
+            class="progress-track"
+            role="progressbar"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            aria-valuenow="0"
+            aria-labelledby="progress-label"
+          >
+            <span id="progress-bar"></span>
+          </div>
+          <p id="progress-detail">Start with the interview operating loop.</p>
+        </section>
+
+        <nav class="module-nav decagon-nav" id="module-nav" aria-label="Interview tracks and modules"></nav>
+
+        <div class="rail-tools">
+          <label class="depth-control" for="mode-select">
+            <span>Practice mode</span>
+            <select id="mode-select">
+              <option value="learn">Learn</option>
+              <option value="interview">Interview</option>
+              <option value="reference">Reference</option>
+            </select>
+          </label>
+          <button class="quiet-button" id="reset-progress" type="button">Reset preparation</button>
+        </div>
+      </aside>
+
+      <div class="course-stage">
+        <header class="course-topbar">
+          <div class="breadcrumbs" id="breadcrumbs" aria-label="Breadcrumb"></div>
+          <div class="topbar-actions">
+            <button class="search-trigger" id="search-trigger" type="button" aria-haspopup="dialog" aria-label="Search the course">
+              <span aria-hidden="true">⌕</span>
+              <span>Search course</span>
+              <kbd>⌘ K</kbd>
+            </button>
+            <button
+              class="mobile-map-trigger"
+              id="mobile-map-trigger"
+              type="button"
+              aria-controls="course-rail"
+              aria-expanded="false"
+            >
+              Interview map
+            </button>
+          </div>
+        </header>
+
+        <main id="course-view" tabindex="-1"></main>
+      </div>
+
+      <aside class="context-drawer decagon-notebook" id="context-drawer" aria-label="Interview notebook"></aside>
+    </div>
+
+    <dialog class="search-dialog" id="search-dialog" aria-labelledby="search-title">
+      <div class="search-dialog-head">
+        <div>
+          <span class="eyebrow">Course index</span>
+          <h2 id="search-title">Find a concept or drill</h2>
+        </div>
+        <button class="icon-button" id="search-close" type="button" aria-label="Close search">×</button>
+      </div>
+      <label class="search-field" for="search-input">
+        <span aria-hidden="true">⌕</span>
+        <input
+          id="search-input"
+          type="search"
+          role="combobox"
+          aria-autocomplete="list"
+          aria-controls="search-results"
+          aria-expanded="false"
+          aria-label="Search course concepts and exercises"
+          placeholder="Try circuit breaker, hedge, or frontier"
+          autocomplete="off"
+        >
+      </label>
+      <div class="search-results" id="search-results" role="listbox"></div>
+      <p class="search-help"><kbd>↑</kbd><kbd>↓</kbd> move <kbd>Enter</kbd> open <kbd>Esc</kbd> close</p>
+    </dialog>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <div class="sr-only" id="live-region" aria-live="polite" aria-atomic="true"></div>
+
+    <noscript>
+      <div class="noscript-message">Enable JavaScript to run the gateway, crawler, code, and mock interview exercises.</div>
+    </noscript>
+
+    <script src="course-data.js?v=20260721-1" defer></script>
+    <script src="simulations.js?v=20260721-1" defer></script>
+    <script src="app.js?v=20260721-1" defer></script>
+  </body>
+</html>
