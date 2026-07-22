@@ -1,5 +1,5 @@
 window.DECAGON_COURSE = {
-  version: 1,
+  version: 3,
   contentRevision: "2026-07-21",
   title: "Decagon Infra Interview Lab",
   subtitle: "Build, benchmark, and defend an AI model gateway and a distributed web crawler",
@@ -101,7 +101,7 @@ window.DECAGON_COURSE = {
           },
           sources: [
             ["HTTP semantics and idempotency", "https://www.rfc-editor.org/rfc/rfc9110.html"],
-            ["OpenTelemetry GenAI metrics", "https://github.com/open-telemetry/semantic-conventions/blob/main/docs/gen-ai/gen-ai-metrics.md"],
+            ["OpenTelemetry GenAI semantic conventions", "https://github.com/open-telemetry/semantic-conventions-genai"],
             ["Envoy AI Gateway provider fallback", "https://aigateway.envoyproxy.io/docs/capabilities/traffic/provider-fallback/"]
           ]
         },
@@ -221,10 +221,10 @@ window.DECAGON_COURSE = {
       ],
       lab: {
         id: "request-oscilloscope",
-        title: "Trace one gateway request",
-        kind: "request-timeline",
-        badge: "Interactive trace",
-        intro: "Place queueing, attempt timeout, fallback, streaming commit, and cleanup on one caller deadline.",
+        title: "Classify gateway outcomes",
+        kind: "code-runner",
+        badge: "Browser-tested exercise",
+        intro: "Implement the boundary between caller errors, provider failures, overload, and neutral cancellation. Pass every deterministic case in the browser.",
         notebook: [
           "Write the response-equivalence assumption.",
           "Mark the downstream commit point.",
@@ -413,7 +413,7 @@ window.DECAGON_COURSE = {
         title: "Route through changing provider weather",
         kind: "routing-simulator",
         badge: "Seeded simulation",
-        intro: "Change provider latency, failures, probe rate, and cooldown. Compare success, p95, and stale-state age against the baseline.",
+        intro: "Hold the scenario and seed fixed, change one routing control, and compare success, tail latency, and calls per request against the baseline.",
         notebook: [
           "Record the seed and offered request rate.",
           "Explain every failure class used by the tracker.",
@@ -638,8 +638,8 @@ window.DECAGON_COURSE = {
           prediction: "You have a working round-robin gateway at minute 30. Should you add distributed health coordination or benchmark the next local routing change?",
           core: [
             "Use minutes 0 through 7 for the contract, failure classes, interface, and target metrics. Confirm how providers are mocked and how the result is evaluated.",
-            "Use minutes 7 through 37 for the baseline, total deadline, reusable clients, and bounded per-provider work. Run tests before changing policy.",
-            "Use minutes 37 through 64 for recent health, cooldown, exploration, and one benchmarked improvement. Reserve the final eleven minutes for edge cases, naming, and explanation."
+            "Use minutes 7 through 22 for one correct provider path, then minutes 22 through 37 for caps, the total deadline, fallback, and cleanup. Run deterministic tests before changing policy.",
+            "Use minutes 37 through 52 for one adaptive rule and minutes 52 through 64 for a comparable benchmark. Reserve the final eleven minutes for edge cases, naming, and explanation."
           ],
           mechanics: [
             { title: "Checkpoint 1", text: "The endpoint forwards one request correctly and has deterministic provider fakes." },
@@ -658,7 +658,8 @@ window.DECAGON_COURSE = {
             title: "Seventy-five minutes",
             nodes: [
               ["0-7", "contract"],
-              ["7-37", "baseline and caps"],
+              ["7-22", "one provider"],
+              ["22-37", "bounds and fallback"],
               ["37-52", "health policy"],
               ["52-64", "benchmark"],
               ["64-75", "tests and defense"]
@@ -793,10 +794,10 @@ window.DECAGON_COURSE = {
       ],
       lab: {
         id: "timed-gateway-coding",
-        title: "Run the coding round",
+        title: "Build the bounded gateway path",
         kind: "code-runner",
-        badge: "75-minute mock",
-        intro: "Implement against scripted providers. Checkpoints reveal at minutes 7, 37, 52, 64, and 75 while the benchmark notebook stays visible.",
+        badge: "Browser-tested integration",
+        intro: "Implement selection, fallback, one shared deadline, application and provider caps, cancellation, and exact cleanup against overlapping scripted requests.",
         notebook: [
           "Keep the contract and benchmark table visible.",
           "Log every accepted AI-generated change.",
@@ -1373,10 +1374,10 @@ window.DECAGON_COURSE = {
       ],
       lab: {
         id: "crawler-path-builder",
-        title: "Build the URL request path",
-        kind: "pipeline-builder",
-        badge: "Crawler path",
-        intro: "Arrange crawler stages, assign each piece of state to an owner, and choose what happens when a boundary is full or a worker crashes.",
+        title: "Size the crawler request path",
+        kind: "capacity-model",
+        badge: "Derived capacity model",
+        intro: "Convert the page target into separate fetch, authority, network, parser, storage, slowdown, and recovery limits. Explain the first bottleneck or least certain assumption.",
         notebook: [
           "Write five requirements and attach one architecture consequence to each.",
           "Estimate average and peak fetch rate plus storage per day.",
@@ -1659,17 +1660,18 @@ window.DECAGON_COURSE = {
           summary: "A staged implementation produces a correct baseline early, then spends remaining time on measured routing improvements and cleanup.",
           prediction: "At minute 45, the baseline works and one routing experiment is faster but occasionally leaks tasks. Do you add another strategy or repair lifecycle correctness?",
           core: [
-            "Use the supplied 75-minute duration. Reserve opening time for contract and benchmark inspection, then build a simple correct path, measure it, add one adaptive strategy, test failure and recovery, and finish with structure and notes.",
+            "Use the supplied 75-minute duration. Spend 0 to 7 minutes on the contract, 7 to 22 on one provider, 22 to 37 on bounds and fallback, 37 to 52 on adaptation, 52 to 64 on a comparable benchmark, and 64 to 75 on tests and defense.",
             "Narrate assumptions and inspect generated code. AI assistance may accelerate scaffolding, but you own deadlines, cancellation, caps, resource release, and test evidence.",
             "Keep a running benchmark table with strategy, workload, sample size, concurrency, latency percentiles, success rate, attempt count, and one interpretation. Do not report a faster mean while hiding errors or overload.",
             "Prefer a clear selector interface, provider adapter, bounded executor, health update, and test seam over a large framework. Interview code should be easy to review and extend."
           ],
           mechanics: [
-            { title: "0 to 10", text: "Clarify request semantics, inspect the provided runner, and write the first benchmark row." },
-            { title: "10 to 30", text: "Implement one-provider correctness, deadlines, error mapping, and a deterministic test." },
-            { title: "30 to 52", text: "Add bounded adaptive selection and measure normal, slow, and failing cases." },
-            { title: "52 to 65", text: "Test recovery, cancellation, queue bounds, and cleanup under concurrency." },
-            { title: "65 to 75", text: "Simplify names and ownership, rerun tests, and summarize evidence and remaining risks." }
+            { title: "0 to 7", text: "Clarify request semantics, inspect the runner, choose metrics, and sketch the interfaces." },
+            { title: "7 to 22", text: "Implement one-provider correctness, the absolute deadline, and a deterministic success test." },
+            { title: "22 to 37", text: "Add application and provider bounds, fallback, cancellation, and cleanup assertions." },
+            { title: "37 to 52", text: "Add one adaptive rule with a recovery path while preserving the simple policy." },
+            { title: "52 to 64", text: "Compare the baseline and candidate under the same scripted provider behavior." },
+            { title: "64 to 75", text: "Repair lifecycle gaps, simplify ownership, rerun tests, and defend the evidence." }
           ],
           deep: [
             "If the runner behavior differs from an assumption, preserve the observed contract in the notebook before changing code. That prevents an optimization from solving the wrong workload.",
@@ -1681,11 +1683,12 @@ window.DECAGON_COURSE = {
             type: "timeline",
             title: "Seventy-five minute coding plan",
             nodes: [
-              ["Clarify", "10 min"],
-              ["Baseline", "20 min"],
-              ["Adapt", "22 min"],
-              ["Break it", "13 min"],
-              ["Polish", "10 min"]
+              ["0-7", "contract"],
+              ["7-22", "one provider"],
+              ["22-37", "bounds and fallback"],
+              ["37-52", "adaptation"],
+              ["52-64", "benchmark"],
+              ["64-75", "tests and defense"]
             ]
           },
           check: {
