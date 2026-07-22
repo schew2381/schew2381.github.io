@@ -5,6 +5,10 @@
   const Sim = window.DecagonSim;
   if (!course || !Sim) return;
 
+  const guides = window.DECAGON_GUIDES || {};
+  const LabModels = window.DecagonLabModels || {};
+  const appliedQuestions = window.DECAGON_APPLIED_QUESTIONS || {};
+
   course.modules.sort((a, b) => Number(a.number) - Number(b.number));
 
   const allLessons = course.modules.flatMap((module) =>
@@ -26,6 +30,8 @@
     designs: {},
     mockScores: {},
     mockNotes: {},
+    mockNoteUpdatedAt: {},
+    activeMockTimer: null,
     mode: "learn",
     lastRoute: "home"
   };
@@ -35,7 +41,10 @@
   let activeSearchIndex = 0;
   let activeGatewayRun = null;
   let activeCrawlerRun = null;
-  let activeTimer = null;
+  let activeFleetRun = null;
+  let activeIncidentRun = null;
+  let frontierFailedRun = null;
+  let activeTimer = restoreMockTimer(state.activeMockTimer);
   let timerInterval = null;
   let toastTimer = null;
 
@@ -47,13 +56,48 @@
   const searchDialog = document.querySelector("#search-dialog");
   const searchInput = document.querySelector("#search-input");
   const searchResults = document.querySelector("#search-results");
-  const modeSelect = document.querySelector("#mode-select");
+  const modeButtons = [...document.querySelectorAll("[data-mode-value]")];
 
   const trackLabels = {
     coding: "AI coding",
     "gateway-design": "Gateway design",
     "crawler-design": "Crawler design"
   };
+
+  const modeCopy = {
+    learn: {
+      label: "Guided lesson",
+      description: "Start with a concrete failure, follow one request, then work through the decision."
+    },
+    interview: {
+      label: "Interview drill",
+      description: "Answer from a blank page before revealing the expected reasoning and follow-up questions."
+    },
+    reference: {
+      label: "Reference sheet",
+      description: "Use the compact diagrams, decision tables, formulas, and source links while reviewing."
+    }
+  };
+
+  const gatewayPolicyLabels = {
+    fixed: "Prefer A, fallback on failure",
+    "round-robin": "Round robin",
+    "least-inflight": "Least in flight",
+    adaptive: "Error-aware EWMA",
+    hedge: "Adaptive with a delayed hedge"
+  };
+
+  const gatewayScenarioLabels = {
+    steady: "Steady",
+    "flaky-fast": "A is fast but flaky",
+    brownout: "Provider brownout",
+    recovery: "Failure then recovery",
+    "slow-tail": "Long latency tail"
+  };
+
+  function moduleTrackLabel(module) {
+    return module.id === "interview-rehearsals" ? "All three interviews" : trackLabels[module.track];
+  }
 
   function loadState() {
     try {
@@ -71,7 +115,8 @@
         codeResults: objectOrEmpty(saved.codeResults),
         designs: objectOrEmpty(saved.designs),
         mockScores: objectOrEmpty(saved.mockScores),
-        mockNotes: objectOrEmpty(saved.mockNotes)
+        mockNotes: objectOrEmpty(saved.mockNotes),
+        mockNoteUpdatedAt: objectOrEmpty(saved.mockNoteUpdatedAt)
       };
     } catch {
       return structuredClone(defaultState);
@@ -86,8 +131,28 @@
     return value && typeof value === "object" && !Array.isArray(value) ? value : {};
   }
 
+  function restoreMockTimer(value) {
+    if (!value || typeof value !== "object" || !mockById.has(value.mockId)) return null;
+    const mock = mockById.get(value.mockId);
+    const total = mock.minutes * 60;
+    const elapsed = Math.max(0, Math.min(total, Number(value.elapsed || 0)));
+    return {
+      mockId: mock.id,
+      remaining: Math.max(0, total - elapsed),
+      running: Boolean(value.running && elapsed < total),
+      started: Boolean(value.started),
+      elapsed,
+      startedAt: typeof value.startedAt === "string" ? value.startedAt : null,
+      attemptId: typeof value.attemptId === "string" ? value.attemptId : null,
+      rubricRevealed: Boolean(value.rubricRevealed),
+      elapsedAtRunStart: Math.max(0, Math.min(total, Number(value.elapsedAtRunStart ?? elapsed))),
+      runStartedAtMs: Number.isFinite(Number(value.runStartedAtMs)) ? Number(value.runStartedAtMs) : null
+    };
+  }
+
   function saveState() {
     try {
+      state.activeMockTimer = activeTimer ? structuredClone(activeTimer) : null;
       localStorage.setItem(storageKey, JSON.stringify(state));
     } catch {
       announce("This browser could not save your progress.");
@@ -161,7 +226,7 @@
   }
 
   function trackStats(trackId) {
-    const modules = course.modules.filter((module) => module.track === trackId);
+    const modules = course.modules.filter((module) => module.track === trackId && module.id !== "interview-rehearsals");
     const checkpoints = modules.reduce((sum, module) => sum + module.lessons.length + 2, 0);
     const completed = modules.reduce((sum, module) => sum + moduleProgress(module).complete, 0);
     const mock = course.mocks.find((item) => item.track === trackId);
@@ -194,15 +259,42 @@
       if (lesson) return routeFor("lesson", lesson.id);
       if (!state.completedLabs.includes(module.id)) return routeFor("lab", module.id);
       if ((state.quizScores[module.id] || 0) < passingScore) return routeFor("quiz", module.id);
+      const mockAfterModule = {
+        "coding-execution": "ai-gateway-coding",
+        "telemetry-recovery": "gateway-production-design",
+        "crawler-frontier": "web-crawler-design"
+      };
+      const mockId = mockAfterModule[module.id];
+      if (mockId && Number(state.mockScores[mockId]?.percent || 0) < 70) return routeFor("mock", mockId);
     }
-    const nextMock = course.mocks.find((mock) => Number(state.mockScores[mock.id]?.percent || 0) < 70);
-    return nextMock ? routeFor("mock", nextMock.id) : "home";
+    return "home";
+  }
+
+  function routeAfterModule(module) {
+    const mockAfterModule = {
+      "coding-execution": "mock/ai-gateway-coding",
+      "telemetry-recovery": "mock/gateway-production-design",
+      "crawler-frontier": "mock/web-crawler-design"
+    };
+    if (mockAfterModule[module.id]) return mockAfterModule[module.id];
+    const index = course.modules.findIndex((entry) => entry.id === module.id);
+    const next = course.modules[index + 1];
+    return next ? routeFor("module", next.id) : "home";
+  }
+
+  function labelAfterModule(module) {
+    if (module.id === "coding-execution") return "Run the coding mock";
+    if (module.id === "telemetry-recovery") return "Run the gateway design mock";
+    if (module.id === "crawler-frontier") return "Run the crawler design mock";
+    const index = course.modules.findIndex((entry) => entry.id === module.id);
+    return course.modules[index + 1] ? `Next: ${course.modules[index + 1].shortTitle}` : "Return to the course map";
   }
 
   function renderNav(activeModuleId) {
-    moduleNav.innerHTML = course.tracks
+    const rehearsal = course.modules.find((module) => module.id === "interview-rehearsals");
+    const trackNavigation = course.tracks
       .map((track) => {
-        const modules = course.modules.filter((module) => module.track === track.id);
+        const modules = course.modules.filter((module) => module.track === track.id && module.id !== "interview-rehearsals");
         return `
           <section class="nav-lane" aria-labelledby="nav-${track.id}">
             <div class="nav-lane-label" id="nav-${track.id}">${escapeHTML(track.shortLabel || track.label)}</div>
@@ -226,6 +318,35 @@
         `;
       })
       .join("");
+    const rehearsalNavigation = rehearsal ? `
+      <section class="nav-lane nav-lane-rehearsal" aria-labelledby="nav-rehearsal">
+        <div class="nav-lane-label" id="nav-rehearsal">Mock interviews</div>
+        ${(() => {
+          const progress = moduleProgress(rehearsal);
+          const status = progress.percent === 100 ? "Complete" : progress.complete ? "In progress" : "Not started";
+          return `
+            <button
+              class="module-nav-button"
+              type="button"
+              data-route="${routeFor("module", rehearsal.id)}"
+              ${rehearsal.id === activeModuleId ? 'aria-current="page"' : ""}
+            >
+              <span class="nav-index">${escapeHTML(rehearsal.number)}</span>
+              <span class="nav-label">${escapeHTML(rehearsal.shortTitle)}</span>
+              <span class="nav-status ${progress.percent === 100 ? "complete" : progress.complete ? "started" : ""}" aria-label="${status}"></span>
+            </button>
+          `;
+        })()}
+      </section>
+    ` : "";
+    moduleNav.innerHTML = trackNavigation + rehearsalNavigation;
+  }
+
+  function updateModePicker() {
+    for (const button of modeButtons) {
+      const selected = button.dataset.modeValue === state.mode;
+      button.setAttribute("aria-pressed", String(selected));
+    }
   }
 
   function updateProgress() {
@@ -248,39 +369,94 @@
   }
 
   function renderHome() {
-    renderBreadcrumbs([{ label: "Interview control room" }]);
+    renderBreadcrumbs([{ label: "Interview preparation" }]);
     if (!activeGatewayRun) activeGatewayRun = Sim.runGateway(defaultGatewayConfig());
     const stats = overallStats();
+    const currentMode = modeCopy[state.mode] || modeCopy.learn;
 
     view.innerHTML = `
-      <div class="home-view decagon-home">
-        <section class="decagon-hero" aria-labelledby="home-title">
-          <div class="hero-copy">
-            <span class="eyebrow">Decagon infrastructure interview lab</span>
-            <span class="freshness-stamp">Source audit · ${escapeHTML(course.verified.date)}</span>
-            <h1 class="hero-title" id="home-title"><span>Build it.</span><span>Scale it.</span><span>Defend it.</span></h1>
-            <p class="hero-lede">
-              Prepare for the AI gateway coding round, its production design follow-up, and the web crawler design round through measured practice.
-            </p>
-            <div class="hero-actions">
-              <button class="primary-button" type="button" data-route="${nextRoute()}">${stats.complete ? "Continue the next rep" : "Start with one request"}</button>
-              <button class="secondary-button" type="button" data-route="mock/ai-gateway-coding">Open a timed mock</button>
+      <div class="home-view decagon-home home-revision">
+        <section class="orientation-hero" aria-labelledby="home-title">
+          <div class="orientation-copy">
+            <div class="orientation-kicker">
+              <span class="eyebrow">Decagon infrastructure interview lab</span>
+              <span class="freshness-stamp">Sources checked ${escapeHTML(course.verified.date)}</span>
             </div>
-            <ul class="hero-facts" aria-label="Course facts">
-              <li>${allLessons.length} lessons</li>
-              <li>${course.modules.length} workbenches</li>
-              <li>${course.mocks.length} scored mocks</li>
-              <li>Progress stays in this browser</li>
-            </ul>
+            <h1 id="home-title">Build the gateway. Defend the system.</h1>
+            <p class="orientation-lede">The coding round and its system-design follow-up are one continuous problem. The crawler round tests the same habits against a different distributed system: define the contract, trace ownership, estimate capacity, and explain failure behavior.</p>
+            <div class="hero-actions">
+              <button class="primary-button" type="button" data-route="${nextRoute()}">${stats.complete ? "Continue your next exercise" : "Start the first guided lesson"}</button>
+              <button class="secondary-button" type="button" data-route="module/interview-rehearsals">See the three interview prompts</button>
+            </div>
+            <dl class="course-facts" aria-label="Course facts">
+              <div><dt>Lessons</dt><dd>${allLessons.length}</dd></div>
+              <div><dt>Hands-on labs</dt><dd>${course.modules.length}</dd></div>
+              <div><dt>Full mocks</dt><dd>${course.mocks.length}</dd></div>
+              <div><dt>Evidence recorded</dt><dd>${stats.complete}/${stats.total}</dd></div>
+            </dl>
           </div>
-          <div class="hero-console-wrap">
-            ${renderGatewayConsole("home", true)}
+
+          <div class="round-brief" aria-labelledby="round-brief-title">
+            <div class="round-brief-head">
+              <span class="eyebrow">How the interviews connect</span>
+              <h2 id="round-brief-title">Three rooms, two systems</h2>
+            </div>
+            <div class="round-stack">
+              <article class="round-card round-coding">
+                <div class="round-meta"><span>01</span><strong>75 min · coding</strong></div>
+                <h3>Build one correct request path</h3>
+                <p>Forward one model request to either provider, measure the result, then adapt without breaking deadlines or concurrency limits.</p>
+                <div class="mini-architecture gateway-mini" role="img" aria-label="Client request enters one gateway, which can call provider A or provider B.">
+                  <span>client</span><i aria-hidden="true">→</i><strong>gateway</strong><i aria-hidden="true">→</i><span class="provider-pair"><b>A</b><b>B</b></span>
+                </div>
+              </article>
+              <div class="round-connector" aria-hidden="true"><span></span><small>same prototype, production constraints</small></div>
+              <article class="round-card round-gateway">
+                <div class="round-meta"><span>02</span><strong>system design follow-up</strong></div>
+                <h3>Scale the gateway into a fleet</h3>
+                <p>Add replicas, shared quotas, local health, configuration rollout, streaming behavior, and telemetry without placing every decision on a central hot path.</p>
+                <div class="mini-architecture fleet-mini" role="img" aria-label="An edge sends requests to three gateway replicas, which share quota and telemetry services while calling two providers.">
+                  <span>edge</span><i aria-hidden="true">→</i><span class="replica-set"><b>g1</b><b>g2</b><b>g3</b></span><i aria-hidden="true">→</i><span>A · B</span>
+                </div>
+              </article>
+            </div>
+            <article class="round-card round-crawler">
+              <div class="round-meta"><span>03</span><strong>independent system design</strong></div>
+              <h3>Design a polite distributed crawler</h3>
+              <p>Turn seeds into durable work, schedule by authority and address, survive crashes, and keep untrusted destinations outside the crawler’s trust boundary.</p>
+              <div class="mini-architecture crawler-mini" role="img" aria-label="Seeds enter a durable frontier, then fetchers retrieve pages and store documents while discovered links return to the frontier.">
+                <span>seeds</span><i aria-hidden="true">→</i><strong>frontier</strong><i aria-hidden="true">→</i><span>fetch</span><i aria-hidden="true">→</i><span>store</span><em aria-hidden="true">↺ links</em>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section class="next-session" aria-labelledby="next-session-title">
+          <div>
+            <span class="eyebrow">Your next 25-minute block</span>
+            <h2 id="next-session-title">${escapeHTML(nextRepLabel())}</h2>
+            <p><strong>${escapeHTML(currentMode.label)}:</strong> ${escapeHTML(currentMode.description)}</p>
+          </div>
+          <div class="session-loop" aria-label="Recommended study loop">
+            <span><b>1</b> predict</span><i aria-hidden="true">→</i><span><b>2</b> trace</span><i aria-hidden="true">→</i><span><b>3</b> decide</span><i aria-hidden="true">→</i><span><b>4</b> retrieve</span>
+          </div>
+          <button class="primary-button" type="button" data-route="${nextRoute()}">Continue</button>
+        </section>
+
+        <section class="study-format-strip" aria-labelledby="study-format-title">
+          <div class="section-heading">
+            <div><span class="eyebrow">Study format</span><h2 id="study-format-title">Choose the kind of work you need now</h2></div>
+          </div>
+          <div class="study-format-grid" role="group" aria-label="Choose how lesson pages are presented">
+            <button type="button" data-mode-value="learn" aria-pressed="${state.mode === "learn"}"><strong>Guided</strong><span>Read the explanation, trace one example, work the numbers, then check your understanding.</span></button>
+            <button type="button" data-mode-value="interview" aria-pressed="${state.mode === "interview"}"><strong>Interview drill</strong><span>See the prompt first. Answer aloud before opening the guide, diagram, and follow-up questions.</span></button>
+            <button type="button" data-mode-value="reference" aria-pressed="${state.mode === "reference"}"><strong>Reference</strong><span>Review only the system diagram, decision table, key terms, and answer shape.</span></button>
           </div>
         </section>
 
         <section class="readiness-section" aria-labelledby="readiness-title">
           <div class="section-heading">
-            <div><span class="eyebrow">Three interview lanes</span><h2 id="readiness-title">Readiness is earned by evidence</h2></div>
+            <div><span class="eyebrow">Preparation plan</span><h2 id="readiness-title">Work one interview lane at a time</h2></div>
             <button class="quiet-button" type="button" data-route="notebook">Open interview notebook</button>
           </div>
           <div class="track-grid">
@@ -288,25 +464,19 @@
           </div>
         </section>
 
-        <section class="dependency-section" aria-labelledby="dependency-title">
+        <section class="home-experiment" aria-labelledby="experiment-title">
           <div class="section-heading">
-            <div><span class="eyebrow">Learning order</span><h2 id="dependency-title">The prototype becomes the design prompt</h2></div>
-          </div>
-          <div class="dependency-map" role="img" aria-label="AI coding leads to gateway system design. Interview operating skills also lead to the independent crawler system design.">
-            <div class="dependency-node shared"><strong>Interview loop</strong><span>ask · estimate · decide · test</span></div>
-            <span class="dependency-arrow" aria-hidden="true">→</span>
-            <div class="dependency-stack">
-              <div class="dependency-node coding"><strong>AI coding</strong><span>working gateway + benchmark</span></div>
-              <span class="dependency-arrow vertical" aria-hidden="true">↓</span>
-              <div class="dependency-node gateway"><strong>Gateway design</strong><span>fleet state + quotas + telemetry</span></div>
+            <div>
+              <span class="eyebrow">Optional first experiment</span>
+              <h2 id="experiment-title">Change one routing decision and read the evidence</h2>
+              <p>The simulator is below the course orientation on purpose. Use it after you can state what success, p95, p99, and calls per request mean.</p>
             </div>
-            <span class="dependency-branch" aria-hidden="true">↘</span>
-            <div class="dependency-node crawler"><strong>Crawler design</strong><span>frontier + politeness + durable capture</span></div>
           </div>
+          <div class="home-console-shell">${renderGatewayConsole("home", true)}</div>
         </section>
 
         <section class="module-map-section" aria-labelledby="map-title">
-          <div class="section-heading"><div><span class="eyebrow">Course map</span><h2 id="map-title">Nine focused workbenches</h2></div></div>
+          <div class="section-heading"><div><span class="eyebrow">Full course map</span><h2 id="map-title">Open any module when you need it</h2></div></div>
           <div class="module-card-grid">${course.modules.map(renderModuleCard).join("")}</div>
         </section>
       </div>
@@ -343,7 +513,7 @@
     const progress = moduleProgress(module);
     return `
       <article class="module-card" style="--module-color:${module.color};--module-soft:${module.soft}">
-        <div class="module-card-top"><span class="module-number">${escapeHTML(module.number)}</span><span class="module-track">${escapeHTML(trackLabels[module.track])}</span></div>
+        <div class="module-card-top"><span class="module-number">${escapeHTML(module.number)}</span><span class="module-track">${escapeHTML(moduleTrackLabel(module))}</span></div>
         <h3>${escapeHTML(module.title)}</h3>
         <p>${escapeHTML(module.description)}</p>
         <div class="module-card-meta"><span>${formatMinutes(module.duration)}</span><span>${module.lessons.length} lessons</span><span>${progress.percent}%</span></div>
@@ -359,7 +529,7 @@
       <div class="module-view" style="--module-color:${module.color};--module-soft:${module.soft}">
         <header class="module-hero">
           <div>
-          <span class="eyebrow">${escapeHTML(trackLabels[module.track])} · ${formatMinutes(module.duration)}</span>
+          <span class="eyebrow">${escapeHTML(moduleTrackLabel(module))} · ${formatMinutes(module.duration)}</span>
             <h1 id="module-title" tabindex="-1">${escapeHTML(module.title)}</h1>
             <p>${escapeHTML(module.description)}</p>
           </div>
@@ -401,9 +571,11 @@
   }
 
   function renderLesson(lesson, module) {
-    const position = allLessons.findIndex((entry) => entry.lesson.id === lesson.id);
-    const next = allLessons[position + 1];
+    const position = module.lessons.findIndex((entry) => entry.id === lesson.id);
+    const nextLesson = module.lessons[position + 1];
     const complete = state.completedLessons.includes(lesson.id);
+    const guide = normalizeLessonGuide(lesson);
+    const currentMode = modeCopy[state.mode] || modeCopy.learn;
     renderBreadcrumbs([
       { label: "Control room", route: "home" },
       { label: `Module ${module.number}`, route: `module/${module.id}` },
@@ -411,41 +583,260 @@
     ]);
 
     view.innerHTML = `
-      <article class="lesson-view" style="--module-color:${module.color};--module-soft:${module.soft}">
+      <article class="lesson-view lesson-mode-${escapeAttr(state.mode)}" style="--module-color:${module.color};--module-soft:${module.soft}">
         <header class="lesson-header">
-          <span class="eyebrow">Lesson ${escapeHTML(lesson.number)} · ${formatMinutes(lesson.duration)}</span>
+          <div class="lesson-meta-row">
+            <span class="eyebrow">Lesson ${escapeHTML(lesson.number)} · ${formatMinutes(lesson.duration)}</span>
+            <span class="lesson-mode-chip">${escapeHTML(currentMode.label)}</span>
+          </div>
           <h1 id="lesson-title" tabindex="-1">${escapeHTML(lesson.title)}</h1>
           <p class="lesson-summary">${escapeHTML(lesson.summary)}</p>
-          <div class="prediction-card"><span>Predict before reading</span><p>${escapeHTML(lesson.prediction)}</p></div>
+          ${state.mode === "learn" ? `<div class="prediction-card"><span>Commit to a prediction</span><p>${escapeHTML(lesson.prediction)}</p><small>You do not need to be right. The prediction gives the walkthrough something concrete to correct.</small></div>` : ""}
         </header>
-        <div class="lesson-body">
-          <section class="prose-section" aria-labelledby="model-title">
-            <span class="eyebrow">Working model</span><h2 id="model-title">Trace the system boundary</h2>
-            ${lesson.core.map((paragraph) => `<p>${escapeHTML(paragraph)}</p>`).join("")}
-          </section>
-          <section class="mechanics-grid" aria-label="Key mechanisms">
-            ${lesson.mechanics.map((item) => `<article><span class="mechanic-mark" aria-hidden="true"></span><h3>${escapeHTML(item.title)}</h3><p>${escapeHTML(item.text)}</p></article>`).join("")}
-          </section>
-          ${renderLessonVisual(lesson.visual, module)}
-          <details class="deep-section" ${state.mode === "interview" ? "open" : ""}>
-            <summary><span>Go one level deeper</span><small>implementation and trade-offs</small></summary>
-            <div>${lesson.deep.map((paragraph) => `<p>${escapeHTML(paragraph)}</p>`).join("")}</div>
-          </details>
-          <div class="lesson-callouts">
-            <aside class="bridge-card"><span>Interview bridge</span><h3>${escapeHTML(lesson.bridge.title)}</h3><p>${escapeHTML(lesson.bridge.text)}</p></aside>
-            <aside class="failure-card"><span>Failure test</span><h3>${escapeHTML(lesson.failure.title)}</h3><p>${escapeHTML(lesson.failure.text)}</p></aside>
-          </div>
-          ${renderQuickCheck(lesson, complete)}
-          <section class="sources-section" aria-labelledby="sources-title">
-            <span class="eyebrow">Direct sources</span><h2 id="sources-title">Read the contract, not a recap</h2>
-            <ul>${lesson.sources.map(([label, url]) => `<li><a href="${escapeAttr(url)}" target="_blank" rel="noreferrer">${escapeHTML(label)} <span aria-hidden="true">↗</span></a></li>`).join("")}</ul>
-          </section>
+        <div class="lesson-body">${state.mode === "interview"
+          ? renderInterviewLessonBody(lesson, guide, module, complete)
+          : state.mode === "reference"
+            ? renderReferenceLessonBody(lesson, guide, module)
+            : renderGuidedLessonBody(lesson, guide, module, complete)}
         </div>
         <footer class="lesson-footer">
           <button class="secondary-button" type="button" data-route="module/${module.id}">Module overview</button>
-          ${next ? `<button class="primary-button" type="button" data-route="lesson/${next.lesson.id}">Next: ${escapeHTML(next.lesson.title)}</button>` : `<button class="primary-button" type="button" data-route="lab/${module.id}">Open the lab</button>`}
+          ${nextLesson ? `<button class="primary-button" type="button" data-route="lesson/${nextLesson.id}">Next: ${escapeHTML(nextLesson.title)}</button>` : `<button class="primary-button" type="button" data-route="lab/${module.id}">Apply this module in the lab</button>`}
         </footer>
       </article>
+    `;
+  }
+
+  function normalizeLessonGuide(lesson) {
+    const guide = guides[lesson.id];
+    if (guide) return guide;
+    return {
+      contextTitle: "Why this decision exists",
+      context: lesson.core,
+      walkthrough: {
+        title: lesson.visual?.title || "Follow one request",
+        intro: "Keep one request in view while each boundary changes its state.",
+        steps: (lesson.visual?.nodes || []).map(([title, text]) => ({ title, text })),
+        takeaway: lesson.summary
+      },
+      workedExample: null,
+      explanations: [{ title: "Implementation details", paragraphs: lesson.deep }],
+      decisionTable: {
+        title: "Terms to keep separate",
+        columns: ["Concept", "What it controls"],
+        rows: lesson.mechanics.map((item) => [item.title, item.text])
+      },
+      diagram: {
+        type: "timeline",
+        title: lesson.visual?.title || "System trace",
+        caption: "Read the trace from left to right, then identify which component owns each transition.",
+        events: (lesson.visual?.nodes || []).map(([label, note]) => ({ label, note }))
+      },
+      interview: {
+        prompt: lesson.prediction,
+        answerPoints: lesson.core,
+        followups: [lesson.failure.text]
+      }
+    };
+  }
+
+  function renderGuidedLessonBody(lesson, guide, module, complete) {
+    return `
+      <section class="narrative-chapter" aria-labelledby="context-${escapeAttr(lesson.id)}">
+        <div class="chapter-number" aria-hidden="true">01</div>
+        <div class="chapter-copy">
+          <span class="eyebrow">Build the mental model</span>
+          <h2 id="context-${escapeAttr(lesson.id)}">${escapeHTML(guide.contextTitle)}</h2>
+          ${guide.context.map((paragraph) => `<p>${escapeHTML(paragraph)}</p>`).join("")}
+        </div>
+      </section>
+      ${renderWalkthrough(guide.walkthrough, "02")}
+      ${renderGuideDiagram(guide.diagram, module)}
+      ${renderWorkedExample(guide.workedExample, "03")}
+      ${renderExplanations(guide.explanations)}
+      ${renderDecisionTable(guide.decisionTable)}
+      ${renderTermList(lesson.mechanics)}
+      <details class="deep-section implementation-notes">
+        <summary><span>Implementation notes</span><small>code boundaries and edge cases</small></summary>
+        <div>${lesson.deep.map((paragraph) => `<p>${escapeHTML(paragraph)}</p>`).join("")}</div>
+      </details>
+      <aside class="failure-story">
+        <span class="eyebrow">Run the failure forward</span>
+        <h2>${escapeHTML(lesson.failure.title)}</h2>
+        <p>${escapeHTML(lesson.failure.text)}</p>
+      </aside>
+      ${renderInterviewTransfer(lesson, guide.interview)}
+      ${renderQuickCheck(lesson, complete)}
+      ${renderSources(lesson)}
+    `;
+  }
+
+  function renderInterviewLessonBody(lesson, guide, module, complete) {
+    return `
+      <section class="drill-brief" aria-labelledby="drill-${escapeAttr(lesson.id)}">
+        <span class="eyebrow">Closed-note drill</span>
+        <h2 id="drill-${escapeAttr(lesson.id)}">Answer before you reveal the guide</h2>
+        <blockquote>${escapeHTML(guide.interview.prompt)}</blockquote>
+        <ol>
+          <li>State the contract or invariant before naming a component.</li>
+          <li>Draw the normal request path and mark who owns each piece of state.</li>
+          <li>Inject one failure, then explain what remains available.</li>
+          <li>Name the metric or test that would disprove your design.</li>
+        </ol>
+      </section>
+      <details class="answer-reveal">
+        <summary><span>Reveal the answer guide</span><small>Open only after answering aloud</small></summary>
+        <div class="answer-reveal-body">
+          <section>
+            <h2>A strong answer covers these points</h2>
+            <ol>${guide.interview.answerPoints.map((point) => `<li>${escapeHTML(point)}</li>`).join("")}</ol>
+          </section>
+          ${renderGuideDiagram(guide.diagram, module)}
+          ${renderDecisionTable(guide.decisionTable)}
+          <section class="followup-list">
+            <h2>Expect these follow-ups</h2>
+            <ul>${guide.interview.followups.map((followup) => `<li>${escapeHTML(followup)}</li>`).join("")}</ul>
+          </section>
+          <aside class="failure-story compact">
+            <span class="eyebrow">Failure boundary</span>
+            <h2>${escapeHTML(lesson.failure.title)}</h2>
+            <p>${escapeHTML(lesson.failure.text)}</p>
+          </aside>
+        </div>
+      </details>
+      ${renderQuickCheck(lesson, complete)}
+      ${renderSources(lesson)}
+    `;
+  }
+
+  function renderReferenceLessonBody(lesson, guide, module) {
+    return `
+      <section class="reference-intro">
+        <span class="eyebrow">Reference sheet</span>
+        <h2>${escapeHTML(guide.contextTitle)}</h2>
+        <p>${escapeHTML(guide.context[0] || lesson.summary)}</p>
+      </section>
+      ${renderGuideDiagram(guide.diagram, module)}
+      ${renderWorkedExample(guide.workedExample, "Worked case")}
+      ${renderDecisionTable(guide.decisionTable)}
+      ${renderTermList(lesson.mechanics)}
+      <section class="reference-answer">
+        <h2>Answer shape</h2>
+        <ol>${guide.interview.answerPoints.map((point) => `<li>${escapeHTML(point)}</li>`).join("")}</ol>
+      </section>
+      <aside class="failure-story compact">
+        <span class="eyebrow">Failure boundary</span>
+        <h2>${escapeHTML(lesson.failure.title)}</h2>
+        <p>${escapeHTML(lesson.failure.text)}</p>
+      </aside>
+      ${renderSources(lesson)}
+    `;
+  }
+
+  function renderWalkthrough(walkthrough, number) {
+    if (!walkthrough?.steps?.length) return "";
+    return `
+      <section class="walkthrough-section" aria-labelledby="walkthrough-title">
+        <div class="chapter-number" aria-hidden="true">${escapeHTML(number)}</div>
+        <div class="chapter-copy">
+          <span class="eyebrow">Follow one concrete case</span>
+          <h2 id="walkthrough-title">${escapeHTML(walkthrough.title)}</h2>
+          <p class="chapter-intro">${escapeHTML(walkthrough.intro)}</p>
+          <ol class="walkthrough-steps">
+            ${walkthrough.steps.map((step, index) => `<li><span>${index + 1}</span><div><h3>${escapeHTML(step.title)}</h3><p>${escapeHTML(step.text)}</p></div></li>`).join("")}
+          </ol>
+          ${walkthrough.takeaway ? `<p class="walkthrough-takeaway"><strong>What changed:</strong> ${escapeHTML(walkthrough.takeaway)}</p>` : ""}
+        </div>
+      </section>
+    `;
+  }
+
+  function renderWorkedExample(example, number) {
+    if (!example) return "";
+    return `
+      <section class="worked-example" aria-labelledby="worked-example-title">
+        <div class="chapter-number" aria-hidden="true">${escapeHTML(number)}</div>
+        <div class="chapter-copy">
+          <span class="eyebrow">Work the numbers and state</span>
+          <h2 id="worked-example-title">${escapeHTML(example.title)}</h2>
+          <p>${escapeHTML(example.setup)}</p>
+          ${example.facts?.length ? `<dl class="example-facts">${example.facts.map((fact) => `<div><dt>${escapeHTML(fact.label)}</dt><dd>${escapeHTML(fact.value)}</dd></div>`).join("")}</dl>` : ""}
+          <ol class="example-steps">${(example.steps || []).map((step) => typeof step === "string" ? `<li>${escapeHTML(step)}</li>` : `<li><strong>${escapeHTML(step.title)}</strong><span>${escapeHTML(step.text)}</span></li>`).join("")}</ol>
+          <p class="example-result"><strong>Result:</strong> ${escapeHTML(example.result)}</p>
+        </div>
+      </section>
+    `;
+  }
+
+  function renderExplanations(explanations = []) {
+    return explanations.map((section) => `
+      <section class="explanation-section">
+        <h2>${escapeHTML(section.title)}</h2>
+        ${section.paragraphs.map((paragraph) => `<p>${escapeHTML(paragraph)}</p>`).join("")}
+      </section>
+    `).join("");
+  }
+
+  function renderDecisionTable(table) {
+    if (!table?.rows?.length) return "";
+    return `
+      <section class="decision-table" aria-labelledby="decision-table-title">
+        <div class="section-heading"><div><span class="eyebrow">Decision guide</span><h2 id="decision-table-title">${escapeHTML(table.title)}</h2></div></div>
+        <div class="table-scroll"><table><thead><tr>${table.columns.map((column) => `<th>${escapeHTML(column)}</th>`).join("")}</tr></thead><tbody>${table.rows.map((row) => `<tr>${row.map((cell) => `<td>${escapeHTML(cell)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>
+      </section>
+    `;
+  }
+
+  function renderTermList(items = []) {
+    if (!items.length) return "";
+    return `
+      <section class="term-list" aria-labelledby="term-list-title">
+        <span class="eyebrow">Keep these boundaries separate</span>
+        <h2 id="term-list-title">Terms in the design</h2>
+        <dl>${items.map((item) => `<div><dt>${escapeHTML(item.title)}</dt><dd>${escapeHTML(item.text)}</dd></div>`).join("")}</dl>
+      </section>
+    `;
+  }
+
+  function renderGuideDiagram(diagram, module) {
+    if (!diagram) return "";
+    let body = "";
+    if (diagram.type === "swimlane") {
+      body = `<div class="diagram-swimlanes">${diagram.lanes.map((lane) => `<section><h3>${escapeHTML(lane.label)}</h3><ol>${lane.items.map((item) => `<li>${escapeHTML(item)}</li>`).join("")}</ol></section>`).join("")}</div>`;
+    } else if (diagram.type === "branch") {
+      body = `<div class="diagram-branch"><div class="diagram-anchor">${escapeHTML(diagram.source)}</div><span aria-hidden="true">→</span><div class="diagram-branches">${diagram.branches.map((branch) => `<div><strong>${escapeHTML(branch.label)}</strong><small>${escapeHTML(branch.note)}</small></div>`).join("")}</div>${diagram.destination ? `<span aria-hidden="true">→</span><div class="diagram-anchor">${escapeHTML(diagram.destination)}</div>` : ""}</div>`;
+    } else if (diagram.type === "state-machine") {
+      body = `<p class="state-machine-guide">These are states, not a one-way pipeline. Follow the event-labeled transitions below, including the return paths.</p><div class="diagram-states">${diagram.states.map((state, index) => `<div><span>${String(index + 1).padStart(2, "0")}</span><strong>${escapeHTML(state.label)}</strong><small>${escapeHTML(state.note)}</small></div>`).join("")}</div>${diagram.transitions?.length ? `<div class="transition-map"><strong>Transition map</strong><ol class="diagram-transitions">${diagram.transitions.map((transition, index) => `<li><span>T${index + 1}</span><p>${escapeHTML(transition).replaceAll("-&gt;", '<b aria-hidden="true">→</b><span class="sr-only"> to </span>')}</p></li>`).join("")}</ol></div>` : ""}`;
+    } else {
+      const events = diagram.events || [];
+      body = `<ol class="diagram-timeline">${events.map((event, index) => `<li><span>${index + 1}</span><div><strong>${escapeHTML(event.label)}</strong><small>${escapeHTML(event.note)}</small></div></li>`).join("")}</ol>`;
+    }
+    return `
+      <figure class="teaching-diagram diagram-${escapeAttr(diagram.type || "timeline")}" style="--module-color:${module.color}">
+        <figcaption><span class="eyebrow">System model</span><strong>${escapeHTML(diagram.title)}</strong><p>${escapeHTML(diagram.caption || "")}</p></figcaption>
+        ${body}
+      </figure>
+    `;
+  }
+
+  function renderInterviewTransfer(lesson, interview) {
+    return `
+      <section class="interview-transfer" aria-labelledby="interview-transfer-title">
+        <span class="eyebrow">Translate it to the interview</span>
+        <h2 id="interview-transfer-title">${escapeHTML(lesson.bridge.title)}</h2>
+        <p>${escapeHTML(lesson.bridge.text)}</p>
+        <details><summary>Answer outline</summary><ol>${interview.answerPoints.map((point) => `<li>${escapeHTML(point)}</li>`).join("")}</ol></details>
+      </section>
+    `;
+  }
+
+  function renderSources(lesson) {
+    return `
+      <section class="sources-section" aria-labelledby="sources-${escapeAttr(lesson.id)}">
+        <span class="eyebrow">Primary sources</span>
+        <h2 id="sources-${escapeAttr(lesson.id)}">Check the contract behind the lesson</h2>
+        <ul>${lesson.sources.map(([label, url]) => `<li><a href="${escapeAttr(url)}" target="_blank" rel="noreferrer">${escapeHTML(label)} <span aria-hidden="true">↗</span></a></li>`).join("")}</ul>
+      </section>
     `;
   }
 
@@ -472,12 +863,13 @@
         <div class="choice-grid">
           ${lesson.check.choices.map((choice, index) => `<button class="choice-button" type="button" data-check-answer="${index}">${escapeHTML(choice)}</button>`).join("")}
         </div>
-        <div class="check-feedback" hidden></div>
+        <div class="check-feedback" role="status" aria-live="polite" tabindex="-1" hidden></div>
       </section>
     `;
   }
 
   function renderDrawer(route) {
+    if (!drawer) return;
     const latest = state.benchmarks[0];
     const tracks = course.tracks.map((track) => ({ track, stats: trackStats(track.id) }));
     drawer.innerHTML = `
@@ -497,7 +889,7 @@
         <section class="drawer-section">
           <div class="drawer-title-row"><span class="eyebrow">Benchmark notebook</span><button class="text-button" type="button" data-route="notebook">Open</button></div>
           ${latest ? `
-            <div class="latest-run"><strong>${escapeHTML(latest.policyLabel || latest.config?.policy || "Saved run")}</strong><span>${latest.metrics.successRate}% success · p95 ${latest.metrics.p95} ms</span><small>${escapeHTML(latest.fingerprint || "")}</small></div>
+            <div class="latest-run"><strong>${escapeHTML(latest.policyLabel || latest.config?.policy || "Saved run")}</strong><span>${latest.metrics.successRate}% success · successful-request p95 ${latest.metrics.successP95 ?? latest.metrics.p95} ms</span><small>${escapeHTML(latest.fingerprint || "")}</small></div>
           ` : `<p class="drawer-empty">Run the gateway lab and save a comparison.</p>`}
         </section>
         <section class="drawer-section interview-cue">
@@ -519,7 +911,8 @@
   }
 
   function renderRoute() {
-    stopTimer();
+    stopTimer(false);
+    announce("");
     const route = parseRoute();
     let activeModuleId = null;
 
@@ -549,7 +942,7 @@
     renderNav(activeModuleId);
     updateProgress();
     renderDrawer(route);
-    if (modeSelect) modeSelect.value = state.mode;
+    updateModePicker();
     const heading = view.querySelector("h1");
     if (heading) {
       heading.setAttribute("tabindex", "-1");
@@ -603,23 +996,91 @@
     };
   }
 
+  function gatewayHypothesisFromDOM(scope) {
+    const root = document.querySelector(`[data-gateway-scope="${CSS.escape(scope)}"]`);
+    return root?.querySelector('[name="hypothesis"]')?.value.trim() || "";
+  }
+
+  function gatewayInterpretationFromDOM(scope) {
+    const root = document.querySelector(`[data-gateway-scope="${CSS.escape(scope)}"]`);
+    return root?.querySelector('[name="interpretation"]')?.value.trim() || "";
+  }
+
+  function changedGatewayFields(left, right) {
+    const ignored = new Set(["scenario", "seed"]);
+    const keys = new Set([...Object.keys(left || {}), ...Object.keys(right || {})]);
+    return [...keys].filter((key) => !ignored.has(key) && left?.[key] !== right?.[key]);
+  }
+
+  function gatewayMetricsChanged(left, right) {
+    const fields = ["successRate", "successP95", "successP99", "terminalP95", "achievedRps", "attemptsPerRequest", "queueP95", "dropped", "retries", "hedges"];
+    return fields.some((field) => Number(left?.metrics?.[field] || 0) !== Number(right?.metrics?.[field] || 0));
+  }
+
+  function changedModelFields(left, right) {
+    const keys = new Set([...Object.keys(left || {}), ...Object.keys(right || {})]);
+    return [...keys].filter((key) => JSON.stringify(left?.[key]) !== JSON.stringify(right?.[key]));
+  }
+
+  function modelOutcomeChanged(baseline, candidate) {
+    const outcome = (run) => Object.fromEntries(
+      Object.entries(run || {}).filter(([key]) => !["config", "controls", "evidence", "modelVersion", "modelAssumptions"].includes(key))
+    );
+    return JSON.stringify(outcome(baseline)) !== JSON.stringify(outcome(candidate));
+  }
+
+  function gatewayModuleFromScope(scope) {
+    return scope.startsWith("lab-") ? scope.slice(4) : null;
+  }
+
+  function gatewayComparisonEvidence(moduleId, savedAfter = null) {
+    const allowedChanges = {
+      "adaptive-routing": new Set(["policy", "explorationPct", "hedgeMs"]),
+      "concurrency-resilience": new Set(["rps", "gatewayCap", "queueCap", "providerCapA", "providerCapB", "deadlineMs", "hedgeMs"])
+    };
+    const cutoff = savedAfter ? new Date(savedAfter).getTime() : 0;
+    const candidates = state.benchmarks.filter((run) => (
+      run.moduleId === moduleId
+      && (!cutoff || new Date(run.savedAt || 0).getTime() >= cutoff)
+    ));
+    for (let first = 0; first < candidates.length; first += 1) {
+      for (let second = first + 1; second < candidates.length; second += 1) {
+        const a = candidates[first];
+        const b = candidates[second];
+        if (a.config?.scenario !== b.config?.scenario || a.config?.seed !== b.config?.seed) continue;
+        const changed = changedGatewayFields(a.config, b.config);
+        if (changed.length !== 1) continue;
+        if (!allowedChanges[moduleId]?.has(changed[0])) continue;
+        if (!gatewayMetricsChanged(a, b)) continue;
+        if (String(a.hypothesis || "").length < 20 || String(b.hypothesis || "").length < 20) continue;
+        if (String(a.note || "").length < 40 || String(b.note || "").length < 40) continue;
+        return { baseline: b, candidate: a, changed };
+      }
+    }
+    return null;
+  }
+
   function renderGatewayConsole(scope, compact = false) {
-    const run = activeGatewayRun || Sim.runGateway(defaultGatewayConfig());
+    if (!activeGatewayRun || activeGatewayRun.evidence?.scope !== scope) {
+      activeGatewayRun = Sim.runGateway(defaultGatewayConfig());
+      activeGatewayRun.evidence = {
+        scope,
+        moduleId: gatewayModuleFromScope(scope),
+        ranByStudent: false,
+        hypothesis: "",
+        configFingerprint: Sim.stableFingerprint(activeGatewayRun.config)
+      };
+    }
+    const run = activeGatewayRun;
     const config = run.config || defaultGatewayConfig();
-    const scenarios = [
-      ["steady", "Steady"],
-      ["flaky-fast", "A is fast but flaky"],
-      ["brownout", "Provider brownout"],
-      ["recovery", "Failure then recovery"],
-      ["slow-tail", "Long latency tail"]
-    ];
-    const policies = [
-      ["fixed", "Fixed A"],
-      ["round-robin", "Round robin"],
-      ["least-inflight", "Least in flight"],
-      ["adaptive", "Error-aware EWMA"],
-      ["hedge", "Adaptive + delayed hedge"]
-    ];
+    const scenarios = Object.entries(gatewayScenarioLabels);
+    const policies = Object.entries(gatewayPolicyLabels);
+    const moduleId = gatewayModuleFromScope(scope);
+    const experimentRule = moduleId === "adaptive-routing"
+      ? "Keep the scenario and seed fixed. Change exactly one of: routing policy, explore percentage, or hedge delay."
+      : moduleId === "concurrency-resilience"
+        ? "Keep the scenario and seed fixed. Change exactly one of: offered RPS, gateway cap, queue cap, provider cap, deadline, or hedge delay."
+        : "";
 
     return `
       <section class="gateway-console ${compact ? "compact" : ""}" data-gateway-scope="${escapeAttr(scope)}" aria-labelledby="gateway-${escapeAttr(scope)}-title">
@@ -652,11 +1113,15 @@
                 ${numberControl("Explore %", "explorationPct", config.explorationPct, 0, 100)}
                 ${numberControl("Seed", "seed", config.seed, 1, 99999)}
               </div>
+              <label class="benchmark-hypothesis"><span>Hypothesis before the run</span><textarea name="hypothesis" placeholder="If I change one control, I expect success, tail latency, or attempt cost to change because…"></textarea></label>
+              <label class="benchmark-interpretation"><span>Interpretation after the run</span><textarea name="interpretation" placeholder="Did the result support the hypothesis? Name the metric change, attempt cost, and decision."></textarea></label>
+              ${experimentRule ? `<p class="experiment-constraint"><strong>Evidence rule:</strong> ${escapeHTML(experimentRule)}</p>` : ""}
             `}
             <div class="sim-actions">
               <button class="primary-button compact" type="button" data-run-gateway="${escapeAttr(scope)}">Run batch</button>
               ${compact ? `<button class="text-button" type="button" data-route="lab/adaptive-routing">Open full lab</button>` : `<button class="secondary-button compact" type="button" data-save-benchmark>Save result</button>`}
             </div>
+            ${compact ? "" : `<p class="run-evidence-status" data-run-evidence-status>${run.evidence?.ranByStudent ? "This result matches the controls and pre-run hypothesis." : "Write a hypothesis, then run the batch before saving evidence."}</p>`}
           </form>
           <div class="sim-output" data-gateway-output>${renderGatewayResult(run, compact)}</div>
         </div>
@@ -664,13 +1129,14 @@
     `;
   }
 
-  function numberControl(label, name, value, min, max) {
-    return `<label>${escapeHTML(label)}<input type="number" name="${escapeAttr(name)}" value="${escapeAttr(value)}" min="${min}" max="${max}" inputmode="numeric"></label>`;
+  function numberControl(label, name, value, min, max, step) {
+    const resolvedStep = step || (Number.isInteger(Number(value)) ? 1 : 0.01);
+    return `<label>${escapeHTML(label)}<input type="number" name="${escapeAttr(name)}" value="${escapeAttr(value)}" min="${min}" max="${max}" step="${escapeAttr(resolvedStep)}" inputmode="decimal"></label>`;
   }
 
   function renderGatewayResult(run, compact = false) {
     const metrics = run.metrics || {};
-    const rows = (run.requests || run.rows || []).slice(0, compact ? 6 : 18);
+    const rows = representativeRows(run.requests || run.rows || [], compact ? 6 : 18);
     const providers = run.providers || {};
     const deadlineMs = Math.max(1, Number(run.config?.deadlineMs || 1000));
     const warnings = Array.isArray(run.warnings) ? run.warnings : [];
@@ -678,15 +1144,19 @@
     return `
       <div class="metric-strip" aria-label="Gateway batch summary">
         ${metric("Success", `${valueOr(metrics.successRate, 0)}%`)}
-        ${metric("p50", `${valueOr(metrics.p50, 0)} ms`)}
-        ${metric("p95", `${valueOr(metrics.p95, 0)} ms`)}
-        ${metric("p99", `${valueOr(metrics.p99, 0)} ms`)}
-        ${metric("Calls/request", valueOr(metrics.attemptsPerRequest, 0))}
+        ${metric("Success p50", `${valueOr(metrics.successP50, metrics.p50 || 0)} ms`)}
+        ${metric("Success p95", `${valueOr(metrics.successP95, metrics.p95 || 0)} ms`)}
+        ${metric("Achieved RPS", valueOr(metrics.achievedRps, 0))}
+        ${metric("Calls/logical request", valueOr(metrics.attemptsPerRequest, 0))}
+        ${metric("Peak active / cap", `${valueOr(metrics.maxActive, 0)} / ${valueOr(run.config?.gatewayCap, 0)}`)}
+        ${metric("Peak queued / cap", `${valueOr(metrics.maxQueueDepth, 0)} / ${valueOr(run.config?.queueCap, 0)}`)}
       </div>
       <div class="provider-state-row">
         ${renderProviderState("A", providers.A || providers.a)}
         ${renderProviderState("B", providers.B || providers.b)}
       </div>
+      ${renderProviderTransitions(providers)}
+      ${renderGatewayWindows(run.windows || [])}
       <div class="request-waterfall" aria-label="Sample request waterfall">
         <div class="waterfall-axis"><span>arrival</span><span>deadline</span></div>
         ${rows.length ? rows.map((row, index) => renderRequestRow(row, index, deadlineMs)).join("") : `<p class="empty-inline">Run a batch to draw request attempts.</p>`}
@@ -695,6 +1165,9 @@
         <summary>Text result table</summary>
         <div class="table-scroll"><table><thead><tr><th>Metric</th><th>Value</th><th>What it tests</th></tr></thead><tbody>
           <tr><td>Success rate</td><td>${valueOr(metrics.successRate, 0)}%</td><td>End-user result before the deadline</td></tr>
+          <tr><td>Successful-request p99</td><td>${valueOr(metrics.successP99, metrics.p99 || 0)} ms</td><td>Tail latency among successful logical requests only</td></tr>
+          <tr><td>Terminal p95</td><td>${valueOr(metrics.terminalP95, 0)} ms</td><td>Time to any terminal result, including failures and immediate shedding</td></tr>
+          <tr><td>Offered / achieved RPS</td><td>${valueOr(metrics.offeredRps, run.config?.rps || 0)} / ${valueOr(metrics.achievedRps, 0)}</td><td>Demand compared with successful results per simulated second</td></tr>
           <tr><td>Queue p95</td><td>${valueOr(metrics.queueP95, 0)} ms</td><td>Admission pressure hidden by provider latency</td></tr>
           <tr><td>Dropped</td><td>${valueOr(metrics.dropped, 0)}</td><td>Bounded overload behavior</td></tr>
           <tr><td>Retries</td><td>${valueOr(metrics.retries, 0)}</td><td>Post-failure extra attempts</td></tr>
@@ -703,6 +1176,20 @@
       </details>
       ${warnings.length ? `<div class="sim-warnings" role="note">${warnings.map((warning) => `<p><span aria-hidden="true">!</span>${escapeHTML(warning)}</p>`).join("")}</div>` : ""}
     `;
+  }
+
+  function representativeRows(rows, limit) {
+    if (rows.length <= limit) return rows;
+    const indexes = new Set([0, rows.length - 1]);
+    for (let sample = 0; sample < limit; sample += 1) {
+      indexes.add(Math.round((sample / Math.max(1, limit - 1)) * (rows.length - 1)));
+    }
+    return [...indexes].sort((left, right) => left - right).slice(0, limit).map((index) => rows[index]);
+  }
+
+  function renderGatewayWindows(windows) {
+    if (!windows.length) return "";
+    return `<details class="gateway-phase-evidence" ${windows.some((window) => window.dropped > 0) ? "open" : ""}><summary>Phase evidence across the full run</summary><div class="table-scroll"><table><thead><tr><th>Window</th><th>Requests</th><th>Success</th><th>Success p95</th><th>A / B share</th><th>Peak active</th><th>Peak queued</th><th>Dropped</th></tr></thead><tbody>${windows.map((window) => `<tr><td>${escapeHTML(window.label)}</td><td>${valueOr(window.requestStart, 0)}–${valueOr(window.requestEnd, 0)}</td><td>${valueOr(window.successRate, 0)}%</td><td>${valueOr(window.successP95, 0)} ms</td><td>${valueOr(window.providerShareA, 0)}% / ${valueOr(window.providerShareB, 0)}%</td><td>${valueOr(window.maxActive, 0)}</td><td>${valueOr(window.maxQueued, 0)}</td><td>${valueOr(window.dropped, 0)}</td></tr>`).join("")}</tbody></table></div></details>`;
   }
 
   function valueOr(value, fallback) {
@@ -717,9 +1204,18 @@
     return `
       <article class="provider-state provider-${label.toLowerCase()}">
         <div><span class="provider-symbol" aria-hidden="true">${label === "A" ? "▲" : "●"}</span><strong>Provider ${label}</strong></div>
-        <dl><div><dt>State</dt><dd>${escapeHTML(provider.state || "closed")}</dd></div><div><dt>Share</dt><dd>${valueOr(provider.share, provider.sharePct || 0)}%</dd></div><div><dt>EWMA</dt><dd>${Math.round(valueOr(provider.latencyEWMA, provider.ewmaLatency || 0))} ms</dd></div></dl>
+        <dl><div><dt>State</dt><dd>${escapeHTML(provider.state || "closed")}</dd></div><div><dt>Share</dt><dd>${valueOr(provider.share, provider.sharePct || 0)}%</dd></div><div><dt>EWMA</dt><dd>${Math.round(valueOr(provider.latencyEWMA, provider.ewmaLatency || 0))} ms</dd></div><div><dt>Peak / cap</dt><dd>${valueOr(provider.maxInFlight, 0)} / ${valueOr(provider.cap, 0)}</dd></div></dl>
       </article>
     `;
+  }
+
+  function renderProviderTransitions(providers) {
+    const events = ["A", "B"].flatMap((providerName) => {
+      const provider = providers[providerName] || providers[providerName.toLowerCase()] || {};
+      return (provider.transitions || []).map((event) => ({ ...event, providerName }));
+    }).sort((left, right) => left.atMs - right.atMs).slice(-10);
+    if (!events.length) return `<p class="breaker-trace-empty">No circuit transition occurred in this batch. Choose a failure-heavy scenario or raise the request count to exercise cooldown and recovery.</p>`;
+    return `<section class="breaker-trace" aria-label="Provider circuit transitions"><span>Circuit transitions</span><div>${events.map((event) => `<article><strong>${escapeHTML(event.providerName)} · ${escapeHTML(event.state)}</strong><small>${Math.round(event.atMs)} ms</small><p>${escapeHTML(event.reason || "State changed.")}</p></article>`).join("")}</div></section>`;
   }
 
   function renderRequestRow(row, index, deadlineMs) {
@@ -759,7 +1255,7 @@
         </header>
         ${renderLabWorkbench(module)}
         ${renderNotebookCommands(module.lab.notebook)}
-        <footer class="lab-footer"><button class="secondary-button" type="button" data-route="module/${module.id}">Module overview</button><p data-lab-requirement>${labRequirement(module)}</p></footer>
+        <footer class="lab-footer"><div><button class="secondary-button" type="button" data-route="module/${module.id}">Module overview</button><button class="primary-button" type="button" data-route="quiz/${module.id}">Continue to the scenario test</button></div><p data-lab-requirement>${labRequirement(module)}</p></footer>
       </div>
     `;
   }
@@ -770,18 +1266,20 @@
       return renderGatewayConsole(`lab-${module.id}`, false);
     }
     if (["request-contract", "coding-execution"].includes(module.id)) return renderCodeLab(module);
-    if (["production-fleet", "telemetry-recovery"].includes(module.id)) return renderDesignBoard(module);
+    if (module.id === "production-fleet") return `${renderFleetLab()}${renderDesignBoard(module)}`;
+    if (module.id === "telemetry-recovery") return `${renderIncidentLab()}${renderDesignBoard(module)}`;
     if (module.id === "crawler-request-path") return renderCapacityLab(module);
     if (module.id === "crawler-frontier") return renderCrawlerLab(module);
     return renderMockHub();
   }
 
   function labRequirement(module) {
-    if (["adaptive-routing", "concurrency-resilience"].includes(module.id)) return "Save one benchmark result to complete this lab.";
+    if (["adaptive-routing", "concurrency-resilience"].includes(module.id)) return "Save a baseline and a one-control change with the same scenario and seed. Write a hypothesis before each run.";
     if (["request-contract", "coding-execution"].includes(module.id)) return "Pass every browser test to complete this lab.";
-    if (["production-fleet", "telemetry-recovery"].includes(module.id)) return "Choose each boundary, inject a failure, and record a rationale.";
-    if (module.id === "crawler-request-path") return "Calculate the five capacity constraints.";
-    if (module.id === "crawler-frontier") return "Finish with zero policy violations.";
+    if (module.id === "production-fleet") return "Change and run a fleet failure, satisfy every invariant, defend admission, and complete the architecture board.";
+    if (module.id === "telemetry-recovery") return "Change and run an incident, satisfy every invariant, explain recovery, and complete the architecture board.";
+    if (module.id === "crawler-request-path") return "Fit every modeled limit and explain the first bottleneck or least certain assumption.";
+    if (module.id === "crawler-frontier") return "Observe an unsafe run, repair it, and defend the state owner that makes the repair hold.";
     return "Score at least one mock rubric.";
   }
 
@@ -816,18 +1314,22 @@
 }`
     },
     "coding-execution": {
-      id: "choose-provider",
-      title: "Choose without starving recovery",
-      prompt: "Implement chooseProvider(states, request). Exclude cooldown and saturated providers. Every tenth request explores the provider with the oldest sample. Otherwise minimize the supplied score.",
-      functionName: "chooseProvider",
-      starter: `function chooseProvider(states, request) {
-  const eligible = states.filter((provider) =>
-    provider.cooldownUntil <= request.nowMs &&
-    provider.inFlight < provider.maxConcurrency
-  );
+      id: "build-gateway",
+      title: "Build the bounded request path",
+      prompt: "Implement createGateway({ providers, states, maxActive, recordOutcome }). Return an object with async handle(request). deadlineAtMs and nowMs share one monotonic clock domain. Try at most two eligible providers, sorted by score then ID. Enforce the application and provider caps, pass the remaining deadlineMs to each provider, and call the optional recordOutcome({ provider, status, elapsedMs }) after every returned result. Retry only 429, 5xx, and non-AbortError exceptions from a provider adapter; in this deterministic exercise, those exceptions represent transport errors and consume zero modeled milliseconds. Do not retry other 4xx responses or AbortError. A result that arrives after the absolute deadline fails with deadline_exhausted. Return the last eligible provider's returned response even if it is retryable, propagate its thrown transport error, and release every counter on every terminal path. Throw no_eligible_provider when no provider is eligible before the first attempt.",
+      functionName: "createGateway",
+      starter: `function createGateway({ providers, states, maxActive, recordOutcome = () => {} }) {
+  let active = 0;
 
-  // Return the selected provider id, or null.
-  return eligible[0]?.id ?? null;
+  async function handle(request) {
+    // request: { id, deadlineAtMs, nowMs }
+    // Success: { status, body, provider, attempts }
+    // Throw Error("gateway_overloaded") before accepting excess work.
+    // Throw Error("deadline_exhausted") when no deadline remains.
+    // Propagate AbortError without trying another provider.
+  }
+
+  return { handle };
 }`
     }
   };
@@ -843,8 +1345,11 @@
           <h2>${escapeHTML(exercise.title)}</h2>
           <p>${escapeHTML(exercise.prompt)}</p>
           <div class="code-contract"><strong>Contract</strong><code>${escapeHTML(exercise.functionName)}(...)</code><span>No network or wall-clock access</span></div>
+          ${exercise.id === "build-gateway" ? `<p class="code-scope-note">This grader isolates the sequential request-path core: absolute deadline, adaptive-feedback callback, fallback, caps, and cleanup. Use the routing simulator to test queueing, hedges, cooldown probes, and recovery phases.</p>` : ""}
           <ul class="test-preview">
-            <li>Normal result</li><li>Failure boundary</li><li>Cancellation or saturation</li><li>Deterministic tie</li>
+            ${exercise.id === "build-gateway"
+              ? "<li>Fallback and shared deadline</li><li>Application and provider caps</li><li>Caller errors and cancellation</li><li>Exact cleanup after overlap</li>"
+              : "<li>Normal result</li><li>Failure boundary</li><li>Cancellation or saturation</li><li>Deterministic classification</li>"}
           </ul>
         </div>
         <div class="editor-panel">
@@ -901,9 +1406,278 @@
           <div class="failure-readout" data-failure-readout>${renderFailureReadout(current.failure, module.id)}</div>
         </div>
         <label class="rationale-field"><span>Defend the design in 2 to 4 sentences</span><textarea data-design-field="rationale" placeholder="State the invariant, the failure behavior, and the trade-off.">${escapeHTML(current.rationale || "")}</textarea></label>
-        <div class="design-actions"><button class="primary-button" type="button" data-check-design="${escapeAttr(module.id)}">Check design evidence</button><p data-design-status>${current.checked ? "Design evidence recorded." : "Complete each decision and explain why."}</p></div>
+        <div class="design-actions"><button class="primary-button" type="button" data-check-design="${escapeAttr(module.id)}">Check architecture evidence</button><p data-design-status>${current.boardChecked ? "Architecture evidence recorded." : "Complete each decision and explain why."}</p></div>
       </section>
     `;
+  }
+
+  function defaultFleetConfig() {
+    return {
+      scenario: "healthy",
+      strategy: "leases",
+      replicas: 15,
+      zones: 3,
+      localCap: 10,
+      providerQuotaA: 100,
+      providerQuotaB: 100,
+      offeredConcurrency: 150,
+      normalShareA: 60,
+      failoverReserveB: 20,
+      leaseTtlSec: 60,
+      maxAttemptSec: 30,
+      coldStartPct: 20,
+      restartRampSec: 30
+    };
+  }
+
+  function renderFleetLab() {
+    if (typeof LabModels.runFleet !== "function") return renderLabModelError();
+    if (!activeFleetRun) {
+      activeFleetRun = LabModels.runFleet(defaultFleetConfig());
+      activeFleetRun.evidence = { ranByStudent: false, changedControls: [] };
+    }
+    const config = activeFleetRun.config;
+    return `
+      <section class="systems-lab" data-fleet-lab>
+        <aside class="systems-lab-controls sim-controls">
+          <span class="eyebrow">Fleet capacity model</span>
+          <h2>Keep a provider quota true across replicas</h2>
+          <p>Inject a fleet failure, then compare what each ownership strategy admits, sheds, or delegates.</p>
+          <label>Failure scenario<select name="scenario">
+            ${selectOptions([
+              ["coordinator-partition", "Capacity coordinator partition"],
+              ["provider-outage", "Provider A outage"],
+              ["zone-outage", "One gateway zone fails"],
+              ["mass-restart", "All gateway replicas restart"],
+              ["healthy", "Healthy control"]
+            ], config.scenario)}
+          </select></label>
+          <label>Quota ownership<select name="strategy">
+            ${selectOptions([
+              ["leases", "Expiring capacity leases"],
+              ["local-caps", "Independent local caps"],
+              ["central-check", "Central check per attempt"]
+            ], config.strategy)}
+          </select></label>
+          <div class="control-pair">${numberControl("Replicas", "replicas", config.replicas, 1, 500)}${numberControl("Zones", "zones", config.zones, 1, 20)}</div>
+          <div class="control-pair">${numberControl("Local cap", "localCap", config.localCap, 1, 100000)}${numberControl("Offered concurrency", "offeredConcurrency", config.offeredConcurrency, 0, 10000000)}</div>
+          <div class="control-pair">${numberControl("Provider A quota", "providerQuotaA", config.providerQuotaA, 1, 1000000)}${numberControl("Provider B quota", "providerQuotaB", config.providerQuotaB, 1, 1000000)}</div>
+          <div class="control-pair">${numberControl("B failover reserve", "failoverReserveB", config.failoverReserveB, 0, 1000000)}${numberControl("Normal share to A %", "normalShareA", config.normalShareA, 0, 100)}</div>
+          <div class="control-pair">${numberControl("Lease TTL sec", "leaseTtlSec", config.leaseTtlSec, 1, 3600)}${numberControl("Max attempt sec", "maxAttemptSec", config.maxAttemptSec, 1, 3600)}</div>
+          <details class="advanced-assumptions"><summary>Advanced restart assumptions</summary><div class="control-pair">${numberControl("Cold capacity %", "coldStartPct", config.coldStartPct, 1, 100)}${numberControl("Restart ramp sec", "restartRampSec", config.restartRampSec, 1, 600)}</div></details>
+          <button class="primary-button" type="button" data-run-fleet>Run fleet failure</button>
+        </aside>
+        <div class="systems-lab-output">
+          <div data-fleet-output>${renderFleetResult(activeFleetRun)}</div>
+          ${renderLabDefense("fleet", "Explain who owns the provider limit, what happens during this failure, and which work is shed.")}
+        </div>
+      </section>
+    `;
+  }
+
+  function selectOptions(options, selected) {
+    return options.map(([value, label]) => `<option value="${escapeAttr(value)}" ${value === selected ? "selected" : ""}>${escapeHTML(label)}</option>`).join("");
+  }
+
+  function renderFleetResult(run) {
+    const capacity = run.derivedCapacity || {};
+    const admitted = run.admitted || {};
+    const shed = run.shed || {};
+    const topology = run.topology || {};
+    return `
+      <div class="metric-strip systems-metrics" aria-label="Fleet simulation summary">
+        ${metric("Active replicas", `${valueOr(topology.activeReplicas, 0)} / ${valueOr(topology.replicas, 0)}`)}
+        ${metric("Safe service", valueOr(admitted.safelyServed, 0))}
+        ${metric("Gateway shed", valueOr(shed.atGateway, 0))}
+        ${metric("Provider rejected", valueOr(shed.rejectedByProvider, 0))}
+        ${metric("Unserved", valueOr(shed.totalUnserved, 0))}
+      </div>
+      <section class="model-explanation">
+        <span class="eyebrow">Derived capacity</span>
+        <h3>${escapeHTML(capacity.mode || "Capacity strategy")}</h3>
+        <p>${escapeHTML(capacity.detail || "")}</p>
+        <div class="capacity-ledger">
+          <div><span>Demand</span><strong>${valueOr(run.demand?.total, 0)}</strong></div>
+          <div><span>A allocation</span><strong>${valueOr(capacity.providerA, 0)}</strong></div>
+          <div><span>B allocation</span><strong>${valueOr(capacity.providerB, 0)}</strong></div>
+          <div><span>Potential quota excess</span><strong>${valueOr(run.oversubscription?.potentialTotal, 0)}</strong></div>
+        </div>
+      </section>
+      <p class="model-assumption-note">A mass restart begins at ${valueOr(run.config?.coldStartPct, 0)}% cold capacity and returns over ${valueOr(run.config?.restartRampSec, 0)} seconds. These values do not affect the other fleet scenarios.</p>
+      ${renderModelTimeline(run.timeline || [])}
+      ${renderInvariantList(run.invariants || [])}
+    `;
+  }
+
+  function defaultIncidentConfig() {
+    return {
+      scenario: "provider-outage",
+      configMode: "atomic",
+      durationSec: 120,
+      stepSec: 5,
+      rps: 1000,
+      gatewayCap: 2400,
+      queueCap: 5000,
+      providerCapA: 1500,
+      providerCapB: 1000,
+      baseP95Ams: 250,
+      baseP95Bms: 300,
+      slowdownMs: 600,
+      deadlineMs: 1200,
+      normalShareA: 60,
+      probeSharePct: 5,
+      faultStartSec: 30,
+      shiftDelaySec: 10,
+      recoveryStartSec: 80,
+      recoveryRampSec: 30,
+      coldStartPct: 20,
+      telemetryQueueBytes: 268435456,
+      telemetryBytesPerRequest: 1680,
+      telemetrySinkBytesPerSec: 2200000
+    };
+  }
+
+  function renderIncidentLab() {
+    if (typeof LabModels.runIncident !== "function") return renderLabModelError();
+    if (!activeIncidentRun) {
+      activeIncidentRun = LabModels.runIncident(defaultIncidentConfig());
+      activeIncidentRun.evidence = { ranByStudent: false, changedControls: [] };
+    }
+    const config = activeIncidentRun.config;
+    return `
+      <section class="systems-lab" data-incident-lab>
+        <aside class="systems-lab-controls sim-controls">
+          <span class="eyebrow">Incident timeline</span>
+          <h2>Keep forwarding separate from telemetry</h2>
+          <p>Move the failure and recovery controls, then inspect request and telemetry behavior on one clock.</p>
+          <label>Incident<select name="scenario">
+            ${selectOptions([
+              ["provider-outage", "Provider A outage"],
+              ["provider-slowdown", "Provider A slowdown"],
+              ["telemetry-sink-outage", "Telemetry sink outage"],
+              ["bad-configuration", "Invalid routing configuration"],
+              ["mass-restart", "Gateway fleet restart"]
+            ], config.scenario)}
+          </select></label>
+          <label>Configuration apply<select name="configMode">${selectOptions([["atomic", "Atomic version"], ["partial", "Partial field updates"]], config.configMode)}</select></label>
+          <div class="control-pair">${numberControl("Offered RPS", "rps", config.rps, 1, 100000)}${numberControl("Gateway cap", "gatewayCap", config.gatewayCap, 1, 1000000)}</div>
+          <div class="control-pair">${numberControl("Provider A cap", "providerCapA", config.providerCapA, 1, 1000000)}${numberControl("Provider B cap", "providerCapB", config.providerCapB, 1, 1000000)}</div>
+          <div class="control-pair">${numberControl("Queue cap", "queueCap", config.queueCap, 0, 10000000)}${numberControl("Deadline ms", "deadlineMs", config.deadlineMs, 25, 120000)}</div>
+          <div class="control-pair">${numberControl("Fault at sec", "faultStartSec", config.faultStartSec, 0, 600)}${numberControl("Detect in sec", "shiftDelaySec", config.shiftDelaySec, 0, 120)}</div>
+          <div class="control-pair">${numberControl("Recover at sec", "recoveryStartSec", config.recoveryStartSec, 0, 600)}${numberControl("Ramp sec", "recoveryRampSec", config.recoveryRampSec, 1, 300)}</div>
+          ${numberControl("Timeline duration sec", "durationSec", config.durationSec, 30, 3600)}
+          <div class="control-pair">${numberControl("Telemetry buffer bytes", "telemetryQueueBytes", config.telemetryQueueBytes, 0, 1000000000000)}${numberControl("Sink bytes/sec", "telemetrySinkBytesPerSec", config.telemetrySinkBytesPerSec, 0, 10000000000)}</div>
+          <details class="advanced-assumptions"><summary>Advanced workload assumptions</summary>
+            <div class="control-pair">${numberControl("Base A p95 ms", "baseP95Ams", config.baseP95Ams, 5, 60000)}${numberControl("Base B p95 ms", "baseP95Bms", config.baseP95Bms, 5, 60000)}</div>
+            <div class="control-pair">${numberControl("Slowdown added ms", "slowdownMs", config.slowdownMs, 0, 60000)}${numberControl("Cold capacity %", "coldStartPct", config.coldStartPct, 1, 100)}</div>
+            <div class="control-pair">${numberControl("Normal A share %", "normalShareA", config.normalShareA, 0, 100)}${numberControl("Probe share %", "probeSharePct", config.probeSharePct, 0, 25)}</div>
+            ${numberControl("Telemetry bytes/request", "telemetryBytesPerRequest", config.telemetryBytesPerRequest, 0, 1000000)}
+          </details>
+          <button class="primary-button" type="button" data-run-incident>Run incident timeline</button>
+        </aside>
+        <div class="systems-lab-output">
+          <div data-incident-output>${renderIncidentResult(activeIncidentRun)}</div>
+          ${renderLabDefense("incident", "Name the first useful alert, state what remains available, and explain how recovery avoids a traffic surge.")}
+        </div>
+      </section>
+    `;
+  }
+
+  function renderIncidentResult(run) {
+    const summary = run.summary || {};
+    const points = incidentDisplayPoints(run.timePoints || []);
+    const assumptions = run.modelAssumptions || {};
+    return `
+      <div class="metric-strip systems-metrics" aria-label="Incident simulation summary">
+        ${metric("Lowest success", `${valueOr(summary.minSuccessRate, 0)}%`)}
+        ${metric("Highest terminal p95", `${valueOr(summary.maxP95Ms, 0)} ms`)}
+        ${metric("Peak active", valueOr(summary.maxActiveAttempts, 0))}
+        ${metric("Peak queue", valueOr(summary.maxQueueDepth, 0))}
+        ${metric("Queue expired", valueOr(summary.totalQueueExpiredRequests, 0))}
+        ${metric("Queue rejected", valueOr(summary.totalQueueRejectedRequests, 0))}
+        ${metric("Telemetry dropped", formatBytes(valueOr(summary.totalTelemetryDroppedBytes, 0)))}
+      </div>
+      <section class="incident-trace" aria-labelledby="incident-trace-title">
+        <div class="section-heading"><div><span class="eyebrow">Shared clock</span><h3 id="incident-trace-title">Fault, detection, and recovery</h3></div></div>
+        <div class="table-scroll"><table><thead><tr><th>Time</th><th>Phase</th><th>Success</th><th>Terminal p95</th><th>A / B share</th><th>Provider health</th><th>Config</th><th>Queue</th><th>Expired</th><th>Rejected</th><th>Sink</th><th>Telemetry dropped</th><th>Buffered</th></tr></thead><tbody>
+          ${points.map((point) => `<tr><td>${valueOr(point.timeSec, 0)}s</td><td><span class="phase-chip phase-${escapeAttr(point.phase || "healthy")}">${escapeHTML(point.phase || "healthy")}</span></td><td>${valueOr(point.successRate, 0)}%</td><td>${valueOr(point.p95Ms, 0)} ms</td><td>${valueOr(point.providerShare?.providerA, 0)}% / ${valueOr(point.providerShare?.providerB, 0)}%</td><td>${escapeHTML(point.providerHealth?.providerA || "-")} / ${escapeHTML(point.providerHealth?.providerB || "-")}</td><td>${escapeHTML(point.configurationState || "-")}</td><td>${valueOr(point.queueDepth, 0)}</td><td>${valueOr(point.queueExpired, 0)}</td><td>${valueOr(point.queueDropped, 0)}</td><td>${escapeHTML(point.telemetry?.sinkState || "-")}</td><td>${formatBytes(valueOr(point.telemetry?.droppedBytes, 0))}</td><td>${formatBytes(valueOr(point.telemetry?.bufferedBytes, 0))}</td></tr>`).join("")}
+        </tbody></table></div>
+      </section>
+      <p class="model-assumption-note">Latency uses ${valueOr(assumptions.latencyBucketCount, 0)} deterministic buckets calibrated to A/B p95 values of ${valueOr(run.config?.baseP95Ams, 0)} / ${valueOr(run.config?.baseP95Bms, 0)} ms, plus ${valueOr(assumptions.queueDelayBucketCount, 0)} queue-delay buckets. The normal A share is ${valueOr(run.config?.normalShareA, 0)}%, recovery probes use ${valueOr(run.config?.probeSharePct, 0)}%, restart capacity begins at ${valueOr(run.config?.coldStartPct, 0)}%, and each request emits ${valueOr(run.config?.telemetryBytesPerRequest, 0)} telemetry bytes. Work beyond the deadline expires, while work beyond the queue cap is rejected.</p>
+      ${renderInvariantList(run.invariants || [])}
+    `;
+  }
+
+  function incidentDisplayPoints(points) {
+    if (points.length <= 30) return points;
+    const stride = Math.max(1, Math.ceil(points.length / 24));
+    const extrema = new Set();
+    const preserveExtreme = (select, direction) => {
+      let selectedIndex = 0;
+      for (let index = 1; index < points.length; index += 1) {
+        if (direction * select(points[index]) > direction * select(points[selectedIndex])) selectedIndex = index;
+      }
+      extrema.add(selectedIndex);
+    };
+    preserveExtreme((point) => Number(point.successRate || 0), -1);
+    preserveExtreme((point) => Number(point.p95Ms || 0), 1);
+    preserveExtreme((point) => Number(point.queueDepth || 0), 1);
+    preserveExtreme((point) => Number(point.queueDropped || 0), 1);
+    preserveExtreme((point) => Number(point.queueExpired || 0), 1);
+    preserveExtreme((point) => Number(point.telemetry?.droppedBytes || 0), 1);
+    preserveExtreme((point) => Number(point.telemetry?.bufferedBytes || 0), 1);
+    const signature = (point) => [
+      point.phase,
+      point.providerHealth?.providerA,
+      point.providerHealth?.providerB,
+      point.configurationState,
+      point.telemetry?.sinkState,
+      Number(point.telemetry?.droppedBytes || 0) > 0
+    ].join("|");
+    return points.filter((point, index) => (
+      index === 0
+      || index === points.length - 1
+      || extrema.has(index)
+      || index % stride === 0
+      || signature(point) !== signature(points[index - 1])
+      || signature(point) !== signature(points[index + 1] || point)
+    ));
+  }
+
+  function renderModelTimeline(events) {
+    if (!events.length) return "";
+    return `<section class="model-timeline"><span class="eyebrow">Failure timeline</span><div>${events.map((event) => `<article><span>${event.timeSec === null || event.timeSec === undefined || !Number.isFinite(Number(event.timeSec)) ? "never" : `${event.timeSec}s`}</span><strong>${escapeHTML(event.label || "Event")}</strong><p>${escapeHTML(event.detail || "")}</p></article>`).join("")}</div></section>`;
+  }
+
+  function renderInvariantList(invariants) {
+    const passing = invariants.filter((invariant) => invariant.ok).length;
+    return `
+      <section class="invariant-panel" aria-label="Model invariants">
+        <div class="section-heading"><div><span class="eyebrow">Executable invariants</span><h3>${passing} of ${invariants.length} hold</h3></div></div>
+        <div class="invariant-list">${invariants.map((invariant) => `<article class="${invariant.ok ? "pass" : "fail"}"><span aria-hidden="true">${invariant.ok ? "✓" : "×"}</span><div><strong>${escapeHTML(invariant.name)}</strong><p>${escapeHTML(invariant.detail)}</p></div></article>`).join("")}</div>
+      </section>
+    `;
+  }
+
+  function renderLabDefense(kind, prompt) {
+    return `
+      <section class="lab-defense">
+        <label><span>Defend the result</span><small>${escapeHTML(prompt)}</small><textarea data-${escapeAttr(kind)}-defense placeholder="State the invariant, failure behavior, and trade-off in your own words."></textarea></label>
+        <button class="secondary-button" type="button" data-record-${escapeAttr(kind)}>Record this evidence</button>
+      </section>
+    `;
+  }
+
+  function renderLabModelError() {
+    return `<section class="empty-state"><h2>The lab model did not load.</h2><p>Reload the page. If the problem remains, use the lesson decision table while the model is repaired.</p></section>`;
+  }
+
+  function formatBytes(bytes) {
+    const value = Number(bytes || 0);
+    if (value >= 1e9) return `${(value / 1e9).toFixed(1)} GB`;
+    if (value >= 1e6) return `${(value / 1e6).toFixed(1)} MB`;
+    if (value >= 1e3) return `${(value / 1e3).toFixed(1)} KB`;
+    return `${Math.round(value)} B`;
   }
 
   function designConsequence(field, value) {
@@ -942,6 +1716,23 @@
     return consequences[field]?.[value] || "Choose an option to expose its consequence.";
   }
 
+  function expectedDesignValues(moduleId) {
+    return moduleId === "production-fleet"
+      ? { health: "local-aggregate", quota: "leases", config: "versioned" }
+      : { telemetry: "bounded-async", audit: "durable-event", tracing: "logical-child" };
+  }
+
+  function designRationaleHolds(moduleId, rationale) {
+    const text = String(rationale || "").trim();
+    const sentenceCount = text.split(/[.!?]+/).filter((part) => part.trim().length >= 12).length;
+    const vocabulary = moduleId === "production-fleet"
+      ? ["quota", "lease", "local", "health", "expiry", "expire", "shed", "capacity", "replica", "version", "known good", "failure"]
+      : ["bound", "queue", "drop", "replay", "dedup", "event", "audit", "span", "attempt", "sink", "latency", "failure"];
+    const normalized = text.toLowerCase();
+    const concepts = vocabulary.filter((term) => normalized.includes(term)).length;
+    return text.length >= 100 && sentenceCount >= 2 && concepts >= 3;
+  }
+
   function renderFailureReadout(failure, moduleId) {
     if (!failure) return `<p>Choose a failure and state what remains available.</p>`;
     const copy = {
@@ -957,68 +1748,230 @@
     return `<p><strong>Expected boundary:</strong> ${escapeHTML(copy[failure] || `State the request-path behavior for ${moduleId}.`)}</p>`;
   }
 
-  function renderCapacityLab(module) {
+  function defaultPipelineConfig() {
+    return {
+      pagesPerDay: 100000000,
+      peakFactor: 3,
+      attemptAmplification: 1.15,
+      meanFetchMs: 400,
+      p95FetchMs: 2000,
+      authorityGapMs: 5000,
+      perAuthorityConcurrency: 1,
+      meanResponseKiB: 200,
+      rawRetentionDays: 30,
+      replicationFactor: 2,
+      parserCpuMs: 20,
+      parserCores: 96,
+      fetchConcurrencyCap: 10000,
+      activeAuthoritiesAvailable: 25000,
+      networkCapacityGbps: 10,
+      rawStorageCapacityPB: 2,
+      browserRenderFraction: 0.1,
+      browserRenderMs: 4000,
+      browserRenderMemoryMiB: 512,
+      browserRenderConcurrencyCap: 2000,
+      browserRenderMemoryGiB: 1024,
+      separateRendererPool: true,
+      slowdown: { durationSeconds: 600, parserCapacityFactor: 0.2, inputRateMode: "average", queueCapacityPages: 500000, maxRecoverySeconds: 900 }
+    };
+  }
+
+  function renderCapacityLab() {
+    if (typeof LabModels.runCrawlPipeline !== "function") return renderLabModelError();
+    if (!activeCrawlerRun || activeCrawlerRun.kind !== "crawl-pipeline") {
+      activeCrawlerRun = LabModels.runCrawlPipeline(defaultPipelineConfig());
+      activeCrawlerRun.evidence = { ranByStudent: false, changedControls: [] };
+    }
+    const config = activeCrawlerRun.config;
     return `
-      <section class="capacity-workbench" data-capacity-lab>
-        <div class="capacity-inputs">
-          <span class="eyebrow">Capacity worksheet</span><h2>Start with rates and ownership</h2>
-          ${numberControl("Pages per day", "pagesPerDay", 100000000, 1000, 10000000000)}
-          ${numberControl("Mean response KiB", "responseKiB", 200, 1, 100000)}
-          ${numberControl("Mean fetch ms", "fetchMs", 400, 1, 60000)}
-          ${numberControl("Minimum authority gap ms", "authorityGapMs", 5000, 0, 600000)}
-          ${numberControl("Raw retention days", "retentionDays", 30, 1, 3650)}
-          ${numberControl("Replication factor", "replication", 2, 1, 5)}
-          <button class="primary-button" type="button" data-run-capacity>Calculate constraints</button>
-        </div>
-        <div class="capacity-output" data-capacity-output>
-          <div class="empty-calculator"><span aria-hidden="true">∑</span><p>Run the worksheet. Peak headroom, retries, parse load, and long-tail latency remain separate decisions.</p></div>
+      <section class="systems-lab" data-pipeline-lab>
+        <aside class="systems-lab-controls sim-controls">
+          <span class="eyebrow">Derived capacity model</span>
+          <h2>Turn a crawl target into separate limits</h2>
+          <p>The same page target produces different fetch, authority, network, parser, and storage requirements.</p>
+          <div class="control-pair">${numberControl("Pages per day", "pagesPerDay", config.pagesPerDay, 1000, 10000000000)}${numberControl("Peak factor", "peakFactor", config.peakFactor, 1, 20)}</div>
+          <div class="control-pair">${numberControl("Attempt amplification", "attemptAmplification", config.attemptAmplification, 1, 10)}${numberControl("Response KiB", "meanResponseKiB", config.meanResponseKiB, 1, 100000)}</div>
+          <div class="control-pair">${numberControl("Mean fetch ms", "meanFetchMs", config.meanFetchMs, 1, 60000)}${numberControl("p95 fetch ms", "p95FetchMs", config.p95FetchMs, 1, 120000)}</div>
+          <div class="control-pair">${numberControl("Authority gap ms", "authorityGapMs", config.authorityGapMs, 0, 600000)}${numberControl("Per-authority cap", "perAuthorityConcurrency", config.perAuthorityConcurrency, 1, 64)}</div>
+          ${numberControl("Active authorities", "activeAuthoritiesAvailable", config.activeAuthoritiesAvailable, 1, 100000000)}
+          <div class="control-pair">${numberControl("Fetch cap", "fetchConcurrencyCap", config.fetchConcurrencyCap, 1, 10000000)}${numberControl("Network Gbps", "networkCapacityGbps", config.networkCapacityGbps, 0.1, 100000)}</div>
+          <div class="control-pair">${numberControl("Parser cores", "parserCores", config.parserCores, 1, 100000)}${numberControl("Parser CPU ms", "parserCpuMs", config.parserCpuMs, 0.1, 60000)}</div>
+          <div class="control-pair">${numberControl("Raw retention days", "rawRetentionDays", config.rawRetentionDays, 1, 3650)}${numberControl("Replication factor", "replicationFactor", config.replicationFactor, 1, 20)}</div>
+          ${numberControl("Raw store PB", "rawStorageCapacityPB", config.rawStorageCapacityPB, 0.01, 100000)}
+          <div class="control-pair">${numberControl("Render fraction 0–1", "browserRenderFraction", config.browserRenderFraction, 0, 1)}${numberControl("Render time ms", "browserRenderMs", config.browserRenderMs, 1, 120000)}</div>
+          <div class="control-pair">${numberControl("Render task MiB", "browserRenderMemoryMiB", config.browserRenderMemoryMiB, 1, 1000000)}${numberControl("Render memory GiB", "browserRenderMemoryGiB", config.browserRenderMemoryGiB, 1, 10000000)}</div>
+          ${numberControl("Render concurrency cap", "browserRenderConcurrencyCap", config.browserRenderConcurrencyCap, 1, 1000000)}
+          ${frontierToggle("separateRendererPool", "Keep rendering in a separate pool", config.separateRendererPool)}
+          <div class="control-pair">${numberControl("Slow parser factor", "parserCapacityFactor", config.slowdown.parserCapacityFactor, 0, 1)}${numberControl("Queue capacity pages", "queueCapacityPages", config.slowdown.queueCapacityPages, 1, 1000000000)}</div>
+          <div class="control-pair">${numberControl("Slowdown seconds", "slowdownDurationSeconds", config.slowdown.durationSeconds, 1, 86400)}${numberControl("Recovery objective sec", "maxRecoverySeconds", config.slowdown.maxRecoverySeconds, 1, 86400)}</div>
+          <label>Slowdown input rate<select name="slowdownInputRateMode">${selectOptions([["average", "Average accepted rate"], ["peak", "Peak accepted rate"]], config.slowdown.inputRateMode)}</select></label>
+          <button class="primary-button" type="button" data-run-pipeline>Recalculate constraints</button>
+        </aside>
+        <div class="systems-lab-output">
+          <div data-pipeline-output>${renderPipelineResult(activeCrawlerRun)}</div>
+          ${renderLabDefense("pipeline", "Identify the first bottleneck, distinguish logical pages from physical attempts, and state one assumption you would measure.")}
         </div>
       </section>
     `;
   }
 
-  function defaultCrawlerConfig() {
-    return { scheduler: "host-aware", workers: 8, perHostCap: 1, perIpCap: 2, minDelayMs: 1000, respectRobots: true, seed: 17, scenario: "mixed" };
+  function renderPipelineResult(run) {
+    const failed = (run.constraints || []).filter((constraint) => !constraint.ok);
+    return `
+      <div class="metric-strip systems-metrics" aria-label="Crawler capacity summary">
+        ${metric("Average pages/s", valueOr(run.rates?.averageAcceptedPagesPerSecond, 0))}
+        ${metric("Peak attempts/s", valueOr(run.rates?.peakFetchAttemptsPerSecond, 0))}
+        ${metric("Tail sizing proxy", valueOr(run.concurrency?.p95InFlightFetches, 0))}
+        ${metric("Authority supply", valueOr(run.concurrency?.activeAuthorityRequirement, 0))}
+        ${metric("Failed limits", failed.length)}
+      </div>
+      <section class="constraint-panel">
+        <div class="section-heading"><div><span class="eyebrow">Independent constraints</span><h3>${failed.length ? `First bottleneck: ${escapeHTML(run.firstBottleneck?.label || "Unknown")}` : "Every modeled limit fits"}</h3></div></div>
+        <div class="table-scroll"><table><thead><tr><th>Limit</th><th>Required</th><th>Available</th><th>Use</th><th>Result</th></tr></thead><tbody>
+          ${(run.constraints || []).map((constraint) => `<tr><td><strong>${escapeHTML(constraint.label)}</strong><small>${escapeHTML(constraint.detail)}</small></td><td>${constraint.required === null ? (constraint.unit === "seconds" ? "never" : "unbounded") : `${constraint.required} ${escapeHTML(constraint.unit)}`}</td><td>${valueOr(constraint.available, 0)} ${escapeHTML(constraint.unit)}</td><td>${constraint.utilizationPercent === null ? "∞" : `${constraint.utilizationPercent}%`}</td><td><span class="constraint-result ${constraint.ok ? "pass" : "fail"}">${constraint.ok ? "Fits" : "Exceeds"}</span></td></tr>`).join("")}
+        </tbody></table></div>
+      </section>
+      ${renderModelTimeline((run.timeline || []).map((event) => ({ ...event, timeSec: event.atSeconds })))}
+      <p class="model-assumption-note">This run uses ${valueOr(run.config?.replicationFactor, 0)} raw-body copies, ${valueOr(run.config?.browserRenderMemoryMiB, 0)} MiB per render task, and a ${valueOr(run.config?.slowdown?.durationSeconds, 0)} second parser slowdown at the ${escapeHTML(run.config?.slowdown?.inputRateMode || "average")} accepted rate. Recovery must finish within ${valueOr(run.config?.slowdown?.maxRecoverySeconds, 0)} seconds.</p>
+      ${renderInvariantList(run.invariants || [])}
+    `;
   }
 
-  function renderCrawlerLab(module) {
-    if (!activeCrawlerRun) activeCrawlerRun = Sim.runCrawler(defaultCrawlerConfig());
+  function defaultFrontierConfig() {
+    return {
+      scenario: "mixed",
+      scheduler: "authority-ready",
+      workers: 3,
+      perAuthorityConcurrency: 1,
+      sharedIpCap: 1,
+      enforceAuthorityReady: true,
+      enforceSharedIp: true,
+      robotsPolicy: "rfc9309",
+      durableLeases: true,
+      requeueExpiredLeases: true,
+      leaseMs: 800,
+      revalidateRedirects: true,
+      blockForbiddenAddresses: true,
+      pinValidatedAddress: true,
+      enforceEgress: true,
+      dedupeMode: "bloom-plus-exact",
+      enforceCrawlBudget: true,
+      maxUrlsPerAuthority: 6
+    };
+  }
+
+  function renderCrawlerLab() {
+    if (typeof LabModels.runFrontierChallenge !== "function") return renderLabModelError();
+    if (!activeCrawlerRun || activeCrawlerRun.kind !== "frontier-challenge") activeCrawlerRun = LabModels.runFrontierChallenge(defaultFrontierConfig());
+    const controls = activeCrawlerRun.controls;
     return `
-      <section class="crawler-workbench" data-crawler-lab>
-        <div class="crawler-controls sim-controls">
-          <label>Scheduler<select name="scheduler"><option value="host-aware">Host-aware ready heap</option><option value="fifo">Global FIFO</option></select></label>
-          <label>Scenario<select name="scenario"><option value="mixed">Mixed public web</option><option value="robots-503">robots.txt 503</option><option value="shared-ip">Two hosts share an IP</option><option value="trap">Infinite calendar trap</option><option value="partition">Stale shard owner</option></select></label>
-          <div class="control-pair">${numberControl("Workers", "workers", 8, 1, 64)}${numberControl("Per-host cap", "perHostCap", 1, 1, 8)}</div>
-          <div class="control-pair">${numberControl("Per-IP cap", "perIpCap", 2, 1, 16)}${numberControl("Host gap ms", "minDelayMs", 1000, 0, 60000)}</div>
-          <label class="check-control"><input type="checkbox" name="respectRobots" checked><span>Respect robots policy</span></label>
-          ${numberControl("Seed", "seed", 17, 1, 99999)}
-          <button class="primary-button" type="button" data-run-crawler>Drain valid frontier</button>
+      <section class="systems-lab" data-frontier-lab>
+        <aside class="systems-lab-controls sim-controls">
+          <span class="eyebrow">Break, observe, repair</span>
+          <h2>Preserve safety and work ownership</h2>
+          <p>Turn off one protection and run the challenge. Repair the failure, rerun it, then defend both results.</p>
+          <label>Scenario<select name="scenario">${selectOptions([
+            ["mixed", "Mixed frontier"], ["authority-ready", "Authority timing"], ["shared-ip", "Shared IP"], ["robots", "Robots outcomes"], ["lease-expiry", "Worker crash and lease expiry"], ["redirect-revalidation", "Forbidden redirect"], ["dns-rebinding", "DNS rebinding"], ["dedupe", "Approximate dedupe"], ["crawl-trap", "Calendar trap"]
+          ], activeCrawlerRun.scenario)}</select></label>
+          <label>Scheduler<select name="scheduler">${selectOptions([["authority-ready", "Authority-ready heap"], ["global-fifo", "Global FIFO"]], controls.scheduler)}</select></label>
+          <div class="control-pair">${numberControl("Workers", "workers", controls.workers, 1, 64)}${numberControl("Per-authority cap", "perAuthorityConcurrency", controls.perAuthorityConcurrency, 1, 16)}</div>
+          <div class="control-pair">${numberControl("Shared-IP cap", "sharedIpCap", controls.sharedIpCap, 1, 32)}${numberControl("Lease ms", "leaseMs", controls.leaseMs, 1, 60000)}</div>
+          <label>Robots policy<select name="robotsPolicy">${selectOptions([["rfc9309", "RFC 9309 split"], ["fail-open", "Allow after 5xx or unreachable"], ["block-on-any-error", "Block on every error"]], controls.robotsPolicy)}</select></label>
+          <label>Dedupe authority<select name="dedupeMode">${selectOptions([["bloom-plus-exact", "Bloom precheck, exact authority"], ["exact", "Exact only"], ["bloom-only", "Bloom result is final"], ["none", "No duplicate check"]], controls.dedupeMode)}</select></label>
+          ${frontierToggle("enforceAuthorityReady", "Enforce authority-ready time", controls.enforceAuthorityReady)}
+          ${frontierToggle("enforceSharedIp", "Enforce shared-IP cap", controls.enforceSharedIp)}
+          ${frontierToggle("durableLeases", "Use durable leases", controls.durableLeases)}
+          ${frontierToggle("requeueExpiredLeases", "Requeue expired leases", controls.requeueExpiredLeases)}
+          ${frontierToggle("revalidateRedirects", "Revalidate every redirect", controls.revalidateRedirects)}
+          ${frontierToggle("pinValidatedAddress", "Connect to validated address", controls.pinValidatedAddress)}
+          ${frontierToggle("enforceEgress", "Block forbidden egress", controls.enforceEgress)}
+          ${frontierToggle("enforceCrawlBudget", "Enforce authority crawl budget", controls.enforceCrawlBudget)}
+          ${numberControl("URLs per authority", "maxUrlsPerAuthority", controls.maxUrlsPerAuthority, 1, 10000)}
+          <button class="primary-button" type="button" data-run-frontier>Run frontier challenge</button>
+        </aside>
+        <div class="systems-lab-output">
+          <div data-frontier-output>${renderFrontierResult(activeCrawlerRun)}</div>
+          ${renderLabDefense("frontier", "Name the failure you observed, the owner of the violated state, and why the repaired run preserves coverage or safety.")}
         </div>
-        <div class="crawler-output" data-crawler-output>${renderCrawlerResult(activeCrawlerRun)}</div>
       </section>
     `;
   }
 
-  function renderCrawlerResult(run) {
+  function frontierToggle(name, label, checked) {
+    return `<label class="check-control"><input type="checkbox" name="${escapeAttr(name)}" ${checked ? "checked" : ""}><span>${escapeHTML(label)}</span></label>`;
+  }
+
+  function renderFrontierResult(run) {
     const metrics = run.metrics || {};
-    const events = (run.events || []).slice(0, 24);
-    const hosts = run.hosts || run.hostSummaries || [];
+    const events = frontierEventTrace(run.events || []);
     return `
-      <div class="metric-strip crawler-metrics">
-        ${metric("Fetched", valueOr(metrics.fetched, 0))}
-        ${metric("Blocked", valueOr(metrics.blocked, 0))}
-        ${metric("Retries", valueOr(metrics.retries, 0))}
-        ${metric("Violations", valueOr(metrics.policyViolations, 0))}
-        ${metric("Frontier age p95", `${valueOr(metrics.frontierAgeP95, 0)} ms`)}
+      <div class="metric-strip systems-metrics" aria-label="Frontier challenge summary">
+        ${metric("Discovered", valueOr(metrics.discovered, 0))}
+        ${metric("Completed", valueOr(metrics.completed, 0))}
+        ${metric("Makespan", `${valueOr(metrics.makespanMs, 0)} ms`)}
+        ${metric("Eligible-wait p95", `${valueOr(metrics.p95EligibleWaitMs, 0)} ms`)}
+        ${metric("Lease renewals", valueOr(metrics.leaseRenewals, 0))}
+        ${metric("Lost work", valueOr(metrics.lostLogicalWork, 0))}
+        ${metric("Duplicate fetches", valueOr(metrics.duplicateFetches, 0))}
+        ${metric("Budget blocked", valueOr(metrics.budgetDrops, 0))}
       </div>
-      <div class="host-queue-grid">
-        ${hosts.length ? hosts.map((host) => `<article><div><strong>${escapeHTML(host.host || host.authority || "authority")}</strong><span>${escapeHTML(host.ip || "resolved IP")}</span></div><dl><div><dt>Fetched</dt><dd>${valueOr(host.fetched, 0)}</dd></div><div><dt>Blocked</dt><dd>${valueOr(host.blocked, 0)}</dd></div><div><dt>Next eligible</dt><dd>${valueOr(host.nextAllowedAt, host.nextEligibleAt || 0)} ms</dd></div></dl></article>`).join("") : `<p>No host state returned.</p>`}
-      </div>
-      <div class="crawler-timeline table-scroll"><table><thead><tr><th>Time</th><th>Authority</th><th>Action</th><th>Reason</th></tr></thead><tbody>
-        ${events.map((event) => `<tr><td>${valueOr(event.timeMs, event.at || 0)} ms</td><td>${escapeHTML(event.host || event.authority || "-")}</td><td>${escapeHTML(event.action || event.type || "fetch")}</td><td>${escapeHTML(event.reason || event.status || "eligible")}</td></tr>`).join("")}
-      </tbody></table></div>
-      ${(run.warnings || []).length ? `<div class="sim-warnings">${run.warnings.map((warning) => `<p><span aria-hidden="true">!</span>${escapeHTML(warning)}</p>`).join("")}</div>` : ""}
+      <section class="frontier-verdict ${run.ok ? "pass" : "fail"}"><span>${run.ok ? "Safe run" : "Invariant failure"}</span><strong>${run.ok ? "Every modeled invariant holds." : `${run.invariants.filter((item) => !item.ok).length} invariants need repair.`}</strong></section>
+      ${renderFrontierRepairComparison(run)}
+      ${renderInvariantList(run.invariants || [])}
+      <section class="frontier-events"><div class="section-heading"><div><span class="eyebrow">Selected event trace</span><h3>From admission to terminal state</h3></div></div><div class="table-scroll"><table><thead><tr><th>Time</th><th>Authority</th><th>Event</th><th>Evidence</th></tr></thead><tbody>
+        ${events.map((event) => `<tr class="${event.safetyViolation || event.durabilityViolation ? "event-failure" : ""}"><td>${valueOr(event.atMs, 0)} ms</td><td>${escapeHTML(event.authority || "-")}</td><td>${escapeHTML(String(event.type || "event").replaceAll("_", " "))}</td><td>${escapeHTML(event.detail || "")}</td></tr>`).join("")}
+      </tbody></table></div></section>
     `;
+  }
+
+  function frontierEventTrace(allEvents) {
+    if (allEvents.length <= 36) return allEvents;
+    const routine = new Set(["lease_granted", "lease_renewed", "fetch_started", "fetch_completed"]);
+    const important = allEvents.filter((event) => !routine.has(event.type) || event.safetyViolation || event.durabilityViolation);
+    const ordinary = allEvents.filter((event) => routine.has(event.type) && !event.safetyViolation && !event.durabilityViolation);
+    return [...new Set([...important, ...ordinary.slice(0, 6), ...ordinary.slice(-6)])]
+      .sort((left, right) => left.atMs - right.atMs);
+  }
+
+  function frontierRepairEvaluation(failedRun, repairedRun) {
+    if (!failedRun || !repairedRun || failedRun.scenario !== repairedRun.scenario) {
+      return { ok: false, reasons: ["The failed and repaired runs must use the same scenario."] };
+    }
+    const failedNames = new Set(failedRun.invariants.filter((item) => !item.ok).map((item) => item.name));
+    const before = failedRun.controls || {};
+    const after = repairedRun.controls || {};
+    const reasons = [];
+    if (failedNames.has("Authority-ready times are respected") && !after.enforceAuthorityReady) reasons.push("Restore authority-ready scheduling instead of removing the timing contract.");
+    if (failedNames.has("Shared destinations stay inside their concurrency cap") && (!after.enforceSharedIp || after.sharedIpCap !== before.sharedIpCap)) reasons.push("Restore shared-destination admission while keeping the original destination cap.");
+    if (failedNames.has("Robots failures preserve the RFC 9309 safety split") && after.robotsPolicy !== "rfc9309") reasons.push("Restore the RFC 9309 outcome split for robots failures.");
+    if (failedNames.has("Redirects repeat destination validation") && !after.revalidateRedirects && !after.enforceEgress) reasons.push("Restore redirect validation or an independent egress boundary.");
+    if (failedNames.has("The connected peer matches a validated destination") && !after.pinValidatedAddress && !after.enforceEgress) reasons.push("Restore address pinning or an independent egress boundary.");
+    if (failedNames.has("Every authority remains inside its crawl budget") && (!after.enforceCrawlBudget || after.maxUrlsPerAuthority !== before.maxUrlsPerAuthority)) reasons.push("Restore authority-budget admission while keeping the original URL budget.");
+    if (failedNames.has("Exact URL identity is fetched at most once") && !["exact", "bloom-plus-exact"].includes(after.dedupeMode)) reasons.push("Restore an exact dedupe authority before fetching.");
+    if (failedNames.has("Approximate dedupe cannot silently remove new URLs") && !["exact", "bloom-plus-exact"].includes(after.dedupeMode)) reasons.push("Put an exact check behind the approximate membership filter.");
+    if (failedNames.has("Active work keeps durable lease ownership") && !after.durableLeases) reasons.push("Restore durable lease ownership and renewal for active work.");
+    if (failedNames.has("Expired leases return unfinished work") && (!after.durableLeases || !after.requeueExpiredLeases)) reasons.push("Restore durable lease expiry and requeue before claiming recovery.");
+    if (failedNames.has("Accepted logical work reaches a terminal state") && (!after.durableLeases || !after.requeueExpiredLeases)) reasons.push("Restore the durable recovery path for accepted work.");
+    return { ok: reasons.length === 0, reasons };
+  }
+
+  function renderFrontierRepairComparison(run) {
+    if (!run.ok || !frontierFailedRun || frontierFailedRun.scenario !== run.scenario) return "";
+    const failedInvariants = frontierFailedRun.invariants.filter((invariant) => !invariant.ok);
+    const changedControls = Object.keys(run.controls || {}).filter((key) => run.controls[key] !== frontierFailedRun.controls?.[key]);
+    const failedEvents = (frontierFailedRun.events || []).filter((event) => event.safetyViolation || event.durabilityViolation).slice(0, 6);
+    const repair = frontierRepairEvaluation(frontierFailedRun, run);
+    return `
+      <section class="repair-comparison" aria-label="Broken and repaired frontier comparison">
+        <div><span class="eyebrow">Broken run</span><strong>${failedInvariants.length} failed invariant${failedInvariants.length === 1 ? "" : "s"}</strong><ul>${failedInvariants.map((invariant) => `<li>${escapeHTML(invariant.name)}</li>`).join("")}</ul></div>
+        <div><span class="eyebrow">Repair</span><strong>${changedControls.length ? `Changed ${changedControls.map(formatControlName).join(", ")}` : "No control changed"}</strong><ul>${failedEvents.map((event) => `<li>${escapeHTML(event.detail || event.type)}</li>`).join("")}</ul></div>
+        <div><span class="eyebrow">Repaired run</span><strong>${repair.ok ? `All ${run.invariants.length} invariants hold under the original contract` : "The model passes only because the contract moved"}</strong><p>${escapeHTML(repair.ok ? "The failed and repaired runs keep the same scenario and safety limit." : repair.reasons[0])}</p></div>
+      </section>
+    `;
+  }
+
+  function formatControlName(value) {
+    return String(value).replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase();
   }
 
   function renderMockHub() {
@@ -1028,10 +1981,32 @@
   }
 
   function quizQuestions(module) {
-    return [
+    const applied = (appliedQuestions[module.id] || []).map((question) => ({
+        ...question,
+        explanation: question.explanation || question.rationale,
+        source: "Applied failure scenario"
+      }));
+    const recall = [
       ...module.lessons.map((lesson) => ({ ...lesson.check, source: lesson.title })),
       ...(module.quizExtra || []).map((question) => ({ ...question, source: "Scenario drill" }))
     ];
+    const interleaved = [];
+    for (let index = 0; index < Math.max(recall.length, applied.length); index += 1) {
+      if (recall[index]) interleaved.push(recall[index]);
+      if (applied[index]) interleaved.push(applied[index]);
+    }
+    return interleaved.map((question, index) => rebalanceQuestion(question, index, Number(module.number) || 0));
+  }
+
+  function rebalanceQuestion(question, index, moduleNumber) {
+    const target = (index * 3 + moduleNumber) % question.choices.length;
+    const correct = question.choices[question.answer];
+    const distractors = question.choices.filter((_, choiceIndex) => choiceIndex !== question.answer);
+    const shift = index % Math.max(1, distractors.length);
+    const rotated = [...distractors.slice(shift), ...distractors.slice(0, shift)];
+    const choices = [...rotated];
+    choices.splice(target, 0, correct);
+    return { ...question, choices, answer: target };
   }
 
   function startQuiz(module) {
@@ -1060,7 +2035,7 @@
           <div class="quiz-choices">
             ${question.choices.map((choice, index) => `<button type="button" class="quiz-choice ${activeQuiz.selected === index ? index === question.answer ? "correct" : "incorrect" : ""}" data-quiz-answer="${index}" ${activeQuiz.selected !== null ? "disabled" : ""}><span>${String.fromCharCode(65 + index)}</span>${escapeHTML(choice)}</button>`).join("")}
           </div>
-          ${activeQuiz.selected !== null ? `<div class="quiz-feedback ${activeQuiz.selected === question.answer ? "correct" : "incorrect"}"><strong>${activeQuiz.selected === question.answer ? "Correct" : `Answer: ${question.choices[question.answer]}`}</strong><p>${escapeHTML(question.explanation)}</p><button class="primary-button" type="button" data-next-question>${activeQuiz.index === activeQuiz.questions.length - 1 ? "See result" : "Next question"}</button></div>` : ""}
+          ${activeQuiz.selected !== null ? `<div class="quiz-feedback ${activeQuiz.selected === question.answer ? "correct" : "incorrect"}" role="status" aria-live="polite" tabindex="-1"><strong>${activeQuiz.selected === question.answer ? "Correct" : `Answer: ${question.choices[question.answer]}`}</strong><p>${escapeHTML(question.explanation)}</p><button class="primary-button" type="button" data-next-question>${activeQuiz.index === activeQuiz.questions.length - 1 ? "See result" : "Next question"}</button></div>` : ""}
         </article>
       </section>
     `;
@@ -1077,7 +2052,7 @@
         <span class="eyebrow">Scenario check complete</span><h1 tabindex="-1">${passed ? "The module signal is recorded." : "Run one more retrieval pass."}</h1>
         <div class="score-ring" aria-label="Score ${percent}%"><strong>${percent}%</strong><span>${activeQuiz.correct} of ${total}</span></div>
         <p>${passed ? "You met the 75% gate. Return later if you want a cleaner explanation under pressure." : "Review the missed failure boundaries, then retry. Your best score is saved."}</p>
-        <div class="result-actions"><button class="primary-button" type="button" data-retry-quiz="${escapeAttr(module.id)}">Retry test</button><button class="secondary-button" type="button" data-route="module/${module.id}">Module overview</button></div>
+        <div class="result-actions"><button class="secondary-button" type="button" data-retry-quiz="${escapeAttr(module.id)}">Retry test</button><button class="secondary-button" type="button" data-route="module/${module.id}">Module overview</button>${passed ? `<button class="primary-button" type="button" data-route="${routeAfterModule(module)}">${escapeHTML(labelAfterModule(module))}</button>` : ""}</div>
         <div class="answer-review"><h2>Answer review</h2>${activeQuiz.answers.map((answer, index) => { const question = activeQuiz.questions[index]; return `<details ${answer.correct ? "" : "open"}><summary><span>${answer.correct ? "✓" : "×"}</span>${escapeHTML(question.question)}</summary><p><strong>${escapeHTML(question.choices[question.answer])}</strong></p><p>${escapeHTML(question.explanation)}</p></details>`; }).join("")}</div>
       </section>
     `;
@@ -1085,28 +2060,124 @@
     renderDrawer(parseRoute());
   }
 
+  function mockCheckpointPlan(mock) {
+    if (mock.id === "ai-gateway-coding") {
+      return [
+        { at: 0, label: "Contract" },
+        { at: 7 * 60, label: "One provider" },
+        { at: 22 * 60, label: "Bounds and fallback" },
+        { at: 37 * 60, label: "Adaptation" },
+        { at: 52 * 60, label: "Benchmark" },
+        { at: 64 * 60, label: "Tests and defense" }
+      ];
+    }
+    return [
+      { at: 0, label: "Requirements" },
+      { at: Math.round(mock.minutes * 15), label: "Numbers" },
+      { at: Math.round(mock.minutes * 30), label: "Design" },
+      { at: Math.round(mock.minutes * 45), label: "Failures" },
+      { at: Math.round(mock.minutes * 55), label: "Defense" }
+    ];
+  }
+
+  function mockFollowupUnlockAt(mock, index) {
+    const coding = [22, 37, 52, 64].map((minutes) => minutes * 60);
+    const design = [0.25, 0.5, 0.75, 0.9].map((ratio) => Math.round(mock.minutes * 60 * ratio));
+    return (mock.id === "ai-gateway-coding" ? coding : design)[index] || mock.minutes * 60;
+  }
+
+  function renderMockRubric(mock, saved) {
+    const objectiveEvidence = mockObjectiveEvidence(mock);
+    if (!activeTimer.rubricRevealed) {
+      const ready = activeTimer.elapsed >= mock.minutes * 60;
+      return `<section class="rubric-panel rubric-locked" aria-labelledby="rubric-title"><span class="eyebrow">Closed until the rep ends</span><h2 id="rubric-title">Evidence rubric</h2><p>The rubric stays hidden so it cannot script the answer. Finish the timer, then reveal the objective artifacts and self-score.</p><button class="primary-button" type="button" data-reveal-rubric ${ready ? "" : "disabled"}>${ready ? "Reveal rubric" : `Available after ${formatClock(activeTimer.remaining)}`}</button></section>`;
+    }
+    return `<section class="rubric-panel" aria-labelledby="rubric-title"><span class="eyebrow">Score after answering aloud</span><h2 id="rubric-title">Evidence rubric</h2><p>Use 0 for missing, 1 for partial, and 2 for clear and defended.</p>
+      <div class="mock-objective-evidence"><strong>Required artifacts from this attempt</strong>${objectiveEvidence.map((item) => `<div class="${item.ok ? "pass" : "pending"}"><span aria-hidden="true">${item.ok ? "✓" : "○"}</span><span>${escapeHTML(item.label)}</span>${item.route && !item.ok ? `<button class="text-button" type="button" data-route="${escapeAttr(item.route)}">Open</button>` : ""}</div>`).join("")}</div>
+      <div class="rubric-list">${mock.rubric.map((item, index) => `<label><span><strong>${escapeHTML(item.label)}</strong><small>${escapeHTML(item.detail)}</small></span><select data-rubric-score="${index}" aria-label="Score ${escapeAttr(item.label)}"><option value="">Not scored</option><option value="0" ${saved.scores?.[index] === 0 ? "selected" : ""}>0</option><option value="1" ${saved.scores?.[index] === 1 ? "selected" : ""}>1</option><option value="2" ${saved.scores?.[index] === 2 ? "selected" : ""}>2</option></select></label>`).join("")}</div>
+      <label class="mock-evidence-check"><input type="checkbox" data-mock-performed><span>I completed this timed attempt before revealing the rubric, and the notes record my decisions and failure analysis.</span></label>
+      <button class="primary-button" type="button" data-score-mock>Record mock score</button><div class="mock-score-readout">${saved.percent !== undefined ? `<strong>${saved.percent}%</strong><span>${saved.percent >= 70 ? "Promising self-score; verify the weakest row" : "Schedule another rep"}</span>` : "Score every row after completing the rep."}</div>
+      ${saved.percent !== undefined ? renderMockRetrospective(mock, saved) : ""}
+    </section>`;
+  }
+
   function renderMock(mock) {
-    const saved = state.mockScores[mock.id] || { scores: {} };
+    if (!activeTimer || activeTimer.mockId !== mock.id) activeTimer = freshMockTimer(mock);
+    syncActiveTimer();
+    const historical = state.mockScores[mock.id] || { scores: {} };
+    const saved = historical.attemptId && historical.attemptId === activeTimer.attemptId ? historical : { scores: {} };
     const notes = state.mockNotes[mock.id] || "";
-    if (!activeTimer || activeTimer.mockId !== mock.id) activeTimer = { mockId: mock.id, remaining: mock.minutes * 60, running: false };
+    const checkpoints = mockCheckpointPlan(mock);
     renderBreadcrumbs([{ label: "Control room", route: "home" }, { label: trackLabels[mock.track] }, { label: "Mock interview" }]);
     view.innerHTML = `
       <section class="mock-view" data-mock-id="${escapeAttr(mock.id)}">
         <header class="mock-header">
-          <div><span class="eyebrow">${escapeHTML(trackLabels[mock.track])} · opt-in timer</span><h1 tabindex="-1">${escapeHTML(mock.title)}</h1><p>${escapeHTML(mock.artifact)}</p></div>
-          <div class="mock-timer" data-timer><output>${formatClock(activeTimer.remaining)}</output><div><button class="primary-button compact" type="button" data-timer-toggle>${activeTimer.running ? "Pause" : "Start timer"}</button><button class="quiet-button" type="button" data-timer-reset>Reset</button></div></div>
+          <div><span class="eyebrow">${escapeHTML(trackLabels[mock.track])} · timed rehearsal</span><h1 tabindex="-1">${escapeHTML(mock.title)}</h1><p>${escapeHTML(mock.artifact)}</p></div>
+          <div class="mock-timer" data-timer><output>${formatClock(activeTimer.remaining)}</output><div><button class="primary-button compact" type="button" data-timer-toggle ${activeTimer.remaining === 0 ? "disabled" : ""}>${activeTimer.remaining === 0 ? "Timer complete" : activeTimer.running ? "Pause" : "Start timer"}</button><button class="quiet-button" type="button" data-timer-reset>Reset</button></div></div>
         </header>
+        <ol class="mock-checkpoints" aria-label="Timed checkpoints">${checkpoints.map((checkpoint) => `<li data-checkpoint-at="${checkpoint.at}" class="${activeTimer.elapsed >= checkpoint.at ? "reached" : ""}"><span>${formatClock(checkpoint.at)}</span><strong>${escapeHTML(checkpoint.label)}</strong></li>`).join("")}</ol>
         <section class="mock-prompt" aria-labelledby="mock-prompt-title"><span class="eyebrow">Candidate prompt</span><h2 id="mock-prompt-title">Design or build from this brief</h2><p>${escapeHTML(mock.prompt)}</p></section>
+        ${mock.id === "ai-gateway-coding" ? `<section class="mock-code-rep" aria-labelledby="mock-code-title"><div class="section-heading"><div><span class="eyebrow">Timed implementation</span><h2 id="mock-code-title">Write and test the request path here</h2></div></div>${renderCodeLab(moduleById.get("coding-execution"))}</section>` : ""}
+        ${mock.id === "ai-gateway-coding" ? `<section class="mock-benchmark-rep" aria-labelledby="mock-benchmark-title"><div class="section-heading"><div><span class="eyebrow">Measured comparison</span><h2 id="mock-benchmark-title">Run the benchmark checkpoints here</h2><p>Save two adaptive-routing runs and two concurrency runs. Each pair needs one changed control, a pre-run hypothesis, and a post-run decision.</p></div></div>${renderGatewayConsole("lab-adaptive-routing", false)}${renderGatewayConsole("lab-concurrency-resilience", false)}</section>` : ""}
         <div class="mock-layout">
-          <section class="mock-work"><label><span>Whiteboard or coding notes</span><textarea data-mock-notes placeholder="Requirements, estimates, invariants, decisions, failure behavior...">${escapeHTML(notes)}</textarea></label><div class="followup-deck"><h2>Follow-up cards</h2>${mock.followups.map((followup, index) => `<details><summary>Card ${index + 1}</summary><p>${escapeHTML(followup)}</p></details>`).join("")}</div></section>
-          <section class="rubric-panel" aria-labelledby="rubric-title"><span class="eyebrow">Score after answering aloud</span><h2 id="rubric-title">Evidence rubric</h2><p>Use 0 for missing, 1 for partial, and 2 for clear and defended.</p>
-            <div class="rubric-list">${mock.rubric.map((item, index) => `<label><span><strong>${escapeHTML(item.label)}</strong><small>${escapeHTML(item.detail)}</small></span><select data-rubric-score="${index}" aria-label="Score ${escapeAttr(item.label)}"><option value="">Not scored</option><option value="0" ${saved.scores?.[index] === 0 ? "selected" : ""}>0</option><option value="1" ${saved.scores?.[index] === 1 ? "selected" : ""}>1</option><option value="2" ${saved.scores?.[index] === 2 ? "selected" : ""}>2</option></select></label>`).join("")}</div>
-            <button class="primary-button" type="button" data-score-mock>Record mock score</button><div class="mock-score-readout">${saved.percent !== undefined ? `<strong>${saved.percent}%</strong><span>${saved.percent >= 70 ? "Ready signal" : "Schedule another rep"}</span>` : "Score every row when the mock ends."}</div>
-          </section>
+          <section class="mock-work"><label><span>Whiteboard or coding notes</span><textarea data-mock-notes placeholder="Requirements, estimates, invariants, decisions, failure behavior...">${escapeHTML(notes)}</textarea></label><div class="followup-deck"><h2>Checkpoint follow-ups</h2>${mock.followups.map((followup, index) => { const unlockAt = mockFollowupUnlockAt(mock, index); const unlocked = activeTimer.elapsed >= unlockAt; return `<div class="followup-card" data-followup-index="${index}" data-unlock-at="${unlockAt}"><div class="followup-locked" ${unlocked ? "hidden" : ""}><span>Card ${index + 1}</span><small>Unlocks at ${formatClock(unlockAt)}</small></div><details ${unlocked ? "" : "hidden"}><summary>Card ${index + 1}</summary><p>${escapeHTML(followup)}</p></details></div>`; }).join("")}</div></section>
+          ${renderMockRubric(mock, saved)}
         </div>
       </section>
     `;
     if (activeTimer.running) startTimerInterval();
+    saveState();
+  }
+
+  function freshMockTimer(mock) {
+    return {
+      mockId: mock.id,
+      remaining: mock.minutes * 60,
+      running: false,
+      started: false,
+      elapsed: 0,
+      startedAt: null,
+      attemptId: null,
+      rubricRevealed: false,
+      elapsedAtRunStart: 0,
+      runStartedAtMs: null
+    };
+  }
+
+  function mockObjectiveEvidence(mock) {
+    const timerUsed = activeTimer?.mockId === mock.id && Number(activeTimer.elapsed || 0) >= mock.minutes * 60;
+    const attemptStartedAt = activeTimer?.startedAt || null;
+    const items = [{
+      ok: timerUsed,
+      label: timerUsed ? `Full ${mock.minutes}-minute timer completed` : `Complete the ${mock.minutes}-minute timer`
+    }];
+    if (mock.id !== "ai-gateway-coding") return items;
+    const codeResult = state.codeResults["build-gateway"];
+    const currentSource = state.codeDrafts["build-gateway"] || codeExercises["coding-execution"].starter;
+    const codeIsFresh = Boolean(
+      attemptStartedAt
+      && codeResult?.passed === true
+      && codeResult.sourceFingerprint === Sim.stableFingerprint({ source: currentSource })
+      && new Date(codeResult.ranAt || 0).getTime() >= new Date(attemptStartedAt).getTime()
+    );
+    return [
+      {
+        ok: codeIsFresh,
+        label: "Current gateway source passes every browser test in this attempt",
+        route: "lab/coding-execution"
+      },
+      {
+        ok: Boolean(gatewayComparisonEvidence("adaptive-routing", attemptStartedAt)),
+        label: "Fresh adaptive-routing comparison includes a measured change and decision",
+        route: "lab/adaptive-routing"
+      },
+      {
+        ok: Boolean(gatewayComparisonEvidence("concurrency-resilience", attemptStartedAt)),
+        label: "Fresh concurrency comparison includes a measured change and decision",
+        route: "lab/concurrency-resilience"
+      },
+      ...items
+    ];
   }
 
   function formatClock(seconds) {
@@ -1115,29 +2186,93 @@
     return `${String(minutes).padStart(2, "0")}:${String(rest).padStart(2, "0")}`;
   }
 
+  function renderMockRetrospective(mock, saved) {
+    const rows = mock.rubric.map((item, index) => ({ ...item, score: Number(saved.scores?.[index] ?? 0) }));
+    const lowest = Math.min(...rows.map((row) => row.score));
+    const gaps = rows.filter((row) => row.score === lowest).map((row) => row.label);
+    return `<div class="mock-retrospective"><strong>Next evidence target</strong><p>Revisit ${escapeHTML(gaps.join(" and "))}. Record one concrete behavior that would raise the score on the next rep.</p></div>`;
+  }
+
   function startTimerInterval() {
     stopTimer(false);
     if (!activeTimer?.running) return;
     timerInterval = setInterval(() => {
       if (!activeTimer?.running) return;
-      activeTimer.remaining = Math.max(0, activeTimer.remaining - 1);
-      const output = document.querySelector("[data-timer] output");
-      if (output) output.textContent = formatClock(activeTimer.remaining);
-      if (activeTimer.remaining === 0) {
-        activeTimer.running = false;
-        stopTimer(false);
+      refreshTimerDisplay(true);
+    }, 1000);
+  }
+
+  function syncActiveTimer(nowMs = Date.now()) {
+    if (!activeTimer?.running) return;
+    const mock = mockById.get(activeTimer.mockId);
+    if (!mock) return;
+    const total = mock.minutes * 60;
+    if (!Number.isFinite(activeTimer.runStartedAtMs)) {
+      activeTimer.runStartedAtMs = nowMs;
+      activeTimer.elapsedAtRunStart = activeTimer.elapsed;
+    }
+    const segmentSeconds = Math.max(0, Math.floor((nowMs - activeTimer.runStartedAtMs) / 1000));
+    activeTimer.elapsed = Math.min(total, Number(activeTimer.elapsedAtRunStart || 0) + segmentSeconds);
+    activeTimer.remaining = Math.max(0, total - activeTimer.elapsed);
+    if (activeTimer.remaining === 0) {
+      activeTimer.running = false;
+      activeTimer.elapsedAtRunStart = activeTimer.elapsed;
+      activeTimer.runStartedAtMs = null;
+    }
+  }
+
+  function refreshTimerDisplay(announceCompletion = false) {
+    if (!activeTimer) return;
+    const wasRunning = activeTimer.running;
+    syncActiveTimer();
+    const output = document.querySelector("[data-timer] output");
+    if (output) output.textContent = formatClock(activeTimer.remaining);
+    updateMockTimedReveals();
+    const button = document.querySelector("[data-timer-toggle]");
+    if (button) {
+      button.textContent = activeTimer.remaining === 0 ? "Timer complete" : activeTimer.running ? "Pause" : "Start timer";
+      button.disabled = activeTimer.remaining === 0;
+    }
+    saveState();
+    if (wasRunning && !activeTimer.running && activeTimer.remaining === 0) {
+      stopTimer(false);
+      if (announceCompletion) {
         announce("Mock timer complete.");
         showToast("Time. Finish the sentence you are on.");
-        const button = document.querySelector("[data-timer-toggle]");
-        if (button) button.textContent = "Start timer";
       }
-    }, 1000);
+    }
+  }
+
+  function updateMockTimedReveals() {
+    if (!activeTimer) return;
+    document.querySelectorAll("[data-checkpoint-at]").forEach((checkpoint) => {
+      checkpoint.classList.toggle("reached", activeTimer.elapsed >= Number(checkpoint.dataset.checkpointAt));
+    });
+    document.querySelectorAll("[data-unlock-at]").forEach((card) => {
+      const unlocked = activeTimer.elapsed >= Number(card.dataset.unlockAt);
+      const locked = card.querySelector(".followup-locked");
+      const details = card.querySelector("details");
+      if (locked) locked.hidden = unlocked;
+      if (details) details.hidden = !unlocked;
+    });
+    const reveal = document.querySelector("[data-reveal-rubric]");
+    if (reveal) {
+      const ready = activeTimer.remaining === 0;
+      reveal.disabled = !ready;
+      reveal.textContent = ready ? "Reveal rubric" : `Available after ${formatClock(activeTimer.remaining)}`;
+    }
   }
 
   function stopTimer(clearRunning = true) {
     if (timerInterval) clearInterval(timerInterval);
     timerInterval = null;
-    if (clearRunning && activeTimer) activeTimer.running = false;
+    if (clearRunning && activeTimer) {
+      syncActiveTimer();
+      activeTimer.running = false;
+      activeTimer.elapsedAtRunStart = activeTimer.elapsed;
+      activeTimer.runStartedAtMs = null;
+      saveState();
+    }
   }
 
   function renderNotebook() {
@@ -1146,7 +2281,7 @@
       <section class="notebook-view">
         <header class="notebook-header"><div><span class="eyebrow">Saved evidence</span><h1 tabindex="-1">Interview notebook</h1><p>Keep strategy changes, fixed inputs, results, and what you learned in one place.</p></div><div class="notebook-actions"><button class="secondary-button" type="button" data-copy-notebook>Copy as Markdown</button><button class="quiet-button" type="button" data-export-progress>Export JSON</button><label class="quiet-button file-button">Import JSON<input type="file" accept="application/json" data-import-progress></label></div></header>
         <section class="benchmark-ledger" aria-labelledby="ledger-title"><div class="section-heading"><div><span class="eyebrow">Gateway benchmark ledger</span><h2 id="ledger-title">One change per run</h2></div></div>
-          ${state.benchmarks.length ? `<div class="table-scroll"><table><thead><tr><th>Compare</th><th>Policy</th><th>Scenario</th><th>Success</th><th>p95</th><th>Calls/request</th><th>Note</th><th></th></tr></thead><tbody>${state.benchmarks.map((run, index) => `<tr><td><input type="checkbox" data-compare-run="${index}" aria-label="Compare run ${index + 1}"></td><td><strong>${escapeHTML(run.config?.policy || "policy")}</strong><small>${escapeHTML(run.fingerprint || "")}</small></td><td>${escapeHTML(run.config?.scenario || "-")}</td><td>${valueOr(run.metrics?.successRate, 0)}%</td><td>${valueOr(run.metrics?.p95, 0)} ms</td><td>${valueOr(run.metrics?.attemptsPerRequest, 0)}</td><td><textarea data-benchmark-note="${index}" aria-label="Note for run ${index + 1}" placeholder="What changed and why?">${escapeHTML(run.note || "")}</textarea></td><td><button class="icon-button" type="button" data-delete-run="${index}" aria-label="Delete run ${index + 1}">×</button></td></tr>`).join("")}</tbody></table></div><div class="compare-bar"><button class="primary-button compact" type="button" data-compare-selected>Compare two runs</button><p data-compare-output>Select exactly two rows.</p></div>` : `<div class="empty-state compact"><h3>No saved runs yet.</h3><p>Open the adaptive routing lab, run a fixed seed, and save the result.</p><button class="primary-button compact" type="button" data-route="lab/adaptive-routing">Open gateway lab</button></div>`}
+          ${state.benchmarks.length ? `<div class="table-scroll"><table><thead><tr><th>Compare</th><th>Policy</th><th>Scenario</th><th>Success</th><th>Success p95</th><th>Achieved RPS</th><th>Calls/request</th><th>Hypothesis and result</th><th></th></tr></thead><tbody>${state.benchmarks.map((run, index) => `<tr><td><input type="checkbox" data-compare-run="${index}" aria-label="Compare run ${index + 1}"></td><td><strong>${escapeHTML(gatewayPolicyLabels[run.config?.policy] || run.config?.policy || "Policy")}</strong><small>${escapeHTML(run.moduleId || "unscoped")} · ${escapeHTML(run.fingerprint || "")}</small></td><td>${escapeHTML(gatewayScenarioLabels[run.config?.scenario] || run.config?.scenario || "-")}</td><td>${valueOr(run.metrics?.successRate, 0)}%</td><td>${valueOr(run.metrics?.successP95 ?? run.metrics?.p95, 0)} ms</td><td>${valueOr(run.metrics?.achievedRps, 0)}</td><td>${valueOr(run.metrics?.attemptsPerRequest, 0)}</td><td><p class="benchmark-hypothesis-copy"><strong>Before:</strong> ${escapeHTML(run.hypothesis || "Legacy run without a written hypothesis.")}</p><textarea data-benchmark-note="${index}" aria-label="Result note for run ${index + 1}" placeholder="After: what happened, and why?">${escapeHTML(run.note || "")}</textarea></td><td><button class="icon-button" type="button" data-delete-run="${index}" aria-label="Delete run ${index + 1}">×</button></td></tr>`).join("")}</tbody></table></div><div class="compare-bar"><button class="primary-button compact" type="button" data-compare-selected>Compare two runs</button><p data-compare-output>Select a baseline first and its candidate second.</p></div>` : `<div class="empty-state compact"><h3>No saved runs yet.</h3><p>Open the adaptive routing lab, keep one scenario and seed fixed, and save a baseline.</p><button class="primary-button compact" type="button" data-route="lab/adaptive-routing">Open gateway lab</button></div>`}
         </section>
         <section class="artifact-grid" aria-labelledby="artifact-title"><div class="section-heading"><div><span class="eyebrow">Mock artifacts</span><h2 id="artifact-title">Scores and next gaps</h2></div></div><div class="mock-card-grid">${course.mocks.map((mock) => { const saved = state.mockScores[mock.id]; return `<article><span>${escapeHTML(trackLabels[mock.track])}</span><h3>${escapeHTML(mock.title)}</h3><strong>${saved ? `${saved.percent}%` : "Not scored"}</strong><p>${escapeHTML(mock.artifact)}</p><button class="text-button" type="button" data-route="mock/${mock.id}">${saved ? "Run another rep" : "Start mock"} →</button></article>`; }).join("")}</div></section>
       </section>
@@ -1154,8 +2289,8 @@
   }
 
   const searchIndex = [
-    ...course.modules.map((module) => ({ title: module.title, subtitle: `${trackLabels[module.track]} module`, route: `module/${module.id}`, terms: `${module.description} ${module.outcomes.join(" ")}` })),
-    ...allLessons.map(({ lesson, module }) => ({ title: lesson.title, subtitle: `${trackLabels[module.track]} · Module ${module.number}`, route: `lesson/${lesson.id}`, terms: `${lesson.summary} ${lesson.core.join(" ")} ${lesson.mechanics.map((item) => `${item.title} ${item.text}`).join(" ")}` })),
+    ...course.modules.map((module) => ({ title: module.title, subtitle: `${moduleTrackLabel(module)} module`, route: `module/${module.id}`, terms: `${module.description} ${module.outcomes.join(" ")}` })),
+    ...allLessons.map(({ lesson, module }) => ({ title: lesson.title, subtitle: `${moduleTrackLabel(module)} · Module ${module.number}`, route: `lesson/${lesson.id}`, terms: `${lesson.summary} ${lesson.core.join(" ")} ${lesson.mechanics.map((item) => `${item.title} ${item.text}`).join(" ")}` })),
     ...course.mocks.map((mock) => ({ title: mock.title, subtitle: `${trackLabels[mock.track]} mock`, route: `mock/${mock.id}`, terms: `${mock.prompt} ${mock.followups.join(" ")}` }))
   ];
 
@@ -1217,19 +2352,38 @@
     const exercise = Object.values(codeExercises).find((item) => item.id === exerciseId);
     if (!exercise) throw new Error("Unknown exercise");
     const workerSource = `
-      self.fetch = () => { throw new Error("Network access is disabled in this exercise"); };
-      self.XMLHttpRequest = undefined;
-      self.WebSocket = undefined;
+      (() => {
+      const reportToHost = self.postMessage.bind(self);
+      const safeStringify = JSON.stringify.bind(JSON);
+      const safeFreeze = Object.freeze.bind(Object);
+      const safeDefineProperty = Object.defineProperty.bind(Object);
+      const safeReflectApply = Reflect.apply.bind(Reflect);
+      const arrayPush = Array.prototype.push;
+      const arrayFilter = Array.prototype.filter;
+      const safePush = (target, value) => safeReflectApply(arrayPush, target, [safeFreeze(value)]);
+      const safeFilter = (target, predicate) => safeReflectApply(arrayFilter, target, [predicate]);
+      const guardedGlobals = [["Object", Object], ["Array", Array], ["Boolean", Boolean], ["Function", Function], ["Promise", Promise], ["Error", Error], ["Map", Map], ["Number", Number], ["Set", Set], ["String", String], ["JSON", JSON], ["Math", Math], ["Reflect", Reflect]];
+      for (const [name, value] of guardedGlobals) {
+        safeFreeze(value.prototype || value);
+        safeFreeze(value);
+        safeDefineProperty(self, name, { value, configurable: false, writable: false });
+      }
+      safeDefineProperty(self, "postMessage", { value: () => { throw new Error("Candidate code cannot send worker messages"); }, configurable: false, writable: false });
+      safeDefineProperty(self, "close", { value: () => { throw new Error("Candidate code cannot stop the grader"); }, configurable: false, writable: false });
+      const blockedGlobals = ["Date", "performance", "setTimeout", "setInterval", "fetch", "XMLHttpRequest", "WebSocket", "EventSource", "WebTransport", "importScripts"];
+      for (const name of blockedGlobals) {
+        try { safeDefineProperty(self, name, { value: undefined, configurable: false, writable: false }); } catch { self[name] = undefined; }
+      }
       self.onmessage = async (event) => {
         const data = event.data;
         const cases = [];
-        const equal = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+        const equal = (a, b) => safeStringify(a) === safeStringify(b);
         const check = async (name, run, expected) => {
           try {
             const actual = await run();
-            cases.push({ name, ok: equal(actual, expected), message: equal(actual, expected) ? "" : "Expected " + JSON.stringify(expected) + ", received " + JSON.stringify(actual) });
+            safePush(cases, { name, ok: equal(actual, expected), message: equal(actual, expected) ? "" : "Expected " + safeStringify(expected) + ", received " + safeStringify(actual) });
           } catch (error) {
-            cases.push({ name, ok: false, message: error?.message || String(error) });
+            safePush(cases, { name, ok: false, message: error?.message || String(error) });
           }
         };
         try {
@@ -1244,6 +2398,171 @@
             await check("transport timeout is provider failure", () => fn({ transportError: "timeout" }), "provider_failure");
             await check("caller cancellation is neutral", () => fn({ cancelledBy: "caller" }), "neutral");
             await check("losing hedge is neutral", () => fn({ cancelledBy: "hedge_winner" }), "neutral");
+          } else if (data.exerciseId === "build-gateway") {
+            const providerState = (id, score, overrides = {}) => ({ id, score, cooldownUntil: 0, inFlight: 0, maxConcurrency: 1, ...overrides });
+            const response = (body, status = 200, elapsedMs = 10) => ({ status, body, elapsedMs });
+            const errorResult = async (promise) => {
+              try {
+                await promise;
+                return "resolved";
+              } catch (error) {
+                return error?.name === "AbortError" ? "AbortError:" + error.message : error?.message || String(error);
+              }
+            };
+
+            await check("lower score wins with a deterministic ID tie-break", async () => {
+              const states = [providerState("B", 1), providerState("A", 1)];
+              const gateway = fn({ providers: { A: async () => response("from-a"), B: async () => response("from-b") }, states, maxActive: 2 });
+              return gateway.handle({ id: "r1", deadlineAtMs: 500, nowMs: 0 });
+            }, { status: 200, body: "from-a", provider: "A", attempts: ["A"] });
+
+            await check("cooldown excludes a provider", async () => {
+              const states = [providerState("A", 1, { cooldownUntil: 100 }), providerState("B", 2)];
+              const gateway = fn({ providers: { A: async () => response("from-a"), B: async () => response("from-b") }, states, maxActive: 2 });
+              return gateway.handle({ id: "r2", deadlineAtMs: 550, nowMs: 50 });
+            }, { status: 200, body: "from-b", provider: "B", attempts: ["B"] });
+
+            await check("retryable failure falls back with the remaining deadline", async () => {
+              let bDeadline = 0;
+              const states = [providerState("A", 1), providerState("B", 2)];
+              const gateway = fn({
+                providers: {
+                  A: async () => response("busy", 503, 80),
+                  B: async (attempt) => { bDeadline = attempt.deadlineMs; return response("ok", 200, 120); }
+                },
+                states,
+                maxActive: 2
+              });
+              const result = await gateway.handle({ id: "r3", deadlineAtMs: 500, nowMs: 0 });
+              return { result, bDeadline, inFlight: states.map((item) => item.inFlight) };
+            }, { result: { status: 200, body: "ok", provider: "B", attempts: ["A", "B"] }, bDeadline: 420, inFlight: [0, 0] });
+
+            await check("deadline exhaustion stops fallback and releases admission", async () => {
+              let bCalls = 0;
+              let aCalls = 0;
+              const states = [providerState("A", 1), providerState("B", 2)];
+              const gateway = fn({ providers: { A: async () => { aCalls += 1; return aCalls === 1 ? response("busy", 503, 100) : response("recovered"); }, B: async () => { bCalls += 1; return response("recovered"); } }, states, maxActive: 1 });
+              const outcome = await errorResult(gateway.handle({ id: "r4", deadlineAtMs: 100, nowMs: 0 }));
+              const bCallsBeforeRecovery = bCalls;
+              const recovered = await gateway.handle({ id: "r4b", deadlineAtMs: 10500, nowMs: 10000 });
+              return { outcome, bCallsBeforeRecovery, recoveredStatus: recovered.status, inFlight: states.map((item) => item.inFlight) };
+            }, { outcome: "deadline_exhausted", bCallsBeforeRecovery: 0, recoveredStatus: 200, inFlight: [0, 0] });
+
+            await check("caller error does not fall back", async () => {
+              let bCalls = 0;
+              const outcomes = [];
+              const states = [providerState("A", 1), providerState("B", 2)];
+              const gateway = fn({ providers: { A: async () => response("bad input", 400, 8), B: async () => { bCalls += 1; return response("wrong"); } }, states, maxActive: 2, recordOutcome: (outcome) => outcomes.push(outcome) });
+              const result = await gateway.handle({ id: "r5", deadlineAtMs: 500, nowMs: 0 });
+              return { result, bCalls, outcomes, inFlight: states.map((item) => item.inFlight) };
+            }, { result: { status: 400, body: "bad input", provider: "A", attempts: ["A"] }, bCalls: 0, outcomes: [{ provider: "A", status: 400, elapsedMs: 8 }], inFlight: [0, 0] });
+
+            await check("429 is retryable provider overload", async () => {
+              const outcomes = [];
+              const states = [providerState("A", 1), providerState("B", 2)];
+              const gateway = fn({ providers: { A: async () => response("busy", 429, 20), B: async (attempt) => response(attempt.deadlineMs, 200, 30) }, states, maxActive: 1, recordOutcome: (outcome) => outcomes.push(outcome) });
+              const result = await gateway.handle({ id: "r5b", deadlineAtMs: 500, nowMs: 0 });
+              return { result, outcomes, inFlight: states.map((item) => item.inFlight) };
+            }, { result: { status: 200, body: 480, provider: "B", attempts: ["A", "B"] }, outcomes: [{ provider: "A", status: 429, elapsedMs: 20 }, { provider: "B", status: 200, elapsedMs: 30 }], inFlight: [0, 0] });
+
+            await check("application cap rejects overlap and later recovers", async () => {
+              let release;
+              let calls = 0;
+              const pending = new Promise((resolve) => { release = resolve; });
+              const states = [providerState("A", 1, { maxConcurrency: 2 })];
+              const gateway = fn({ providers: { A: async () => { calls += 1; return calls === 1 ? pending : response("next"); } }, states, maxActive: 1 });
+              const first = gateway.handle({ id: "r6a", deadlineAtMs: 500, nowMs: 0 });
+              await Promise.resolve();
+              const overlap = await errorResult(gateway.handle({ id: "r6b", deadlineAtMs: 500, nowMs: 0 }));
+              release(response("first"));
+              await first;
+              const next = await gateway.handle({ id: "r6c", deadlineAtMs: 500, nowMs: 0 });
+              return { overlap, next, inFlight: states[0].inFlight };
+            }, { overlap: "gateway_overloaded", next: { status: 200, body: "next", provider: "A", attempts: ["A"] }, inFlight: 0 });
+
+            await check("provider cap sends concurrent work to another eligible provider", async () => {
+              let release;
+              const pending = new Promise((resolve) => { release = resolve; });
+              const states = [providerState("A", 1), providerState("B", 2)];
+              const gateway = fn({ providers: { A: async () => pending, B: async () => response("second") }, states, maxActive: 2 });
+              const first = gateway.handle({ id: "r7a", deadlineAtMs: 500, nowMs: 0 });
+              await Promise.resolve();
+              const second = await gateway.handle({ id: "r7b", deadlineAtMs: 500, nowMs: 0 });
+              release(response("first"));
+              const firstResult = await first;
+              return { providers: [firstResult.provider, second.provider], inFlight: states.map((item) => item.inFlight) };
+            }, { providers: ["A", "B"], inFlight: [0, 0] });
+
+            await check("caller cancellation does not fall back and releases permits", async () => {
+              let bCalls = 0;
+              let aCalls = 0;
+              const states = [providerState("A", 1), providerState("B", 2)];
+              const cancelled = new Error("caller_cancelled");
+              safeDefineProperty(cancelled, "name", { value: "AbortError" });
+              const gateway = fn({ providers: { A: async () => { aCalls += 1; if (aCalls === 1) throw cancelled; return response("recovered"); }, B: async () => { bCalls += 1; return response("recovered"); } }, states, maxActive: 1 });
+              const outcome = await errorResult(gateway.handle({ id: "r8", deadlineAtMs: 500, nowMs: 0 }));
+              const bCallsBeforeRecovery = bCalls;
+              const recovered = await gateway.handle({ id: "r8b", deadlineAtMs: 10500, nowMs: 10000 });
+              return { outcome, bCallsBeforeRecovery, recoveredStatus: recovered.status, inFlight: states.map((item) => item.inFlight) };
+            }, { outcome: "AbortError:caller_cancelled", bCallsBeforeRecovery: 0, recoveredStatus: 200, inFlight: [0, 0] });
+
+            await check("an already expired absolute deadline starts no provider", async () => {
+              let calls = 0;
+              const states = [providerState("A", 1), providerState("B", 2)];
+              const gateway = fn({ providers: { A: async () => { calls += 1; return response("late"); }, B: async () => { calls += 1; return response("late"); } }, states, maxActive: 1 });
+              const outcome = await errorResult(gateway.handle({ id: "r9", deadlineAtMs: 500, nowMs: 501 }));
+              const recovered = await gateway.handle({ id: "r9b", deadlineAtMs: 1100, nowMs: 600 });
+              return { outcome, calls, recoveredStatus: recovered.status, inFlight: states.map((item) => item.inFlight) };
+            }, { outcome: "deadline_exhausted", calls: 1, recoveredStatus: 200, inFlight: [0, 0] });
+
+            await check("ordinary provider errors fall back and release every permit", async () => {
+              let aCalls = 0;
+              const states = [providerState("A", 1), providerState("B", 2)];
+              const gateway = fn({ providers: { A: async () => { aCalls += 1; if (aCalls === 1) throw new Error("socket_reset"); return response("again"); }, B: async () => response("fallback") }, states, maxActive: 1 });
+              const first = await gateway.handle({ id: "r10", deadlineAtMs: 500, nowMs: 0 });
+              const second = await gateway.handle({ id: "r10b", deadlineAtMs: 1100, nowMs: 600 });
+              return { first, secondStatus: second.status, inFlight: states.map((item) => item.inFlight) };
+            }, { first: { status: 200, body: "fallback", provider: "B", attempts: ["A", "B"] }, secondStatus: 200, inFlight: [0, 0] });
+
+            await check("a final transport error propagates after cleanup", async () => {
+              let fail = true;
+              const states = [providerState("A", 1), providerState("B", 2)];
+              const gateway = fn({ providers: { A: async () => { if (fail) throw new Error("a_reset"); return response("recovered"); }, B: async () => { throw new Error("b_reset"); } }, states, maxActive: 1 });
+              const outcome = await errorResult(gateway.handle({ id: "r10c", deadlineAtMs: 500, nowMs: 0 }));
+              fail = false;
+              const recovered = await gateway.handle({ id: "r10d", deadlineAtMs: 1100, nowMs: 600 });
+              return { outcome, recoveredStatus: recovered.status, inFlight: states.map((item) => item.inFlight) };
+            }, { outcome: "b_reset", recoveredStatus: 200, inFlight: [0, 0] });
+
+            await check("a result after the absolute deadline is rejected", async () => {
+              let late = true;
+              let bCalls = 0;
+              const states = [providerState("A", 1), providerState("B", 2)];
+              const gateway = fn({ providers: { A: async () => late ? response("too late", 200, 501) : response("recovered"), B: async () => { bCalls += 1; return response("wrong"); } }, states, maxActive: 1 });
+              const outcome = await errorResult(gateway.handle({ id: "r10e", deadlineAtMs: 500, nowMs: 0 }));
+              late = false;
+              const recovered = await gateway.handle({ id: "r10f", deadlineAtMs: 1100, nowMs: 600 });
+              return { outcome, bCalls, recoveredStatus: recovered.status, inFlight: states.map((item) => item.inFlight) };
+            }, { outcome: "deadline_exhausted", bCalls: 0, recoveredStatus: 200, inFlight: [0, 0] });
+
+            await check("no eligible provider fails before transport", async () => {
+              let calls = 0;
+              const states = [providerState("A", 1, { cooldownUntil: 1000 }), providerState("B", 2, { inFlight: 1 })];
+              const gateway = fn({ providers: { A: async () => { calls += 1; return response("a"); }, B: async () => { calls += 1; return response("b"); } }, states, maxActive: 1 });
+              const outcome = await errorResult(gateway.handle({ id: "r11", deadlineAtMs: 500, nowMs: 0 }));
+              states[0].cooldownUntil = 0;
+              states[1].inFlight = 0;
+              const recovered = await gateway.handle({ id: "r11b", deadlineAtMs: 1100, nowMs: 600 });
+              return { outcome, calls, recoveredStatus: recovered.status, inFlight: states.map((item) => item.inFlight) };
+            }, { outcome: "no_eligible_provider", calls: 1, recoveredStatus: 200, inFlight: [0, 0] });
+
+            await check("every provider result crosses the adaptive feedback boundary", async () => {
+              const outcomes = [];
+              const states = [providerState("A", 1), providerState("B", 2)];
+              const gateway = fn({ providers: { A: async () => response("busy", 503, 20), B: async () => response("ok", 200, 30) }, states, maxActive: 1, recordOutcome: (outcome) => outcomes.push(outcome) });
+              const result = await gateway.handle({ id: "r12", deadlineAtMs: 500, nowMs: 0 });
+              return { result, outcomes };
+            }, { result: { status: 200, body: "ok", provider: "B", attempts: ["A", "B"] }, outcomes: [{ provider: "A", status: 503, elapsedMs: 20 }, { provider: "B", status: 200, elapsedMs: 30 }] });
           } else {
             const base = [
               { id: "A", cooldownUntil: 0, inFlight: 0, maxConcurrency: 2, lastSampleAt: 90, latencyEWMA: 80, failureEWMA: 0.3 },
@@ -1257,15 +2576,18 @@
             const tie = base.map((item) => ({ ...item, latencyEWMA: 100, failureEWMA: 0, lastSampleAt: 50 }));
             await check("ties are deterministic", () => fn(tie, { sequence: 1, nowMs: 200 }), "A");
           }
-          const passedCount = cases.filter((item) => item.ok).length;
-          self.postMessage({ cases, passedCount, failed: cases.length - passedCount, total: cases.length, passed: passedCount === cases.length });
+          const passedCount = safeFilter(cases, (item) => item.ok === true).length;
+          reportToHost({ nonce: data.nonce, cases, passedCount, failed: cases.length - passedCount, total: cases.length, passed: passedCount === cases.length });
         } catch (error) {
-          self.postMessage({ cases: [{ name: "Load solution", ok: false, message: error?.message || String(error) }], passedCount: 0, failed: 1, total: 1, passed: false });
+          reportToHost({ nonce: data.nonce, fatal: true, cases: [{ name: "Load solution", ok: false, message: error?.message || String(error) }], passedCount: 0, failed: 1, total: 1, passed: false });
         }
       };
+      })();
     `;
     const url = URL.createObjectURL(new Blob([workerSource], { type: "text/javascript" }));
     const worker = new Worker(url);
+    const nonce = crypto.randomUUID();
+    const expectedTotal = exerciseId === "classify-attempt" ? 7 : exerciseId === "build-gateway" ? 15 : 6;
     try {
       return await new Promise((resolve) => {
         const timeout = setTimeout(() => {
@@ -1273,14 +2595,24 @@
           resolve({ cases: [{ name: "Execution limit", ok: false, message: "The solution exceeded 1.5 seconds." }], passedCount: 0, failed: 1, total: 1, passed: false });
         }, 1500);
         worker.onmessage = (event) => {
+          const result = event.data;
+          if (result?.nonce !== nonce || !Array.isArray(result?.cases)) return;
+          if (result.fatal === true) {
+            clearTimeout(timeout);
+            resolve({ ...result, passed: false });
+            return;
+          }
+          if (result.total !== expectedTotal || result.cases.length !== expectedTotal) return;
+          const cases = result.cases.map((test) => ({ name: String(test.name || "Case"), ok: test.ok === true, message: String(test.message || "") }));
+          const passedCount = cases.filter((test) => test.ok).length;
           clearTimeout(timeout);
-          resolve(event.data);
+          resolve({ cases, passedCount, failed: expectedTotal - passedCount, total: expectedTotal, passed: passedCount === expectedTotal });
         };
         worker.onerror = (event) => {
           clearTimeout(timeout);
           resolve({ cases: [{ name: "Worker error", ok: false, message: event.message || "The solution could not run." }], passedCount: 0, failed: 1, total: 1, passed: false });
         };
-        worker.postMessage({ exerciseId, functionName: exercise.functionName, code });
+        worker.postMessage({ exerciseId, functionName: exercise.functionName, code, nonce });
       });
     } finally {
       worker.terminate();
@@ -1304,7 +2636,7 @@
   function notebookMarkdown() {
     const lines = ["# Decagon interview benchmark notebook", ""];
     state.benchmarks.forEach((run, index) => {
-      lines.push(`## Run ${index + 1}: ${run.config?.policy || "policy"}`, "", `- Fingerprint: \`${run.fingerprint || "n/a"}\``, `- Scenario: ${run.config?.scenario || "n/a"}`, `- Offered RPS: ${run.config?.rps || "n/a"}`, `- Success: ${run.metrics?.successRate || 0}%`, `- p50 / p95 / p99: ${run.metrics?.p50 || 0} / ${run.metrics?.p95 || 0} / ${run.metrics?.p99 || 0} ms`, `- Calls per request: ${run.metrics?.attemptsPerRequest || 0}`, `- Note: ${run.note || "Add the hypothesis and result."}`, "");
+      lines.push(`## Run ${index + 1}: ${gatewayPolicyLabels[run.config?.policy] || run.config?.policy || "Policy"}`, "", `- Module: ${run.moduleId || "unscoped"}`, `- Fingerprint: \`${run.fingerprint || "n/a"}\``, `- Scenario: ${gatewayScenarioLabels[run.config?.scenario] || run.config?.scenario || "n/a"}`, `- Offered / achieved RPS: ${run.metrics?.offeredRps || run.config?.rps || "n/a"} / ${run.metrics?.achievedRps || 0}`, `- Hypothesis: ${run.hypothesis || "Not recorded"}`, `- Success: ${run.metrics?.successRate || 0}%`, `- Successful-request p50 / p95 / p99: ${run.metrics?.successP50 ?? run.metrics?.p50 ?? 0} / ${run.metrics?.successP95 ?? run.metrics?.p95 ?? 0} / ${run.metrics?.successP99 ?? run.metrics?.p99 ?? 0} ms`, `- Terminal p95: ${run.metrics?.terminalP95 || 0} ms`, `- Calls per request: ${run.metrics?.attemptsPerRequest || 0}`, `- Result: ${run.note || "Add what happened and why."}`, "");
     });
     return lines.join("\n");
   }
@@ -1319,6 +2651,15 @@
   }
 
   document.addEventListener("click", async (event) => {
+    const modeButton = event.target.closest("[data-mode-value]");
+    if (modeButton) {
+      state.mode = modeButton.dataset.modeValue;
+      saveState();
+      updateModePicker();
+      renderRoute();
+      return;
+    }
+
     const routeButton = event.target.closest("[data-route]");
     if (routeButton) {
       goToRoute(routeButton.dataset.route);
@@ -1348,6 +2689,7 @@
       feedback.hidden = false;
       feedback.className = `check-feedback ${correct ? "correct" : "incorrect"}`;
       feedback.innerHTML = `<strong>${correct ? "Correct" : "Not yet"}</strong><p>${escapeHTML(entry.lesson.check.explanation)}</p>${correct ? "" : '<button class="quiet-button" type="button" data-retry-check>Try again</button>'}`;
+      announce(`${correct ? "Correct." : "Not yet."} ${entry.lesson.check.explanation}`);
       if (correct) {
         if (!state.completedLessons.includes(entry.lesson.id)) state.completedLessons.push(entry.lesson.id);
         saveState();
@@ -1355,8 +2697,9 @@
         renderDrawer(parseRoute());
         root.querySelector(".completion-chip").textContent = "Recorded";
         root.querySelector(".completion-chip").classList.add("complete");
-        announce("Correct answer. Lesson evidence recorded.");
       }
+      const nextFocus = correct ? feedback : feedback.querySelector("[data-retry-check]");
+      requestAnimationFrame(() => nextFocus?.focus());
       return;
     }
 
@@ -1378,6 +2721,8 @@
       if (selected === question.answer) activeQuiz.correct += 1;
       activeQuiz.answers.push({ selected, correct: selected === question.answer });
       renderQuiz(moduleById.get(activeQuiz.moduleId));
+      announce(`${selected === question.answer ? "Correct." : `Answer: ${question.choices[question.answer]}.`} ${question.explanation}`);
+      requestAnimationFrame(() => view.querySelector("[data-next-question]")?.focus());
       return;
     }
 
@@ -1385,6 +2730,7 @@
       if (activeQuiz.index >= activeQuiz.questions.length - 1) activeQuiz.finished = true;
       else { activeQuiz.index += 1; activeQuiz.selected = null; }
       renderQuiz(moduleById.get(activeQuiz.moduleId));
+      requestAnimationFrame(() => view.querySelector("[data-quiz-answer]")?.focus());
       return;
     }
 
@@ -1400,29 +2746,84 @@
     if (gatewayButton) {
       const scope = gatewayButton.dataset.runGateway;
       const config = gatewayConfigFromDOM(scope);
+      const hypothesis = gatewayHypothesisFromDOM(scope);
+      const gatewayRoot = gatewayButton.closest("[data-gateway-scope]");
+      if (gatewayRoot?.querySelector('[name="hypothesis"]') && hypothesis.length < 20) {
+        showToast("Write a testable hypothesis before running this batch.");
+        gatewayRoot.querySelector('[name="hypothesis"]')?.focus();
+        return;
+      }
       activeGatewayRun = Sim.runGateway(config);
-      const output = gatewayButton.closest("[data-gateway-scope]").querySelector("[data-gateway-output]");
+      activeGatewayRun.evidence = {
+        scope,
+        moduleId: gatewayModuleFromScope(scope),
+        ranByStudent: true,
+        hypothesis,
+        configFingerprint: Sim.stableFingerprint(activeGatewayRun.config),
+        ranAt: new Date().toISOString()
+      };
+      const output = gatewayRoot.querySelector("[data-gateway-output]");
       output.innerHTML = renderGatewayResult(activeGatewayRun, scope === "home");
-      announce(`Gateway run complete. ${activeGatewayRun.metrics?.successRate || 0}% success, p95 ${activeGatewayRun.metrics?.p95 || 0} milliseconds.`);
+      const status = gatewayRoot.querySelector("[data-run-evidence-status]");
+      if (status) status.textContent = "This result matches the controls and pre-run hypothesis.";
+      const interpretation = gatewayRoot.querySelector('[name="interpretation"]');
+      if (interpretation) interpretation.value = "";
+      announce(`Gateway run complete. ${activeGatewayRun.metrics?.successRate || 0}% success, successful-request p95 ${activeGatewayRun.metrics?.successP95 || 0} milliseconds.`);
       return;
     }
 
     if (event.target.closest("[data-save-benchmark]")) {
-      if (!activeGatewayRun) return;
+      if (!activeGatewayRun?.evidence?.ranByStudent) {
+        showToast("Run the batch from this workbench before saving evidence.");
+        return;
+      }
+      const gatewayRoot = event.target.closest("[data-gateway-scope]");
+      const scope = gatewayRoot?.dataset.gatewayScope || "";
+      const hypothesis = gatewayHypothesisFromDOM(scope);
+      const interpretation = gatewayInterpretationFromDOM(scope);
+      const moduleId = gatewayModuleFromScope(scope);
+      const currentConfig = gatewayConfigFromDOM(scope);
+      const controlsChanged = Object.keys(activeGatewayRun.config || {}).some((key) => currentConfig[key] !== activeGatewayRun.config[key]);
+      if (activeGatewayRun.evidence.scope !== scope || activeGatewayRun.evidence.moduleId !== moduleId) {
+        showToast("Run this workbench before saving its evidence.");
+        return;
+      }
+      if (controlsChanged || Sim.stableFingerprint(activeGatewayRun.config) !== activeGatewayRun.evidence.configFingerprint) {
+        showToast("Controls changed after the run. Run the batch again before saving.");
+        return;
+      }
+      if (hypothesis !== activeGatewayRun.evidence.hypothesis) {
+        showToast("The hypothesis changed after the run. Run the batch again before saving.");
+        gatewayRoot?.querySelector('[name="hypothesis"]')?.focus();
+        return;
+      }
+      if (interpretation.length < 40) {
+        showToast("Write what happened, whether it supported the hypothesis, and what you would keep.");
+        gatewayRoot?.querySelector('[name="interpretation"]')?.focus();
+        return;
+      }
       const snapshot = {
+        moduleId,
+        scope,
         config: structuredClone(activeGatewayRun.config || defaultGatewayConfig()),
         metrics: structuredClone(activeGatewayRun.metrics || {}),
         providers: structuredClone(activeGatewayRun.providers || {}),
         warnings: structuredClone(activeGatewayRun.warnings || []),
         fingerprint: activeGatewayRun.fingerprint || Sim.stableFingerprint(activeGatewayRun.config || {}),
         savedAt: new Date().toISOString(),
-        note: ""
+        hypothesis: activeGatewayRun.evidence.hypothesis,
+        note: interpretation
       };
       state.benchmarks.unshift(snapshot);
       state.benchmarks = state.benchmarks.slice(0, 40);
       const route = parseRoute();
-      if (route.type === "lab" && ["adaptive-routing", "concurrency-resilience"].includes(route.id)) completeLab(route.id, "Benchmark saved. Lab evidence recorded.");
-      else { saveState(); showToast("Benchmark saved."); }
+      const comparison = gatewayComparisonEvidence(moduleId);
+      if (route.type === "lab" && ["adaptive-routing", "concurrency-resilience"].includes(route.id) && comparison) {
+        completeLab(route.id, `Comparison recorded. You changed ${comparison.changed[0]}.`);
+      } else {
+        saveState();
+        showToast(comparison ? "Benchmark saved. This module now has comparison evidence." : "Benchmark saved. Change one allowed control, keep the scenario and seed fixed, then run again.");
+      }
       renderDrawer(parseRoute());
       return;
     }
@@ -1440,7 +2841,11 @@
       state.codeDrafts[exerciseId] = editor.value;
       saveState();
       const result = await runCodeExercise(exerciseId, editor.value);
-      state.codeResults[exerciseId] = result;
+      state.codeResults[exerciseId] = {
+        ...result,
+        sourceFingerprint: Sim.stableFingerprint({ source: editor.value }),
+        ranAt: new Date().toISOString()
+      };
       saveState();
       output.className = `test-results ${result.passed ? "passed" : "failed"}`;
       output.innerHTML = renderCodeResult(result);
@@ -1467,92 +2872,373 @@
       return;
     }
 
+    if (event.target.closest("[data-run-fleet]")) {
+      const root = event.target.closest("[data-fleet-lab]");
+      const read = (name) => root.querySelector(`[name="${name}"]`)?.value;
+      activeFleetRun = LabModels.runFleet({
+        scenario: read("scenario"),
+        strategy: read("strategy"),
+        replicas: read("replicas"),
+        zones: read("zones"),
+        localCap: read("localCap"),
+        offeredConcurrency: read("offeredConcurrency"),
+        providerQuotaA: read("providerQuotaA"),
+        providerQuotaB: read("providerQuotaB"),
+        failoverReserveB: read("failoverReserveB"),
+        normalShareA: read("normalShareA"),
+        leaseTtlSec: read("leaseTtlSec"),
+        maxAttemptSec: read("maxAttemptSec"),
+        coldStartPct: read("coldStartPct"),
+        restartRampSec: read("restartRampSec")
+      });
+      const fleetBaseline = LabModels.runFleet(defaultFleetConfig());
+      activeFleetRun.evidence = {
+        ranByStudent: true,
+        changedControls: changedModelFields(fleetBaseline.config, activeFleetRun.config),
+        outcomeChanged: modelOutcomeChanged(fleetBaseline, activeFleetRun),
+        ranAt: new Date().toISOString()
+      };
+      root.querySelector("[data-fleet-output]").innerHTML = renderFleetResult(activeFleetRun);
+      announce(`${activeFleetRun.invariants.filter((item) => item.ok).length} of ${activeFleetRun.invariants.length} fleet invariants hold.`);
+      return;
+    }
+
+    if (event.target.closest("[data-run-incident]")) {
+      const root = event.target.closest("[data-incident-lab]");
+      const read = (name) => root.querySelector(`[name="${name}"]`)?.value;
+      activeIncidentRun = LabModels.runIncident({
+        scenario: read("scenario"),
+        configMode: read("configMode"),
+        durationSec: read("durationSec"),
+        rps: read("rps"),
+        gatewayCap: read("gatewayCap"),
+        providerCapA: read("providerCapA"),
+        providerCapB: read("providerCapB"),
+        baseP95Ams: read("baseP95Ams"),
+        baseP95Bms: read("baseP95Bms"),
+        slowdownMs: read("slowdownMs"),
+        queueCap: read("queueCap"),
+        deadlineMs: read("deadlineMs"),
+        normalShareA: read("normalShareA"),
+        probeSharePct: read("probeSharePct"),
+        faultStartSec: read("faultStartSec"),
+        shiftDelaySec: read("shiftDelaySec"),
+        recoveryStartSec: read("recoveryStartSec"),
+        recoveryRampSec: read("recoveryRampSec"),
+        coldStartPct: read("coldStartPct"),
+        telemetryQueueBytes: read("telemetryQueueBytes"),
+        telemetryBytesPerRequest: read("telemetryBytesPerRequest"),
+        telemetrySinkBytesPerSec: read("telemetrySinkBytesPerSec")
+      });
+      const incidentBaseline = LabModels.runIncident(defaultIncidentConfig());
+      activeIncidentRun.evidence = {
+        ranByStudent: true,
+        changedControls: changedModelFields(incidentBaseline.config, activeIncidentRun.config),
+        outcomeChanged: modelOutcomeChanged(incidentBaseline, activeIncidentRun),
+        ranAt: new Date().toISOString()
+      };
+      const durationControl = root.querySelector('[name="durationSec"]');
+      if (durationControl) durationControl.value = activeIncidentRun.config.durationSec;
+      root.querySelector("[data-incident-output]").innerHTML = renderIncidentResult(activeIncidentRun);
+      announce(`${activeIncidentRun.invariants.filter((item) => item.ok).length} of ${activeIncidentRun.invariants.length} incident invariants hold.`);
+      return;
+    }
+
+    const recordModel = event.target.closest("[data-record-fleet], [data-record-incident]");
+    if (recordModel) {
+      const fleet = recordModel.hasAttribute("data-record-fleet");
+      const root = recordModel.closest(fleet ? "[data-fleet-lab]" : "[data-incident-lab]");
+      const run = fleet ? activeFleetRun : activeIncidentRun;
+      const moduleId = fleet ? "production-fleet" : "telemetry-recovery";
+      const defense = root.querySelector(fleet ? "[data-fleet-defense]" : "[data-incident-defense]")?.value.trim() || "";
+      const failed = run?.invariants?.filter((invariant) => !invariant.ok) || [];
+      if (!run?.evidence?.ranByStudent) {
+        showToast("Run the model yourself before recording evidence.");
+        return;
+      }
+      if (!run.evidence.changedControls?.length) {
+        showToast("Change at least one control from the starting model, then run it again.");
+        return;
+      }
+      if (!run.evidence.outcomeChanged) {
+        showToast("The changed control did not change modeled behavior in this scenario. Change a relevant control and run again.");
+        return;
+      }
+      if (fleet && run?.config?.scenario === "healthy") {
+        showToast("Choose a fleet failure before recording evidence.");
+        return;
+      }
+      if (failed.length) {
+        showToast(`Resolve ${failed.length} failing invariant${failed.length === 1 ? "" : "s"} first.`);
+        return;
+      }
+      if (defense.length < 100) {
+        showToast("Write at least 100 characters that defend the failure behavior.");
+        root.querySelector(fleet ? "[data-fleet-defense]" : "[data-incident-defense]")?.focus();
+        return;
+      }
+      const design = state.designs[moduleId] || {};
+      state.designs[moduleId] = {
+        ...design,
+        modelChecked: true,
+        defense,
+        config: structuredClone(run.config),
+        recordedAt: new Date().toISOString()
+      };
+      if (state.designs[moduleId].boardChecked) {
+        completeLab(moduleId, "Model and architecture evidence recorded.");
+      } else {
+        saveState();
+        showToast("Model evidence recorded. Complete the architecture board next.");
+      }
+      return;
+    }
+
     const checkDesignButton = event.target.closest("[data-check-design]");
     if (checkDesignButton) {
       const moduleId = checkDesignButton.dataset.checkDesign;
       const design = state.designs[moduleId] || {};
       const required = moduleId === "production-fleet" ? ["health", "quota", "config"] : ["telemetry", "audit", "tracing"];
+      const expected = expectedDesignValues(moduleId);
       const missing = required.filter((field) => !design[field]);
+      const unsafe = required.filter((field) => design[field] && design[field] !== expected[field]);
       const status = checkDesignButton.parentElement.querySelector("[data-design-status]");
-      if (missing.length || !design.failure || String(design.rationale || "").trim().length < 40) {
-        status.textContent = "Choose every boundary, inject a failure, and write at least 40 characters of rationale.";
+      if (missing.length || !design.failure) {
+        status.textContent = "Choose every boundary and inject one failure before checking the design.";
+        status.classList.add("error");
+      } else if (unsafe.length) {
+        status.textContent = `Revisit ${unsafe.join(", ")}. Its consequence conflicts with the request-path or ownership invariant.`;
+        status.classList.add("error");
+      } else if (!designRationaleHolds(moduleId, design.rationale)) {
+        status.textContent = "Write 2 to 4 complete sentences that connect at least three system concepts to the invariant, failure behavior, and trade-off.";
         status.classList.add("error");
       } else {
-        design.checked = true;
+        design.boardChecked = true;
         state.designs[moduleId] = design;
-        completeLab(moduleId, "Design evidence recorded.");
-        status.textContent = "Design evidence recorded. Practice saying the rationale without reading it.";
+        if (design.modelChecked) {
+          completeLab(moduleId, "Model and architecture evidence recorded.");
+          status.textContent = "Architecture evidence recorded. The full lab gate now holds.";
+        } else {
+          saveState();
+          showToast("Architecture evidence recorded. Run and defend the executable model next.");
+          status.textContent = "Architecture evidence recorded. The executable model is still required.";
+        }
         status.classList.remove("error");
       }
       return;
     }
 
-    if (event.target.closest("[data-run-capacity]")) {
-      const root = event.target.closest("[data-capacity-lab]");
-      const value = (name) => Number(root.querySelector(`[name="${name}"]`).value);
-      const pages = value("pagesPerDay");
-      const qps = pages / 86400;
-      const bytesPerDay = pages * value("responseKiB") * 1024;
-      const inflight = qps * (value("fetchMs") / 1000);
-      const authorities = qps * (value("authorityGapMs") / 1000);
-      const retained = bytesPerDay * value("retentionDays") * value("replication");
-      root.querySelector("[data-capacity-output]").innerHTML = `<div class="capacity-result-grid">${metric("Average fetch rate", `${qps.toLocaleString(undefined, { maximumFractionDigits: 0 })} /s`)}${metric("Raw ingress", `${(bytesPerDay / 1e12).toFixed(2)} TB/day`)}${metric("Mean in flight", inflight.toLocaleString(undefined, { maximumFractionDigits: 0 }))}${metric("Ready authorities", authorities.toLocaleString(undefined, { maximumFractionDigits: 0 }))}${metric("Retained raw bytes", `${(retained / 1e15).toFixed(2)} PB`)}</div><div class="formula-sheet"><code>fetch_qps = pages_per_day / 86,400</code><code>mean_inflight = fetch_qps × mean_fetch_seconds</code><code>active_authorities ≥ fetch_qps × authority_gap_seconds</code><p>Now add peak headroom, retries, parse throughput, long tails, indexes, and metadata.</p></div>`;
-      completeLab("crawler-request-path", "Capacity worksheet recorded.");
+    if (event.target.closest("[data-run-pipeline]")) {
+      const root = event.target.closest("[data-pipeline-lab]");
+      const read = (name) => root.querySelector(`[name="${name}"]`)?.value;
+      activeCrawlerRun = LabModels.runCrawlPipeline({
+        pagesPerDay: read("pagesPerDay"),
+        peakFactor: read("peakFactor"),
+        attemptAmplification: read("attemptAmplification"),
+        meanResponseKiB: read("meanResponseKiB"),
+        meanFetchMs: read("meanFetchMs"),
+        p95FetchMs: read("p95FetchMs"),
+        authorityGapMs: read("authorityGapMs"),
+        perAuthorityConcurrency: read("perAuthorityConcurrency"),
+        activeAuthoritiesAvailable: read("activeAuthoritiesAvailable"),
+        fetchConcurrencyCap: read("fetchConcurrencyCap"),
+        networkCapacityGbps: read("networkCapacityGbps"),
+        parserCores: read("parserCores"),
+        parserCpuMs: read("parserCpuMs"),
+        rawRetentionDays: read("rawRetentionDays"),
+        replicationFactor: read("replicationFactor"),
+        rawStorageCapacityPB: read("rawStorageCapacityPB"),
+        browserRenderFraction: read("browserRenderFraction"),
+        browserRenderMs: read("browserRenderMs"),
+        browserRenderMemoryMiB: read("browserRenderMemoryMiB"),
+        browserRenderConcurrencyCap: read("browserRenderConcurrencyCap"),
+        browserRenderMemoryGiB: read("browserRenderMemoryGiB"),
+        separateRendererPool: root.querySelector('[name="separateRendererPool"]')?.checked,
+        slowdown: {
+          durationSeconds: read("slowdownDurationSeconds"),
+          parserCapacityFactor: read("parserCapacityFactor"),
+          inputRateMode: read("slowdownInputRateMode"),
+          queueCapacityPages: read("queueCapacityPages"),
+          maxRecoverySeconds: read("maxRecoverySeconds")
+        }
+      });
+      const pipelineBaseline = LabModels.runCrawlPipeline(defaultPipelineConfig());
+      activeCrawlerRun.evidence = {
+        ranByStudent: true,
+        changedControls: changedModelFields(pipelineBaseline.config, activeCrawlerRun.config),
+        outcomeChanged: modelOutcomeChanged(pipelineBaseline, activeCrawlerRun),
+        ranAt: new Date().toISOString()
+      };
+      root.querySelector("[data-pipeline-output]").innerHTML = renderPipelineResult(activeCrawlerRun);
+      announce(`${activeCrawlerRun.invariants.filter((item) => item.ok).length} of ${activeCrawlerRun.invariants.length} pipeline invariants hold.`);
       return;
     }
 
-    if (event.target.closest("[data-run-crawler]")) {
-      const root = event.target.closest("[data-crawler-lab]");
-      const read = (name) => root.querySelector(`[name="${name}"]`);
-      const config = {
-        scheduler: read("scheduler").value,
-        scenario: read("scenario").value,
-        workers: Number(read("workers").value),
-        perHostCap: Number(read("perHostCap").value),
-        perIpCap: Number(read("perIpCap").value),
-        minDelayMs: Number(read("minDelayMs").value),
-        respectRobots: read("respectRobots").checked,
-        seed: Number(read("seed").value)
+    if (event.target.closest("[data-run-frontier]")) {
+      const root = event.target.closest("[data-frontier-lab]");
+      const value = (name) => root.querySelector(`[name="${name}"]`);
+      activeCrawlerRun = LabModels.runFrontierChallenge({
+        scenario: value("scenario").value,
+        scheduler: value("scheduler").value,
+        workers: value("workers").value,
+        perAuthorityConcurrency: value("perAuthorityConcurrency").value,
+        sharedIpCap: value("sharedIpCap").value,
+        leaseMs: value("leaseMs").value,
+        robotsPolicy: value("robotsPolicy").value,
+        dedupeMode: value("dedupeMode").value,
+        maxUrlsPerAuthority: value("maxUrlsPerAuthority").value,
+        enforceAuthorityReady: value("enforceAuthorityReady").checked,
+        enforceSharedIp: value("enforceSharedIp").checked,
+        durableLeases: value("durableLeases").checked,
+        requeueExpiredLeases: value("requeueExpiredLeases").checked,
+        revalidateRedirects: value("revalidateRedirects").checked,
+        pinValidatedAddress: value("pinValidatedAddress").checked,
+        enforceEgress: value("enforceEgress").checked,
+        enforceCrawlBudget: value("enforceCrawlBudget").checked
+      });
+      if (!activeCrawlerRun.ok) frontierFailedRun = structuredClone(activeCrawlerRun);
+      root.querySelector("[data-frontier-output]").innerHTML = renderFrontierResult(activeCrawlerRun);
+      announce(activeCrawlerRun.ok ? "Every frontier invariant holds." : `${activeCrawlerRun.invariants.filter((item) => !item.ok).length} frontier invariants failed.`);
+      return;
+    }
+
+    const recordCrawlerModel = event.target.closest("[data-record-pipeline], [data-record-frontier]");
+    if (recordCrawlerModel) {
+      const pipeline = recordCrawlerModel.hasAttribute("data-record-pipeline");
+      const root = recordCrawlerModel.closest(pipeline ? "[data-pipeline-lab]" : "[data-frontier-lab]");
+      const run = activeCrawlerRun;
+      const moduleId = pipeline ? "crawler-request-path" : "crawler-frontier";
+      const defense = root.querySelector(pipeline ? "[data-pipeline-defense]" : "[data-frontier-defense]")?.value.trim() || "";
+      const failed = run?.invariants?.filter((invariant) => !invariant.ok) || [];
+      if (pipeline && !run?.evidence?.ranByStudent) {
+        showToast("Change an assumption and recalculate the model before recording evidence.");
+        return;
+      }
+      if (pipeline && !run.evidence.changedControls?.length) {
+        showToast("Change at least one sizing assumption, then recalculate.");
+        return;
+      }
+      if (pipeline && !run.evidence.outcomeChanged) {
+        showToast("That assumption did not change the modeled result. Change a relevant input and recalculate.");
+        return;
+      }
+      if (!pipeline && (!frontierFailedRun || frontierFailedRun.scenario !== run?.scenario)) {
+        showToast("Break and repair the same scenario before recording evidence.");
+        return;
+      }
+      if (!pipeline) {
+        const repair = frontierRepairEvaluation(frontierFailedRun, run);
+        if (!repair.ok) {
+          showToast(repair.reasons[0]);
+          return;
+        }
+      }
+      if (failed.length) {
+        showToast(`Resolve ${failed.length} failing invariant${failed.length === 1 ? "" : "s"} first.`);
+        return;
+      }
+      if (defense.length < 100) {
+        showToast("Write at least 100 characters that defend the result.");
+        root.querySelector(pipeline ? "[data-pipeline-defense]" : "[data-frontier-defense]")?.focus();
+        return;
+      }
+      state.designs[moduleId] = {
+        checked: true,
+        defense,
+        config: structuredClone(run.config || run.controls),
+        recordedAt: new Date().toISOString()
       };
-      activeCrawlerRun = Sim.runCrawler(config);
-      root.querySelector("[data-crawler-output]").innerHTML = renderCrawlerResult(activeCrawlerRun);
-      const violations = Number(activeCrawlerRun.metrics?.policyViolations || 0);
-      if (violations === 0) completeLab("crawler-frontier", "Frontier drained with zero policy violations.");
-      else showToast(`${violations} policy violation${violations === 1 ? "" : "s"}. Adjust the scheduler or limits.`);
-      announce(`Crawler run complete with ${violations} policy violations.`);
+      completeLab(moduleId, "Model invariants and design defense recorded.");
       return;
     }
 
     if (event.target.closest("[data-timer-toggle]")) {
-      activeTimer.running = !activeTimer.running;
-      event.target.closest("[data-timer-toggle]").textContent = activeTimer.running ? "Pause" : "Start timer";
-      if (activeTimer.running) startTimerInterval(); else stopTimer(false);
+      if (!activeTimer || activeTimer.remaining === 0) return;
+      if (activeTimer.running) {
+        syncActiveTimer();
+        activeTimer.running = false;
+        activeTimer.elapsedAtRunStart = activeTimer.elapsed;
+        activeTimer.runStartedAtMs = null;
+        stopTimer(false);
+      } else {
+        if (!activeTimer.started) {
+          activeTimer.started = true;
+          activeTimer.startedAt = new Date().toISOString();
+          activeTimer.attemptId = crypto.randomUUID();
+          activeTimer.rubricRevealed = false;
+        }
+        activeTimer.elapsedAtRunStart = activeTimer.elapsed;
+        activeTimer.runStartedAtMs = Date.now();
+        activeTimer.running = true;
+        startTimerInterval();
+      }
+      refreshTimerDisplay();
       return;
     }
 
     if (event.target.closest("[data-timer-reset]")) {
       const mock = mockById.get(activeTimer.mockId);
-      activeTimer.remaining = mock.minutes * 60;
-      activeTimer.running = false;
       stopTimer(false);
-      document.querySelector("[data-timer] output").textContent = formatClock(activeTimer.remaining);
-      document.querySelector("[data-timer-toggle]").textContent = "Start timer";
+      activeTimer = freshMockTimer(mock);
+      delete state.mockNotes[mock.id];
+      delete state.mockNoteUpdatedAt[mock.id];
+      saveState();
+      renderMock(mock);
+      showToast("Mock attempt reset.");
+      return;
+    }
+
+    if (event.target.closest("[data-reveal-rubric]")) {
+      const root = event.target.closest("[data-mock-id]");
+      const mock = mockById.get(root?.dataset.mockId);
+      if (!mock || !activeTimer || activeTimer.elapsed < mock.minutes * 60) {
+        showToast("Complete the full timer before revealing the rubric.");
+        return;
+      }
+      activeTimer.rubricRevealed = true;
+      saveState();
+      renderMock(mock);
       return;
     }
 
     if (event.target.closest("[data-score-mock]")) {
       const root = event.target.closest("[data-mock-id]");
       const mock = mockById.get(root.dataset.mockId);
+      if (!activeTimer?.rubricRevealed) {
+        showToast("Complete the timer and reveal the rubric before scoring.");
+        return;
+      }
+      const missingEvidence = mockObjectiveEvidence(mock).find((item) => !item.ok);
+      if (missingEvidence) {
+        showToast(`Required artifact missing: ${missingEvidence.label}.`);
+        return;
+      }
       const selects = [...root.querySelectorAll("[data-rubric-score]")];
       if (selects.some((select) => select.value === "")) {
         showToast("Score every rubric row first.");
+        return;
+      }
+      const notes = String(state.mockNotes[mock.id] || "").trim();
+      if (notes.length < 120) {
+        showToast("Record at least 120 characters of requirements, decisions, and failure behavior first.");
+        root.querySelector("[data-mock-notes]")?.focus();
+        return;
+      }
+      if (!activeTimer.startedAt || new Date(state.mockNoteUpdatedAt[mock.id] || 0).getTime() < new Date(activeTimer.startedAt).getTime()) {
+        showToast("Add or revise your notes during this timed attempt before scoring.");
+        root.querySelector("[data-mock-notes]")?.focus();
+        return;
+      }
+      if (!root.querySelector("[data-mock-performed]")?.checked) {
+        showToast("Confirm that you completed the rep before self-scoring it.");
+        root.querySelector("[data-mock-performed]")?.focus();
         return;
       }
       const scores = Object.fromEntries(selects.map((select) => [select.dataset.rubricScore, Number(select.value)]));
       const earned = Object.values(scores).reduce((sum, value) => sum + value, 0);
       const total = mock.rubric.length * 2;
       const percent = Math.round((earned / total) * 100);
-      state.mockScores[mock.id] = { scores, earned, total, percent, scoredAt: new Date().toISOString() };
+      state.mockScores[mock.id] = { scores, earned, total, percent, notesLength: notes.length, elapsedSec: Number(activeTimer?.elapsed || 0), attemptId: activeTimer.attemptId, scoredAt: new Date().toISOString() };
       saveState();
       if (!state.completedLabs.includes("interview-rehearsals")) state.completedLabs.push("interview-rehearsals");
       saveState();
@@ -1580,11 +3266,16 @@
       const selected = [...document.querySelectorAll("[data-compare-run]:checked")].map((input) => Number(input.dataset.compareRun));
       const output = document.querySelector("[data-compare-output]");
       if (selected.length !== 2) { output.textContent = "Select exactly two rows."; return; }
-      const [a, b] = selected.map((index) => state.benchmarks[index]);
-      const successDelta = Number(b.metrics.successRate || 0) - Number(a.metrics.successRate || 0);
-      const latencyDelta = Number(b.metrics.p95 || 0) - Number(a.metrics.p95 || 0);
-      const callDelta = Number(b.metrics.attemptsPerRequest || 0) - Number(a.metrics.attemptsPerRequest || 0);
-      output.textContent = `Second minus first: success ${successDelta >= 0 ? "+" : ""}${successDelta.toFixed(1)} points, p95 ${latencyDelta >= 0 ? "+" : ""}${latencyDelta} ms, calls/request ${callDelta >= 0 ? "+" : ""}${callDelta.toFixed(2)}.`;
+      const ordered = selected.map((index) => state.benchmarks[index]).sort((left, right) => new Date(left.savedAt || 0) - new Date(right.savedAt || 0));
+      const [baseline, candidate] = ordered;
+      if (baseline.moduleId !== candidate.moduleId) { output.textContent = "Compare two runs from the same module."; return; }
+      if (baseline.config?.scenario !== candidate.config?.scenario || baseline.config?.seed !== candidate.config?.seed) { output.textContent = "Scenario and seed must match before the result is comparable."; return; }
+      const changed = changedGatewayFields(baseline.config, candidate.config);
+      if (changed.length !== 1) { output.textContent = `Change exactly one control. This pair changed ${changed.length}.`; return; }
+      const successDelta = Number(candidate.metrics.successRate || 0) - Number(baseline.metrics.successRate || 0);
+      const latencyDelta = Number(candidate.metrics.successP95 ?? candidate.metrics.p95 ?? 0) - Number(baseline.metrics.successP95 ?? baseline.metrics.p95 ?? 0);
+      const callDelta = Number(candidate.metrics.attemptsPerRequest || 0) - Number(baseline.metrics.attemptsPerRequest || 0);
+      output.textContent = `Candidate minus baseline: success ${successDelta >= 0 ? "+" : ""}${successDelta.toFixed(1)} points, successful-request p95 ${latencyDelta >= 0 ? "+" : ""}${latencyDelta.toFixed(1)} ms, calls/request ${callDelta >= 0 ? "+" : ""}${callDelta.toFixed(2)}. Changed: ${changed.length ? changed.join(", ") : "no controls"}.`;
       return;
     }
 
@@ -1616,6 +3307,9 @@
       activeQuiz = null;
       activeGatewayRun = null;
       activeCrawlerRun = null;
+      activeFleetRun = null;
+      activeIncidentRun = null;
+      frontierFailedRun = null;
       activeTimer = null;
       renderRoute();
       showToast("Course progress reset.");
@@ -1625,13 +3319,25 @@
   document.addEventListener("input", (event) => {
     if (event.target.matches("[data-code-editor]")) {
       const root = event.target.closest("[data-code-exercise]");
-      state.codeDrafts[root.dataset.codeExercise] = event.target.value;
+      const exerciseId = root.dataset.codeExercise;
+      state.codeDrafts[exerciseId] = event.target.value;
+      if (state.codeResults[exerciseId]) {
+        delete state.codeResults[exerciseId];
+        const moduleId = Object.entries(codeExercises).find(([, exercise]) => exercise.id === exerciseId)?.[0];
+        state.completedLabs = state.completedLabs.filter((id) => id !== moduleId);
+        const results = root.querySelector("[data-test-results]");
+        if (results) {
+          results.className = "test-results";
+          results.innerHTML = "<p>Code changed. Run the tests again.</p>";
+        }
+      }
       saveState();
     }
     if (event.target.matches("[data-design-field]")) {
       const root = event.target.closest("[data-design-board]");
       const design = state.designs[root.dataset.designBoard] || {};
       design[event.target.dataset.designField] = event.target.value;
+      design.boardChecked = false;
       state.designs[root.dataset.designBoard] = design;
       saveState();
       if (event.target.tagName === "SELECT" && event.target.dataset.designField !== "failure") {
@@ -1646,6 +3352,7 @@
     if (event.target.matches("[data-mock-notes]")) {
       const root = event.target.closest("[data-mock-id]");
       state.mockNotes[root.dataset.mockId] = event.target.value;
+      state.mockNoteUpdatedAt[root.dataset.mockId] = new Date().toISOString();
       saveState();
     }
     if (event.target.matches("[data-benchmark-note]")) {
@@ -1659,11 +3366,6 @@
   });
 
   document.addEventListener("change", async (event) => {
-    if (event.target === modeSelect) {
-      state.mode = modeSelect.value;
-      saveState();
-      if (parseRoute().type === "lesson") renderRoute();
-    }
     if (event.target.matches("[data-import-progress]")) {
       const file = event.target.files?.[0];
       if (!file) return;
@@ -1672,6 +3374,7 @@
         if (payload.format !== "decagon-prep-v1" || !payload.state) throw new Error("Unsupported preparation record");
         localStorage.setItem(storageKey, JSON.stringify(payload.state));
         state = loadState();
+        activeTimer = restoreMockTimer(state.activeMockTimer);
         renderRoute();
         showToast("Preparation record imported.");
       } catch {
@@ -1708,7 +3411,14 @@
       event.preventDefault();
       openSearch();
     }
-    if (event.key === "Escape" && document.body.classList.contains("map-open")) setMobileMap(false);
+    if (event.key === "Escape" && document.body.classList.contains("map-open")) {
+      setMobileMap(false);
+      document.querySelector("#mobile-map-trigger")?.focus();
+    }
+  });
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && activeTimer?.running) refreshTimerDisplay(true);
   });
 
   window.addEventListener("hashchange", renderRoute);
@@ -1716,6 +3426,6 @@
     if (!matchMedia("(max-width: 820px)").matches) setMobileMap(false);
   });
 
-  if (modeSelect) modeSelect.value = state.mode;
+  updateModePicker();
   renderRoute();
 })();

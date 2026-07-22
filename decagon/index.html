@@ -35,7 +35,7 @@
       href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;600;700&amp;family=IBM+Plex+Mono:wght@400;500;600&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;display=swap"
       rel="stylesheet"
     >
-    <link rel="stylesheet" href="styles.css?v=20260721-1">
+    <link rel="stylesheet" href="styles.css?v=20260722-11">
   </head>
   <body>
     <a class="skip-link" href="#course-view">Skip to the current exercise</a>
@@ -76,14 +76,23 @@
         <nav class="module-nav decagon-nav" id="module-nav" aria-label="Interview tracks and modules"></nav>
 
         <div class="rail-tools">
-          <label class="depth-control" for="mode-select">
-            <span>Practice mode</span>
-            <select id="mode-select">
-              <option value="learn">Learn</option>
-              <option value="interview">Interview</option>
-              <option value="reference">Reference</option>
-            </select>
-          </label>
+          <div class="mode-picker" aria-labelledby="mode-picker-label">
+            <span id="mode-picker-label">Study format</span>
+            <div class="mode-options" role="group" aria-label="Choose how lesson pages are presented">
+              <button type="button" data-mode-value="learn" aria-pressed="true">
+                <strong>Guided</strong>
+                <small>Explanation and worked example</small>
+              </button>
+              <button type="button" data-mode-value="interview" aria-pressed="false">
+                <strong>Interview drill</strong>
+                <small>Prompt first, then reveal the rubric</small>
+              </button>
+              <button type="button" data-mode-value="reference" aria-pressed="false">
+                <strong>Reference</strong>
+                <small>Decisions, diagrams, and formulas</small>
+              </button>
+            </div>
+          </div>
           <button class="quiet-button" id="reset-progress" type="button">Reset preparation</button>
         </div>
       </aside>
@@ -112,7 +121,6 @@
         <main id="course-view" tabindex="-1"></main>
       </div>
 
-      <aside class="context-drawer decagon-notebook" id="context-drawer" aria-label="Interview notebook"></aside>
     </div>
 
     <dialog class="search-dialog" id="search-dialog" aria-labelledby="search-title">
@@ -148,8 +156,17 @@
       <div class="noscript-message">Enable JavaScript to run the gateway, crawler, code, and mock interview exercises.</div>
     </noscript>
 
-    <script src="course-data.js?v=20260721-1" defer></script>
-    <script src="simulations.js?v=20260721-1" defer></script>
-    <script src="app.js?v=20260721-1" defer></script>
+    <script src="course-data.js?v=20260722-11" defer></script>
+    <script src="guides-coding.js?v=20260722-11" defer></script>
+    <script src="guides-gateway.js?v=20260722-11" defer></script>
+    <script src="guides-crawler.js?v=20260722-11" defer></script>
+    <script src="lab-models-gateway.js?v=20260722-11" defer></script>
+    <script src="lab-models-crawler.js?v=20260722-11" defer></script>
+    <script src="applied-coding.js?v=20260722-11" defer></script>
+    <script src="applied-gateway.js?v=20260722-11" defer></script>
+    <script src="applied-crawler.js?v=20260722-11" defer></script>
+    <script src="applied-rehearsal.js?v=20260722-11" defer></script>
+    <script src="simulations.js?v=20260722-11" defer></script>
+    <script src="app.js?v=20260722-11" defer></script>
   </body>
 </html>

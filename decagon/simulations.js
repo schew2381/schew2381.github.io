@@ -236,17 +236,76 @@
     return { serviceMs, success: !failed, status };
   }
 
+  function gatewayPhaseDefinitions(scenario) {
+    if (scenario === "brownout") {
+      return [
+        { label: "Before brownout", start: 0, end: 0.3 },
+        { label: "Brownout begins", start: 0.3, end: 0.53 },
+        { label: "Brownout continues", start: 0.53, end: 0.76 },
+        { label: "After brownout", start: 0.76, end: 1.01 }
+      ];
+    }
+    if (scenario === "recovery") {
+      return [
+        { label: "Failure", start: 0, end: 0.35 },
+        { label: "Early recovery", start: 0.35, end: 0.57 },
+        { label: "Recovery ramp", start: 0.57, end: 0.8 },
+        { label: "Recovered", start: 0.8, end: 1.01 }
+      ];
+    }
+    return [
+      { label: "Opening quarter", start: 0, end: 0.25 },
+      { label: "Second quarter", start: 0.25, end: 0.5 },
+      { label: "Third quarter", start: 0.5, end: 0.75 },
+      { label: "Final quarter", start: 0.75, end: 1.01 }
+    ];
+  }
+
+  function gatewayPhaseWindows(config, rows) {
+    return gatewayPhaseDefinitions(config.scenario).map((phase) => {
+      const phaseRows = rows.filter((row) => {
+        const progress = config.requests <= 1 ? 0 : row.id / (config.requests - 1);
+        return progress >= phase.start && progress < phase.end;
+      });
+      const attempts = phaseRows.flatMap((row) => row.attempts || []);
+      const providerACount = attempts.filter((attempt) => attempt.provider === "A").length;
+      const providerBCount = attempts.filter((attempt) => attempt.provider === "B").length;
+      const attemptCount = providerACount + providerBCount;
+      const queueIntervals = phaseRows
+        .filter((row) => row.queued && row.startMs !== null && row.startMs > row.arrivalMs)
+        .map((row) => ({ startMs: row.arrivalMs, endMs: row.startMs }));
+      const successfulLatencies = phaseRows.filter((row) => row.success).map((row) => row.latencyMs);
+      return {
+        label: phase.label,
+        requestStart: phaseRows[0]?.id ?? 0,
+        requestEnd: phaseRows.at(-1)?.id ?? 0,
+        successRate: phaseRows.length === 0 ? 0 : roundTo((phaseRows.filter((row) => row.success).length / phaseRows.length) * 100, 1),
+        successP95: roundTo(percentile(successfulLatencies, 95), 1),
+        providerShareA: attemptCount === 0 ? 0 : roundTo((providerACount / attemptCount) * 100, 1),
+        providerShareB: attemptCount === 0 ? 0 : roundTo((providerBCount / attemptCount) * 100, 1),
+        maxActive: maximumConcurrency(attempts),
+        maxQueued: maximumConcurrency(queueIntervals),
+        dropped: phaseRows.filter((row) => row.dropped).length
+      };
+    });
+  }
+
   function makeGatewayProvider(name, cap, initialLatency) {
     return {
       name,
       cap,
       slots: Array(cap).fill(0),
       attempts: [],
+      transitions: [],
       health: {
         samples: 0,
         successEwma: 0.985,
         latencyEwma: initialLatency,
         consecutiveFailures: 0,
+        circuitState: "closed",
+        openUntilMs: 0,
+        probeInFlight: false,
+        recoverySuccesses: 0,
       },
     };
   }
@@ -265,13 +324,62 @@
     let retries = 0;
     let hedges = 0;
 
+    function transitionCircuit(providerName, state, atMs, reason) {
+      const provider = providers[providerName];
+      if (provider.health.circuitState === state) return;
+      provider.health.circuitState = state;
+      provider.transitions.push({ state, atMs, reason });
+    }
+
+    function openCircuit(providerName, atMs, reason) {
+      const health = providers[providerName].health;
+      health.openUntilMs = atMs + Math.max(500, Math.min(3000, config.deadlineMs));
+      health.probeInFlight = false;
+      health.recoverySuccesses = 0;
+      transitionCircuit(providerName, "open", atMs, reason);
+    }
+
+    function refreshCircuit(providerName, now) {
+      const health = providers[providerName].health;
+      if (health.circuitState === "open" && now >= health.openUntilMs) {
+        health.probeInFlight = false;
+        transitionCircuit(providerName, "half-open", now, "Cooldown elapsed; admit one probe.");
+      }
+    }
+
     function updateHealth(event) {
-      const health = providers[event.provider].health;
+      const provider = providers[event.provider];
+      const health = provider.health;
       const weight = health.samples < 4 ? 0.34 : 0.2;
       health.samples += 1;
       health.successEwma = health.successEwma * (1 - weight) + (event.success ? 1 : 0) * weight;
       health.latencyEwma = health.latencyEwma * (1 - weight) + event.latencyMs * weight;
       health.consecutiveFailures = event.success ? 0 : health.consecutiveFailures + 1;
+
+      if (event.breakerProbe) health.probeInFlight = false;
+      if (!event.success) {
+        if (
+          event.breakerProbe
+          || health.circuitState === "recovering"
+          || health.consecutiveFailures >= 3
+        ) {
+          openCircuit(event.provider, event.time, event.breakerProbe
+            ? "The half-open probe failed."
+            : "The failure threshold was reached.");
+        }
+        return;
+      }
+
+      if (event.breakerProbe) {
+        health.recoverySuccesses = 1;
+        transitionCircuit(event.provider, "recovering", event.time, "The half-open probe succeeded.");
+      } else if (health.circuitState === "recovering") {
+        health.recoverySuccesses += 1;
+        if (health.recoverySuccesses >= 4) {
+          health.recoverySuccesses = 0;
+          transitionCircuit(event.provider, "closed", event.time, "Four recovery samples succeeded.");
+        }
+      }
     }
 
     function flushHealth(now) {
@@ -292,6 +400,7 @@
         latencyMs: attempt.endMs - attempt.startMs,
         success: attempt.success,
         sequence: attempt.sequence,
+        breakerProbe: attempt.breakerProbe,
       });
     }
 
@@ -306,42 +415,65 @@
       const health = provider.health;
       const load = providerInflight(providerName, now) / provider.cap;
       const reliabilityPenalty = 1 / Math.pow(clamp(health.successEwma, 0.08, 1), 2);
-      const breakerPenalty = health.consecutiveFailures >= 3 ? 4 : 1;
+      const breakerPenalty = health.circuitState === "recovering"
+        ? 4 / Math.max(1, health.recoverySuccesses)
+        : 1;
       return health.latencyEwma * reliabilityPenalty * breakerPenalty * (1 + load * 0.7);
+    }
+
+    function providerEligible(providerName, requestId, now) {
+      refreshCircuit(providerName, now);
+      const health = providers[providerName].health;
+      if (health.circuitState === "open") return false;
+      if (health.circuitState === "half-open") return !health.probeInFlight;
+      if (health.circuitState === "recovering") {
+        const share = Math.min(1, health.recoverySuccesses / 4);
+        const sample = makeRandom(`${config.seed}:recovery:${providerName}:${requestId}`)();
+        return sample < share;
+      }
+      return true;
     }
 
     function chooseProvider(policy, requestId, now) {
       flushHealth(now);
+      const eligible = ["A", "B"].filter((providerName) => providerEligible(providerName, requestId, now));
+      if (eligible.length === 0) return null;
+      const halfOpen = eligible.find((providerName) => providers[providerName].health.circuitState === "half-open");
+      if (halfOpen) return halfOpen;
       if (policy === "fixed") {
-        return "A";
+        return eligible.includes("A") ? "A" : eligible[0];
       }
       if (policy === "round-robin") {
-        return requestId % 2 === 0 ? "A" : "B";
+        const preferred = requestId % 2 === 0 ? "A" : "B";
+        return eligible.includes(preferred) ? preferred : eligible[0];
       }
       if (policy === "least-inflight") {
-        const loadA = providerInflight("A", now) / providers.A.cap;
-        const loadB = providerInflight("B", now) / providers.B.cap;
-        if (loadA === loadB) {
-          return providers.A.health.latencyEwma <= providers.B.health.latencyEwma ? "A" : "B";
-        }
-        return loadA < loadB ? "A" : "B";
+        return eligible.slice().sort((left, right) => {
+          const loadLeft = providerInflight(left, now) / providers[left].cap;
+          const loadRight = providerInflight(right, now) / providers[right].cap;
+          return loadLeft - loadRight
+            || providers[left].health.latencyEwma - providers[right].health.latencyEwma
+            || left.localeCompare(right);
+        })[0];
       }
 
       if (random() * 100 < config.explorationPct) {
-        return random() < 0.5 ? "A" : "B";
+        return eligible[Math.floor(random() * eligible.length)];
       }
-      return adaptiveScore("A", now) <= adaptiveScore("B", now) ? "A" : "B";
+      return eligible.slice().sort((left, right) => adaptiveScore(left, now) - adaptiveScore(right, now) || left.localeCompare(right))[0];
     }
 
     function otherProvider(providerName) {
       return providerName === "A" ? "B" : "A";
     }
 
-    function earliestProviderStart(providerName, desiredStart) {
+    function earliestProviderStart(providerName, desiredStart, requestId) {
+      if (!providerEligible(providerName, requestId, desiredStart)) return Number.POSITIVE_INFINITY;
       return Math.max(desiredStart, minimumSlot(providers[providerName].slots).freeAt);
     }
 
     function scheduleAttempt(providerName, desiredStart, deadlineAt, requestId, kind, ordinal) {
+      if (!providerName || !providerEligible(providerName, requestId, desiredStart)) return null;
       const provider = providers[providerName];
       const slot = minimumSlot(provider.slots);
       const startMs = Math.max(desiredStart, slot.freeAt);
@@ -369,7 +501,9 @@
         slotPreviousFreeAt: slot.freeAt,
         slotReservedUntil: endMs,
         healthCommitted: false,
+        breakerProbe: provider.health.circuitState === "half-open",
       };
+      if (attempt.breakerProbe) provider.health.probeInFlight = true;
       provider.slots[slot.index] = endMs;
       provider.attempts.push(attempt);
       return attempt;
@@ -399,13 +533,15 @@
       attempt.success = false;
       attempt.status = "cancelled";
       attempt.cancelled = true;
+      if (attempt.breakerProbe) provider.health.probeInFlight = false;
     }
 
     function retryAfterFailure(primary, deadlineAt, requestId, ordinal) {
       commitHealth(primary);
       flushHealth(primary.endMs);
+      const retryProvider = otherProvider(primary.provider);
       const retry = scheduleAttempt(
-        otherProvider(primary.provider),
+        retryProvider,
         primary.endMs + 1,
         deadlineAt,
         requestId,
@@ -435,7 +571,7 @@
         0,
       );
       if (!primary) {
-        return { attempts, success: false, endMs: deadlineAt, status: "deadline" };
+        return { attempts, success: false, endMs: startMs, status: "no-eligible-provider" };
       }
       attempts.push(primary);
 
@@ -479,7 +615,7 @@
       }
 
       const secondaryProvider = otherProvider(primary.provider);
-      const secondaryStart = earliestProviderStart(secondaryProvider, hedgeAt);
+      const secondaryStart = earliestProviderStart(secondaryProvider, hedgeAt, requestId);
       if (secondaryStart >= primary.endMs || secondaryStart >= deadlineAt) {
         if (primary.success) {
           commitHealth(primary);
@@ -604,6 +740,7 @@
         attempts: logical.attempts.map((attempt) => ({
           provider: attempt.provider,
           kind: attempt.kind,
+          breakerProbe: attempt.breakerProbe,
           startMs: attempt.startMs,
           scheduledStartMs: attempt.scheduledStartMs,
           endMs: attempt.endMs,
@@ -619,7 +756,8 @@
     flushHealth(Number.POSITIVE_INFINITY);
     const completedRows = rows.filter((row) => !row.dropped);
     const successfulRows = completedRows.filter((row) => row.success);
-    const latencyPopulation = successfulRows.length > 0 ? successfulRows : completedRows;
+    const successfulLatencies = successfulRows.map((row) => row.latencyMs);
+    const terminalLatencies = rows.map((row) => row.latencyMs);
     const allAttempts = [...providers.A.attempts, ...providers.B.attempts];
     const providerResults = {};
 
@@ -645,9 +783,10 @@
         sharePct: allAttempts.length === 0
           ? 0
           : Math.round((provider.attempts.length / allAttempts.length) * 1000) / 10,
-        state: provider.health.consecutiveFailures >= 3
-          ? "open"
-          : provider.health.successEwma < 0.9 ? "degraded" : "closed",
+        state: provider.health.circuitState,
+        circuitState: provider.health.circuitState,
+        recoverySuccesses: provider.health.recoverySuccesses,
+        transitions: provider.transitions.slice(),
         latencyEWMA: provider.health.latencyEwma,
         ewmaLatency: provider.health.latencyEwma,
         averageLatencyMs: roundTo(average(latencies), 1),
@@ -657,28 +796,45 @@
           samples: provider.health.samples,
           successEwma: provider.health.successEwma,
           latencyEwma: provider.health.latencyEwma,
+          circuitState: provider.health.circuitState,
+          openUntilMs: provider.health.openUntilMs,
+          recoverySuccesses: provider.health.recoverySuccesses,
         },
       };
     });
 
-    const startedRequests = rows.filter((row) => row.attempts.length > 0).length;
     const successRatio = successfulRows.length / config.requests;
+    const durationMs = Math.max(0, ...rows.map((row) => row.endMs));
+    const queueIntervals = rows
+      .filter((row) => row.queued && row.startMs !== null && row.startMs > row.arrivalMs)
+      .map((row) => ({ startMs: row.arrivalMs, endMs: row.startMs }));
     const metrics = {
       successRate: roundTo(successRatio * 100, 1),
       successRatio,
-      p50: roundTo(percentile(latencyPopulation.map((row) => row.latencyMs), 50), 1),
-      p95: roundTo(percentile(latencyPopulation.map((row) => row.latencyMs), 95), 1),
-      p99: roundTo(percentile(latencyPopulation.map((row) => row.latencyMs), 99), 1),
+      latencyPopulation: "successful requests",
+      p50: roundTo(percentile(successfulLatencies, 50), 1),
+      p95: roundTo(percentile(successfulLatencies, 95), 1),
+      p99: roundTo(percentile(successfulLatencies, 99), 1),
+      successP50: roundTo(percentile(successfulLatencies, 50), 1),
+      successP95: roundTo(percentile(successfulLatencies, 95), 1),
+      successP99: roundTo(percentile(successfulLatencies, 99), 1),
+      terminalP50: roundTo(percentile(terminalLatencies, 50), 1),
+      terminalP95: roundTo(percentile(terminalLatencies, 95), 1),
+      terminalP99: roundTo(percentile(terminalLatencies, 99), 1),
       queueP95: roundTo(percentile(completedRows.map((row) => row.queueMs), 95), 1),
-      attemptsPerRequest: startedRequests === 0
-        ? 0
-        : roundTo(allAttempts.length / startedRequests, 2),
+      attemptsPerRequest: roundTo(allAttempts.length / config.requests, 2),
+      attemptPopulation: "all logical requests",
+      maxActive: maximumConcurrency(allAttempts),
+      maxQueueDepth: maximumConcurrency(queueIntervals),
       dropped: rows.filter((row) => row.dropped).length,
       retries,
       hedges,
       completed: completedRows.length,
       successful: successfulRows.length,
-      durationMs: Math.max(0, ...rows.map((row) => row.endMs)),
+      durationMs,
+      offeredRps: config.rps,
+      achievedRps: durationMs > 0 ? roundTo(successfulRows.length / (durationMs / 1000), 1) : 0,
+      terminalRps: durationMs > 0 ? roundTo(rows.length / (durationMs / 1000), 1) : 0,
     };
 
     if (metrics.dropped > 0) {
@@ -694,7 +850,7 @@
       warnings.push("Retries and hedges added more than 25% request amplification.");
     }
     if (metrics.p95 >= config.deadlineMs * 0.8) {
-      warnings.push("P95 latency approached the request deadline.");
+      warnings.push("Successful-request p95 latency approached the request deadline.");
     }
     if (
       providerResults.A.maxInFlight > providerResults.A.cap
@@ -710,6 +866,7 @@
       providers: providerResults,
       requests: rows,
       rows,
+      windows: gatewayPhaseWindows(config, rows),
       warnings,
     };
     result.fingerprint = stableFingerprint({ kind: result.kind, config: result.config });
