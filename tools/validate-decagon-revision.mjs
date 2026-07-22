@@ -7,6 +7,7 @@ const root = path.resolve(import.meta.dirname, "..");
 const decagonRoot = path.join(root, "decagon");
 const indexPath = path.join(decagonRoot, "index.html");
 const indexSource = fs.readFileSync(indexPath, "utf8");
+const appSource = fs.readFileSync(path.join(decagonRoot, "app.js"), "utf8");
 
 const bannedTerms = [
   "delve",
@@ -110,6 +111,7 @@ for (const file of [
   "course-data.js",
   ...guideFiles,
   ...appliedFiles,
+  "system-design-studios.js",
   "simulations.js",
   ...labModelFiles
 ]) {
@@ -128,18 +130,22 @@ function runInCourseContext(file) {
 runInCourseContext("course-data.js");
 for (const file of guideFiles) runInCourseContext(file);
 for (const file of appliedFiles) runInCourseContext(file);
+runInCourseContext("system-design-studios.js");
 runInCourseContext("simulations.js");
 for (const file of labModelFiles) runInCourseContext(file);
 
 const course = sandbox.window.DECAGON_COURSE;
 const guides = sandbox.window.DECAGON_GUIDES;
 const appliedQuestions = sandbox.window.DECAGON_APPLIED_QUESTIONS;
+const designStudios = sandbox.window.DECAGON_SYSTEM_DESIGN_STUDIOS;
 const simulations = sandbox.window.DecagonSim;
 const labModels = sandbox.window.DecagonLabModels;
 
 assert.ok(course && Array.isArray(course.modules), "Course modules did not load");
+assert.equal(course.version, 4, "Course storage version must invalidate or migrate pre-workbook completions");
 assert.ok(guides && typeof guides === "object", "Guide registries did not load");
 assert.ok(appliedQuestions && typeof appliedQuestions === "object", "Applied question registries did not load");
+assert.ok(designStudios && typeof designStudios === "object", "System-design studios did not load");
 assert.ok(simulations && typeof simulations === "object", "Simulations did not load");
 assert.ok(labModels && typeof labModels === "object", "Lab models did not load");
 
@@ -283,6 +289,56 @@ const moduleIds = new Set(course.modules.map((module) => module.id));
 const lessonIds = new Set();
 let lessonCount = 0;
 let appliedQuestionCount = 0;
+
+assert.deepEqual(Object.keys(designStudios).sort(), ["crawler", "gateway"]);
+for (const [studioId, studio] of Object.entries(designStudios)) {
+  assertText(studio.title, `${studioId} studio.title`);
+  assertArraySize(studio.interviewer, 5, 8, `${studioId} studio.interviewer`);
+  assert.equal(studio.phases.length, 7, `${studioId} studio must cover seven interview phases`);
+  assert.equal(new Set(studio.phases.map((phase) => phase.id)).size, 7, `${studioId} studio phase IDs repeat`);
+  for (const phase of studio.phases) {
+    assertText(phase.id, `${studioId} phase.id`);
+    assertText(phase.purpose, `${studioId}.${phase.id}.purpose`);
+    assertArraySize(phase.fields, 2, 3, `${studioId}.${phase.id}.fields`);
+    assert.ok(phase.coach && typeof phase.coach === "object", `${studioId}.${phase.id}.coach is missing`);
+    assertText(phase.coach.lead, `${studioId}.${phase.id}.coach.lead`);
+    assertArraySize(phase.coach.rows, 4, 5, `${studioId}.${phase.id}.coach.rows`);
+    for (const field of phase.fields) {
+      assertText(field.id, `${studioId}.${phase.id}.field.id`);
+      assertText(field.label, `${studioId}.${phase.id}.${field.id}.label`);
+      assertText(field.prompt, `${studioId}.${phase.id}.${field.id}.prompt`);
+      if (field.kind === "decision") {
+        assertArraySize(field.options, 3, 3, `${studioId}.${phase.id}.${field.id}.options`);
+      } else if (field.kind === "diagram") {
+        assert.ok(field.minNodes >= 5, `${studioId}.${phase.id}.${field.id} needs a meaningful topology threshold`);
+      } else {
+        assert.ok(field.minChars >= 80, `${studioId}.${phase.id}.${field.id} needs a meaningful evidence threshold`);
+      }
+    }
+  }
+  assertText(studio.workedTopology?.title, `${studioId} studio.workedTopology.title`);
+  assertArraySize(studio.workedTopology?.lanes, 3, 3, `${studioId} studio.workedTopology.lanes`);
+  studio.workedTopology.lanes.forEach((lane, index) => {
+    assertText(lane?.[0], `${studioId} studio.workedTopology.lanes[${index}].label`);
+    assertArraySize(lane?.[1], 4, 8, `${studioId} studio.workedTopology.lanes[${index}].nodes`);
+  });
+  assertArraySize(studio.evolution, 4, 4, `${studioId} studio.evolution`);
+  assertArraySize(studio.tradeoffs, 4, 5, `${studioId} studio.tradeoffs`);
+  for (const [moduleId, phaseIds] of Object.entries(studio.guidedModules)) {
+    assert.ok(course.modules.some((module) => module.id === moduleId), `${studioId} studio references missing module ${moduleId}`);
+    assert.ok(phaseIds.every((phaseId) => studio.phases.some((phase) => phase.id === phaseId)), `${studioId} studio has an unknown guided phase`);
+  }
+}
+
+assert.match(appSource, /previousStorageKey\s*=\s*"decagon-prep:v3"/u, "Missing legacy progress migration");
+assert.match(appSource, /localStorage\.removeItem\(previousStorageKey\)/u, "Legacy progress survives migration or reset");
+assert.match(appSource, /activeTimer\.endedAt/u, "Timed design evidence has no end boundary");
+assert.match(appSource, /\|\|\s*!activeTimer\.running/u, "Paused mocks must lock the design board");
+assert.match(appSource, /timestamp\s*<=\s*endedAt/u, "Design evidence may be recorded after time expires");
+assert.match(appSource, /data-studio-add-node/u, "System design has no student-created topology control");
+assert.match(appSource, /record\.guidedDecisions\[field\.id\]/u, "Mock decisions can bypass their written trade-off gate");
+assert.match(appSource, /\.mock-code-rep textarea/u, "Timed coding controls are not covered by the attempt lock");
+assert.match(appSource, /codeResult\.attemptId\s*===\s*attemptId/u, "Coding evidence is not bound to the active attempt");
 
 for (const module of course.modules) {
   assertText(module.id, "module.id");

@@ -1,5 +1,5 @@
 window.DECAGON_COURSE = {
-  version: 3,
+  version: 4,
   contentRevision: "2026-07-21",
   title: "Decagon Infra Interview Lab",
   subtitle: "Build, benchmark, and defend an AI model gateway and a distributed web crawler",
@@ -10,7 +10,8 @@ window.DECAGON_COURSE = {
       "The supplied Decagon interview summary",
       "Current IETF HTTP, URI, robots, and DNS specifications",
       "Current Envoy, gRPC, OpenTelemetry, and Prometheus documentation",
-      "Original crawler, load-balancing, and latency research"
+      "Original crawler, load-balancing, and latency research",
+      "Current Google SRE system-design, load-management, and overload guidance"
     ],
     assumptions: [
       "The coding round supplies two interchangeable providers for one model.",
@@ -988,7 +989,7 @@ window.DECAGON_COURSE = {
         title: "Scale replicas without scaling quota",
         kind: "fleet-simulator",
         badge: "System model",
-        intro: "Change replica count, local caps, provider quotas, and failover reserve. Keep the hot path serving while control dependencies fail.",
+        intro: "Build scope, requirements, scale, entities, interfaces, and the healthy request path before changing fleet capacity and failure controls.",
         notebook: [
           "Write the normal and single-provider capacity equations.",
           "Name the fail-open or fail-closed policy for quota coordination.",
@@ -1180,7 +1181,7 @@ window.DECAGON_COURSE = {
         title: "Operate a failing gateway fleet",
         kind: "incident-simulator",
         badge: "Failure drills",
-        intro: "Inject provider, control-plane, quota, and telemetry faults. Choose a mitigation and verify request-path invariants.",
+        intro: "Finish state ownership, failure walks, trade-offs, and the final defense before testing a production incident against request-path invariants.",
         notebook: [
           "Name the first reliable detection signal.",
           "State the intended degraded state and capacity ceiling.",
@@ -1377,7 +1378,7 @@ window.DECAGON_COURSE = {
         title: "Size the crawler request path",
         kind: "capacity-model",
         badge: "Derived capacity model",
-        intro: "Convert the page target into separate fetch, authority, network, parser, storage, slowdown, and recovery limits. Explain the first bottleneck or least certain assumption.",
+        intro: "Build scope, requirements, scale, entities, interfaces, and one healthy URL lifecycle before testing fetch, authority, network, parser, and storage limits.",
         notebook: [
           "Write five requirements and attach one architecture consequence to each.",
           "Estimate average and peak fetch rate plus storage per day.",
@@ -1628,7 +1629,7 @@ window.DECAGON_COURSE = {
         title: "Operate a polite and hostile frontier",
         kind: "frontier-simulator",
         badge: "Frontier lab",
-        intro: "Schedule skewed authorities, process exact robots outcomes, recover expired leases, and block rebinding and redirect attacks.",
+        intro: "Finish frontier ownership, failure walks, trade-offs, and the final defense before repairing skew, lease loss, robots outcomes, and hostile destinations.",
         notebook: [
           "Explain why both authority and destination-address limits exist.",
           "Write the RFC 9309 behavior for 404, 503, and DNS failure.",
@@ -1747,6 +1748,7 @@ window.DECAGON_COURSE = {
             explanation: "Replica count matters because health, quotas, policy, and logs now cross process boundaries under stated traffic."
           },
           sources: [
+            ["Google SRE non-abstract large system design", "https://sre.google/workbook/non-abstract-design/"],
             ["Google SRE cascading failures", "https://sre.google/sre-book/addressing-cascading-failures/"],
             ["OpenTelemetry logs data model", "https://opentelemetry.io/docs/specs/otel/logs/data-model/"],
             ["Envoy load balancing", "https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancing"],
@@ -1798,6 +1800,7 @@ window.DECAGON_COURSE = {
             explanation: "The fetch target is untrusted, so destination policy is part of normal request execution."
           },
           sources: [
+            ["Google SRE non-abstract large system design", "https://sre.google/workbook/non-abstract-design/"],
             ["Robots Exclusion Protocol", "https://www.rfc-editor.org/rfc/rfc9309.html"],
             ["Mercator crawler architecture", "https://research.google/pubs/mercator-a-scalable-extensible-web-crawler/"],
             ["BUbiNG crawler paper", "https://arxiv.org/abs/1601.06919"],
@@ -1867,7 +1870,7 @@ window.DECAGON_COURSE = {
       track: "gateway-design",
       title: "Production gateway system-design mock",
       minutes: 60,
-      prompt: "Practice assumption: use 60 minutes because the supplied notes do not state this round's duration. Scale the coding prototype across multiple application servers while coordinating health and quotas, handling log writes and observability pipelines, and preserving low latency and high reliability when dependencies fail.",
+      prompt: "Practice assumption: use 60 minutes because the supplied notes do not state this round's duration. Start from the coding prototype, clarify scope, write functional and non-functional requirements, derive capacity, define entities and interfaces, draw one healthy request, scale it across replicas, then defend logs, observability, failure recovery, and trade-offs.",
       followups: [
         "Traffic grows to many replicas in three zones. Which health state stays local, and which state is shared?",
         "A provider has one account-wide concurrency quota. Show admission under stale or partitioned quota coordination.",
@@ -1876,20 +1879,20 @@ window.DECAGON_COURSE = {
         "Estimate request concurrency, provider attempts, metric volume, and log bytes from your chosen traffic assumptions."
       ],
       rubric: [
-        { label: "Requirements and estimates", detail: "Clarifies traffic, streaming, tenancy, quotas, objectives, regions, cost, and derives useful capacity numbers.", max: 20 },
-        { label: "Request and attempt path", detail: "Explains deadlines, admission, selection, transport, response commit, fallback, and logical versus physical outcomes.", max: 20 },
+        { label: "Scope, requirements, and estimates", detail: "Separates functional requirements, measurable qualities, assumptions, constraints, non-goals, and derives useful capacity numbers.", max: 20 },
+        { label: "Entities, interfaces, and request path", detail: "Defines stable identities and contracts, then explains deadlines, admission, selection, transport, commit, fallback, and cleanup.", max: 20 },
         { label: "State and quota ownership", detail: "Balances fast local health with shared coordination and defines behavior during stale state or partitions.", max: 20 },
         { label: "Telemetry and data safety", detail: "Bounds log pipelines, controls metric labels, connects traces and logs, and states redaction and durability rules.", max: 20 },
-        { label: "Failure and recovery", detail: "Walks provider, quota, collector, zone, and overload faults through detection, degraded state, bounds, and recovery.", max: 20 }
+        { label: "Failure, recovery, and trade-offs", detail: "Walks faults through detection, degraded state, bounds, and recovery while defending credible alternatives and reversal conditions.", max: 20 }
       ],
-      artifact: "A whiteboard architecture with capacity math, state ownership, one normal request trace, and two end-to-end failure walks."
+      artifact: "A complete interview board with requirements, math, entities, contracts, architecture evolution, one healthy trace, two failure walks, and defended trade-offs."
     },
     {
       id: "web-crawler-design",
       track: "crawler-design",
       title: "Web-crawling infrastructure mock",
       minutes: 60,
-      prompt: "Practice assumption: use 60 minutes because the supplied notes do not state this round's duration. Design infrastructure that crawls from seeds at an explicitly assumed scale, respects site policy and shared destinations, stores useful documents and link discoveries durably, revisits content, and treats every fetched URL as hostile input.",
+      prompt: "Practice assumption: use 60 minutes because the supplied notes do not state this round's duration. Clarify crawl scope and outputs, write functional and non-functional requirements, derive fetch and metadata capacity, define entities and durable interfaces, trace one URL, evolve the frontier, then defend politeness, recrawl, security, failures, and trade-offs.",
       followups: [
         "robots.txt returns 404 for one site, 503 for another, and DNS fails for a third. State the exact behavior for each.",
         "Millions of tenant hostnames share one IP. Preserve throughput without overloading that destination.",
@@ -1898,13 +1901,13 @@ window.DECAGON_COURSE = {
         "A public hostname redirects to a cloud metadata address after DNS changes. Stop the request and show defense beyond application parsing."
       ],
       rubric: [
-        { label: "Requirements and arithmetic", detail: "Clarifies scope, freshness, rendering, retention, politeness, safety, and computes fetch and storage estimates.", max: 20 },
-        { label: "URL lifecycle", detail: "Traces conservative identity, frontier admission, fetching, body storage, parsing, discovery, and recrawl with clear owners.", max: 20 },
+        { label: "Scope, requirements, and arithmetic", detail: "Separates features, measurable qualities, assumptions, and non-goals, then computes fetch, metadata, and storage estimates.", max: 20 },
+        { label: "Entities, contracts, and URL lifecycle", detail: "Defines stable keys and durable handoffs, then traces identity, admission, fetch, storage, parse, discovery, and recrawl.", max: 20 },
         { label: "Frontier and politeness", detail: "Coordinates per-authority ready times, exact robots behavior, shared-IP caps, DNS changes, and hot authorities.", max: 20 },
         { label: "Durability and identity", detail: "Explains leases, replay, idempotent writes, exact versus approximate dedupe, versioned content, and conditional requests.", max: 20 },
-        { label: "Security and failure recovery", detail: "Rechecks redirects and resolved addresses, prevents rebinding, bounds resource use, isolates egress, and walks worker and storage faults.", max: 20 }
+        { label: "Security, recovery, and trade-offs", detail: "Rechecks hostile destinations, bounds resource use, walks faults causally, and states when credible alternatives would fit better.", max: 20 }
       ],
-      artifact: "A whiteboard crawler with scale math, one URL state machine, exact robots decisions, and security and durability failure paths."
+      artifact: "A complete interview board with requirements, math, entities, contracts, architecture evolution, one URL trace, two failure walks, and defended trade-offs."
     }
   ]
 };
