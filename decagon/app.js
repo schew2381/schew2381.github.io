@@ -8,6 +8,7 @@
   const guides = window.DECAGON_GUIDES || {};
   const LabModels = window.DecagonLabModels || {};
   const appliedQuestions = window.DECAGON_APPLIED_QUESTIONS || {};
+  const systemDesignStudios = window.DECAGON_SYSTEM_DESIGN_STUDIOS || {};
 
   course.modules.sort((a, b) => Number(a.number) - Number(b.number));
 
@@ -19,6 +20,7 @@
   const mockById = new Map(course.mocks.map((mock) => [mock.id, mock]));
   const passingScore = 75;
   const storageKey = `decagon-prep:v${course.version}`;
+  const previousStorageKey = "decagon-prep:v3";
   const defaultState = {
     completedLessons: [],
     completedLabs: [],
@@ -31,6 +33,8 @@
     mockScores: {},
     mockNotes: {},
     mockNoteUpdatedAt: {},
+    designWorkbooks: {},
+    mockDesignWorkbooks: {},
     activeMockTimer: null,
     mode: "learn",
     lastRoute: "home"
@@ -101,9 +105,11 @@
 
   function loadState() {
     try {
-      const saved = JSON.parse(localStorage.getItem(storageKey));
+      const currentRaw = localStorage.getItem(storageKey);
+      const previousRaw = currentRaw ? null : localStorage.getItem(previousStorageKey);
+      const saved = JSON.parse(currentRaw || previousRaw);
       if (!saved || typeof saved !== "object") return structuredClone(defaultState);
-      return {
+      const loaded = {
         ...structuredClone(defaultState),
         ...saved,
         completedLessons: arrayOfStrings(saved.completedLessons),
@@ -116,8 +122,22 @@
         designs: objectOrEmpty(saved.designs),
         mockScores: objectOrEmpty(saved.mockScores),
         mockNotes: objectOrEmpty(saved.mockNotes),
-        mockNoteUpdatedAt: objectOrEmpty(saved.mockNoteUpdatedAt)
+        mockNoteUpdatedAt: objectOrEmpty(saved.mockNoteUpdatedAt),
+        designWorkbooks: objectOrEmpty(saved.designWorkbooks),
+        mockDesignWorkbooks: objectOrEmpty(saved.mockDesignWorkbooks)
       };
+      if (previousRaw || !saved.designWorkbooks || !saved.mockDesignWorkbooks) {
+        const replacedLabs = new Set(["production-fleet", "telemetry-recovery", "crawler-request-path", "crawler-frontier", "interview-rehearsals"]);
+        loaded.completedLabs = loaded.completedLabs.filter((id) => !replacedLabs.has(id));
+        loaded.designWorkbooks = {};
+        loaded.mockDesignWorkbooks = {};
+        loaded.activeMockTimer = null;
+        delete loaded.mockScores["gateway-production-design"];
+        delete loaded.mockScores["web-crawler-design"];
+        localStorage.setItem(storageKey, JSON.stringify(loaded));
+        if (previousRaw) localStorage.removeItem(previousStorageKey);
+      }
+      return loaded;
     } catch {
       return structuredClone(defaultState);
     }
@@ -143,6 +163,7 @@
       started: Boolean(value.started),
       elapsed,
       startedAt: typeof value.startedAt === "string" ? value.startedAt : null,
+      endedAt: typeof value.endedAt === "string" ? value.endedAt : null,
       attemptId: typeof value.attemptId === "string" ? value.attemptId : null,
       rubricRevealed: Boolean(value.rubricRevealed),
       elapsedAtRunStart: Math.max(0, Math.min(total, Number(value.elapsedAtRunStart ?? elapsed))),
@@ -540,6 +561,7 @@
           <h2 id="outcomes-title">Defend these decisions aloud</h2>
           <ul>${module.outcomes.map((outcome) => `<li>${escapeHTML(outcome)}</li>`).join("")}</ul>
         </section>
+        ${renderSystemDesignMethod(module)}
         <section class="lesson-list" aria-labelledby="lessons-title">
           <div class="section-heading"><div><span class="eyebrow">Learn and retrieve</span><h2 id="lessons-title">Lessons</h2></div></div>
           ${module.lessons.map((lesson, index) => renderLessonRow(lesson, module, index)).join("")}
@@ -555,6 +577,30 @@
           </article>
         </section>
       </div>
+    `;
+  }
+
+  function renderSystemDesignMethod(module) {
+    const studioId = module.track === "gateway-design"
+      ? "gateway"
+      : module.track === "crawler-design"
+        ? "crawler"
+        : null;
+    const studio = studioId ? systemDesignStudios[studioId] : null;
+    if (!studio) return "";
+    const phaseIds = studio.guidedModules[module.id] || [];
+    if (!phaseIds.length) return "";
+    const phases = studio.phases.filter((phase) => phaseIds.includes(phase.id));
+    return `
+      <section class="design-method-strip" aria-labelledby="design-method-${escapeAttr(module.id)}">
+        <div>
+          <span class="eyebrow">System-design operating loop</span>
+          <h2 id="design-method-${escapeAttr(module.id)}">The board grows in interview order</h2>
+          <p>Produce each artifact before comparing it with the worked design. The executable model then tests whether the capacity or failure claim holds.</p>
+        </div>
+        <ol>${phases.map((phase) => `<li><span>${escapeHTML(phase.number)}</span><strong>${escapeHTML(phase.short)}</strong><small>${escapeHTML(phase.minutes)}</small></li>`).join("")}</ol>
+        <button class="secondary-button compact" type="button" data-route="lab/${escapeAttr(module.id)}">Open this part of the board</button>
+      </section>
     `;
   }
 
@@ -1033,15 +1079,18 @@
     return scope.startsWith("lab-") ? scope.slice(4) : null;
   }
 
-  function gatewayComparisonEvidence(moduleId, savedAfter = null) {
+  function gatewayComparisonEvidence(moduleId, savedAfter = null, savedBefore = null, attemptId = null) {
     const allowedChanges = {
       "adaptive-routing": new Set(["policy", "explorationPct", "hedgeMs"]),
       "concurrency-resilience": new Set(["rps", "gatewayCap", "queueCap", "providerCapA", "providerCapB", "deadlineMs", "hedgeMs"])
     };
     const cutoff = savedAfter ? new Date(savedAfter).getTime() : 0;
+    const ceiling = savedBefore ? new Date(savedBefore).getTime() : Number.POSITIVE_INFINITY;
     const candidates = state.benchmarks.filter((run) => (
       run.moduleId === moduleId
       && (!cutoff || new Date(run.savedAt || 0).getTime() >= cutoff)
+      && new Date(run.savedAt || 0).getTime() <= ceiling
+      && (!attemptId || run.attemptId === attemptId)
     ));
     for (let first = 0; first < candidates.length; first += 1) {
       for (let second = first + 1; second < candidates.length; second += 1) {
@@ -1248,7 +1297,7 @@
     ]);
     const complete = state.completedLabs.includes(module.id);
     view.innerHTML = `
-      <div class="lab-view" style="--module-color:${module.color};--module-soft:${module.soft}">
+      <div class="lab-view" data-lab-module="${escapeAttr(module.id)}" style="--module-color:${module.color};--module-soft:${module.soft}">
         <header class="lab-header">
           <div><span class="eyebrow">${escapeHTML(module.lab.badge || "Interactive workbench")}</span><h1 tabindex="-1">${escapeHTML(module.lab.title)}</h1><p>${escapeHTML(module.lab.intro)}</p></div>
           <span class="completion-chip ${complete ? "complete" : ""}">${complete ? "Evidence recorded" : "Evidence required"}</span>
@@ -1266,20 +1315,20 @@
       return renderGatewayConsole(`lab-${module.id}`, false);
     }
     if (["request-contract", "coding-execution"].includes(module.id)) return renderCodeLab(module);
-    if (module.id === "production-fleet") return `${renderFleetLab()}${renderDesignBoard(module)}`;
-    if (module.id === "telemetry-recovery") return `${renderIncidentLab()}${renderDesignBoard(module)}`;
-    if (module.id === "crawler-request-path") return renderCapacityLab(module);
-    if (module.id === "crawler-frontier") return renderCrawlerLab(module);
+    if (module.id === "production-fleet") return `${renderSystemDesignStudio("gateway", { moduleId: module.id })}${renderFleetLab()}`;
+    if (module.id === "telemetry-recovery") return `${renderSystemDesignStudio("gateway", { moduleId: module.id })}${renderIncidentLab()}`;
+    if (module.id === "crawler-request-path") return `${renderSystemDesignStudio("crawler", { moduleId: module.id })}${renderCapacityLab(module)}`;
+    if (module.id === "crawler-frontier") return `${renderSystemDesignStudio("crawler", { moduleId: module.id })}${renderCrawlerLab(module)}`;
     return renderMockHub();
   }
 
   function labRequirement(module) {
     if (["adaptive-routing", "concurrency-resilience"].includes(module.id)) return "Save a baseline and a one-control change with the same scenario and seed. Write a hypothesis before each run.";
     if (["request-contract", "coding-execution"].includes(module.id)) return "Pass every browser test to complete this lab.";
-    if (module.id === "production-fleet") return "Change and run a fleet failure, satisfy every invariant, defend admission, and complete the architecture board.";
-    if (module.id === "telemetry-recovery") return "Change and run an incident, satisfy every invariant, explain recovery, and complete the architecture board.";
-    if (module.id === "crawler-request-path") return "Fit every modeled limit and explain the first bottleneck or least certain assumption.";
-    if (module.id === "crawler-frontier") return "Observe an unsafe run, repair it, and defend the state owner that makes the repair hold.";
+    if (module.id === "production-fleet") return "Complete the first five design artifacts, then change and defend a fleet failure that satisfies every invariant.";
+    if (module.id === "telemetry-recovery") return "Finish the failure and defense artifacts, then run and defend an incident with every invariant intact.";
+    if (module.id === "crawler-request-path") return "Complete the first five design artifacts, fit every modeled limit, and explain the first bottleneck.";
+    if (module.id === "crawler-frontier") return "Finish the failure and defense artifacts, then repair an unsafe frontier run without moving the contract.";
     return "Score at least one mock rubric.";
   }
 
@@ -1371,44 +1420,343 @@
     `;
   }
 
-  function renderDesignBoard(module) {
-    const current = state.designs[module.id] || {};
-    const gatewayBoard = module.id === "production-fleet";
-    const decisions = gatewayBoard ? [
-      { id: "health", label: "Health state", options: [["", "Choose a boundary"], ["local-aggregate", "Local decisions + expiring fleet hints"], ["shared-read", "Shared read on every request"], ["local-only", "Local memory only"]] },
-      { id: "quota", label: "Provider quota", options: [["", "Choose an owner"], ["leases", "Leased fleet capacity + local burst bucket"], ["local-caps", "Independent local caps"], ["central-call", "Central check on every attempt"]] },
-      { id: "config", label: "Routing config", options: [["", "Choose a rollout"], ["versioned", "Versioned snapshot + expiry + last known good"], ["mutable", "Mutable shared object"], ["startup", "Read once at startup"]] }
-    ] : [
-      { id: "telemetry", label: "Request telemetry", options: [["", "Choose a write path"], ["bounded-async", "Bounded async queue"], ["synchronous", "Synchronous export"], ["unbounded", "Unbounded memory queue"]] },
-      { id: "audit", label: "Billing or audit events", options: [["", "Choose durability"], ["durable-event", "Durable event ID + replay + dedupe"], ["best-effort", "Best-effort log line"], ["request-db", "Database transaction in request path"]] },
-      { id: "tracing", label: "Attempt tracing", options: [["", "Choose span shape"], ["logical-child", "One logical span + child per attempt"], ["single", "One span for all attempts"], ["provider-request-id", "Provider request ID as metric label"]] }
-    ];
-    const failures = gatewayBoard
-      ? ["Shared health store is unavailable", "One zone cannot reach Provider A", "All replicas restart", "Surviving provider lacks failover capacity"]
-      : ["Log sink stops accepting writes", "Collector queue is full", "Clients cancel long requests", "A bad config names a missing provider"];
+  function designWorkbook(studioId, { mockId = null } = {}) {
+    const collection = mockId ? state.mockDesignWorkbooks : state.designWorkbooks;
+    const key = mockId || studioId;
+    if (!collection[key] || typeof collection[key] !== "object") {
+      collection[key] = { activePhase: "scope", phases: {}, createdAt: new Date().toISOString() };
+    }
+    if (!collection[key].phases || typeof collection[key].phases !== "object") collection[key].phases = {};
+    return collection[key];
+  }
+
+  function designPhaseRecord(workbook, phaseId) {
+    if (!workbook.phases[phaseId] || typeof workbook.phases[phaseId] !== "object") {
+      workbook.phases[phaseId] = { fields: {}, fieldUpdatedAt: {}, guidedDecisions: {}, verified: false, verifiedAt: null };
+    }
+    if (!workbook.phases[phaseId].fields || typeof workbook.phases[phaseId].fields !== "object") {
+      workbook.phases[phaseId].fields = {};
+    }
+    if (!workbook.phases[phaseId].fieldUpdatedAt || typeof workbook.phases[phaseId].fieldUpdatedAt !== "object") {
+      workbook.phases[phaseId].fieldUpdatedAt = {};
+    }
+    if (!workbook.phases[phaseId].guidedDecisions || typeof workbook.phases[phaseId].guidedDecisions !== "object") {
+      workbook.phases[phaseId].guidedDecisions = {};
+    }
+    return workbook.phases[phaseId];
+  }
+
+  function designFieldComplete(field, record) {
+    if (field.kind === "diagram") {
+      return designDiagramNodes(record.fields[field.id]).length >= Number(field.minNodes || 1);
+    }
+    const value = String(record.fields[field.id] || "").trim();
+    if (field.kind === "decision" && record.guidedDecisions[field.id] && field.options.some((option) => option.id === value)) return true;
+    return designTextComplete(value, Number(field.minChars || (field.kind === "decision" ? 120 : 1)));
+  }
+
+  function designTextComplete(value, minimum) {
+    const words = value.toLowerCase().match(/[a-z0-9][a-z0-9_-]*/gu) || [];
+    const uniqueWords = new Set(words);
+    const sections = value.split(/[.!?;\n]+/u).filter((part) => part.trim().length >= 12);
+    return value.length >= minimum
+      && words.length >= Math.max(16, Math.ceil(minimum / 8))
+      && uniqueWords.size >= Math.max(12, Math.ceil(words.length * 0.4))
+      && sections.length >= 2;
+  }
+
+  function designDiagramNodes(value) {
+    const nodes = Array.isArray(value) ? value : String(value || "").split("\n");
+    return nodes.map((node) => String(node).trim()).filter(Boolean).slice(0, 12);
+  }
+
+  function designPhaseComplete(phase, record) {
+    return Boolean(record.verified && phase.fields.every((field) => designFieldComplete(field, record)));
+  }
+
+  function mockDesignLocked(mockId) {
+    if (!mockId) return false;
+    return Boolean(
+      !activeTimer?.started
+      || activeTimer.mockId !== mockId
+      || !activeTimer.running
+      || activeTimer.remaining === 0
+      || activeTimer.endedAt
+    );
+  }
+
+  function renderSystemDesignStudio(studioId, { moduleId = null, mockId = null } = {}) {
+    const studio = systemDesignStudios[studioId];
+    if (!studio) return "";
+    const workbook = designWorkbook(studioId, { mockId });
+    const phaseIds = mockId
+      ? studio.phases.map((phase) => phase.id)
+      : studio.guidedModules[moduleId] || studio.phases.map((phase) => phase.id);
+    const phases = studio.phases.filter((phase) => phaseIds.includes(phase.id));
+    if (!phaseIds.includes(workbook.activePhase)) workbook.activePhase = phases[0]?.id || "scope";
+    const active = phases.find((phase) => phase.id === workbook.activePhase) || phases[0];
+    const completed = studio.phases.filter((phase) => designPhaseComplete(phase, designPhaseRecord(workbook, phase.id))).length;
+    const contextLabel = mockId ? "Timed blank board" : "Guided design studio";
 
     return `
-      <section class="design-workbench" data-design-board="${escapeAttr(module.id)}">
-        <div class="topology-board" aria-labelledby="topology-title">
-          <div class="section-heading"><div><span class="eyebrow">Guided topology</span><h2 id="topology-title">Keep optional state off the request path</h2></div></div>
-          <div class="topology-flow" role="img" aria-label="Client to edge to gateway replicas to two providers, with separate health, quota, and telemetry branches.">
-            <div class="topology-node">Client</div><span>→</span><div class="topology-node">Edge</div><span>→</span><div class="topology-node strong">Gateway replicas</div><span>→</span><div class="topology-providers"><div>▲ Provider A</div><div>● Provider B</div></div>
-            <div class="topology-branches"><span>↘ health policy</span><span>↘ quota owner</span><span>↘ event buffer</span></div>
+      <section
+        class="system-design-studio ${mockId ? "system-design-studio-mock" : ""}"
+        data-system-design-studio="${escapeAttr(studioId)}"
+        data-studio-module="${escapeAttr(moduleId || "")}"
+        data-studio-mock="${escapeAttr(mockId || "")}"
+        aria-labelledby="studio-title-${escapeAttr(studioId)}-${escapeAttr(mockId || moduleId || "guided")}"
+      >
+        <header class="studio-header">
+          <div>
+            <span class="eyebrow">${escapeHTML(contextLabel)} · ${escapeHTML(studio.label)}</span>
+            <h2 id="studio-title-${escapeAttr(studioId)}-${escapeAttr(mockId || moduleId || "guided")}">${escapeHTML(studio.title)}</h2>
+            <p>${escapeHTML(studio.premise)}</p>
           </div>
+          <div class="studio-progress" aria-label="${completed} of ${studio.phases.length} design phases recorded">
+            <strong>${completed}/${studio.phases.length}</strong>
+            <span>artifacts recorded</span>
+          </div>
+        </header>
+
+        <nav class="studio-phase-nav" aria-label="System-design interview phases">
+          ${phases.map((phase) => {
+            const record = designPhaseRecord(workbook, phase.id);
+            const complete = designPhaseComplete(phase, record);
+            return `<button type="button" data-studio-phase="${escapeAttr(phase.id)}" aria-current="${phase.id === active.id ? "step" : "false"}"><span>${escapeHTML(phase.number)}</span><strong>${escapeHTML(phase.short)}</strong><small>${complete ? "Recorded" : phase.minutes}</small></button>`;
+          }).join("")}
+        </nav>
+
+        <div class="studio-desk">
+          ${renderDesignPhase(studio, active, workbook, { mockId, phases })}
+          ${renderGrowingDesignBoard(studio, workbook)}
         </div>
-        <div class="decision-grid">
-          ${decisions.map((decision) => `
-            <label class="decision-card"><span>${escapeHTML(decision.label)}</span><select data-design-field="${escapeAttr(decision.id)}">${decision.options.map(([value, label]) => `<option value="${value}" ${current[decision.id] === value ? "selected" : ""}>${escapeHTML(label)}</option>`).join("")}</select><small>${designConsequence(decision.id, current[decision.id])}</small></label>
-          `).join("")}
-        </div>
-        <div class="failure-injector">
-          <label><span>Inject a failure</span><select data-design-field="failure"><option value="">Choose a failure</option>${failures.map((failure) => `<option value="${escapeAttr(failure)}" ${current.failure === failure ? "selected" : ""}>${escapeHTML(failure)}</option>`).join("")}</select></label>
-          <div class="failure-readout" data-failure-readout>${renderFailureReadout(current.failure, module.id)}</div>
-        </div>
-        <label class="rationale-field"><span>Defend the design in 2 to 4 sentences</span><textarea data-design-field="rationale" placeholder="State the invariant, the failure behavior, and the trade-off.">${escapeHTML(current.rationale || "")}</textarea></label>
-        <div class="design-actions"><button class="primary-button" type="button" data-check-design="${escapeAttr(module.id)}">Check architecture evidence</button><p data-design-status>${current.boardChecked ? "Architecture evidence recorded." : "Complete each decision and explain why."}</p></div>
+        ${!mockId && designPhaseRecord(workbook, active.id).attempted ? renderDesignReference(studio, active) : ""}
       </section>
     `;
+  }
+
+  function renderDesignPhase(studio, phase, workbook, { mockId = null, phases = studio.phases } = {}) {
+    const record = designPhaseRecord(workbook, phase.id);
+    const complete = designPhaseComplete(phase, record);
+    const mockLocked = mockDesignLocked(mockId);
+    const mockFinished = Boolean(mockId && activeTimer?.mockId === mockId && activeTimer.remaining === 0);
+    const next = phases[phases.findIndex((entry) => entry.id === phase.id) + 1];
+    const interviewer = phase.id === "scope"
+      ? `<div class="interviewer-drawer"><span>${mockId ? "Simulated interviewer: open an answer only after asking" : "Ask before opening"}</span>${studio.interviewer.map((item, index) => `<details><summary>Question ${index + 1}: ${escapeHTML(item.question)}</summary><p>${escapeHTML(item.answer)}</p></details>`).join("")}</div>`
+      : "";
+    return `
+      <section class="studio-phase" aria-labelledby="studio-phase-${escapeAttr(studio.id)}-${escapeAttr(phase.id)}">
+        <div class="studio-phase-heading">
+          <div><span>${escapeHTML(phase.minutes)}</span><h3 id="studio-phase-${escapeAttr(studio.id)}-${escapeAttr(phase.id)}" tabindex="-1">${escapeHTML(phase.title)}</h3></div>
+          ${mockId ? `<details class="studio-mock-cue"><summary>Show phase cue</summary><p>${escapeHTML(phase.purpose)}</p></details>` : `<p>${escapeHTML(phase.purpose)}</p>`}
+        </div>
+        ${interviewer}
+        <div class="studio-fields">
+          ${phase.fields.map((field) => renderStudioField(studio, phase, field, record, { mockId })).join("")}
+        </div>
+        <div class="studio-phase-actions">
+          <button class="primary-button compact" type="button" data-check-studio-phase="${escapeAttr(phase.id)}" ${mockLocked ? "disabled" : ""}>${complete ? "Recheck this artifact" : mockId ? "Lock phase evidence" : "Compare my artifact"}</button>
+          ${complete && next ? `<button class="text-button" type="button" data-studio-phase="${escapeAttr(next.id)}">Next: ${escapeHTML(next.short)} →</button>` : ""}
+          <p class="${complete ? "complete" : ""}" data-studio-phase-status tabindex="-1">${mockFinished ? "Time is complete. This attempt is frozen for scoring." : mockLocked ? activeTimer?.started ? "Resume the interview timer to edit this board." : "Start the interview timer to unlock the blank board." : complete ? mockId ? "Evidence recorded for this timed attempt." : "Artifact recorded. Revise it if the reference exposes a gap." : "Complete every field before recording this phase."}</p>
+        </div>
+      </section>
+    `;
+  }
+
+  function renderStudioField(studio, phase, field, record, { mockId = null } = {}) {
+    const rawValue = record.fields[field.id];
+    const value = String(rawValue || "");
+    const fieldId = `studio-${studio.id}-${mockId || "guided"}-${phase.id}-${field.id}`;
+    const disabled = mockDesignLocked(mockId);
+    if (field.kind === "diagram") {
+      const nodes = designDiagramNodes(rawValue);
+      return `
+        <fieldset class="studio-field studio-diagram-field">
+          <legend>${escapeHTML(field.label)}</legend>
+          ${mockId ? "" : `<p>${escapeHTML(field.prompt)}</p>`}
+          <div class="studio-diagram-entry">
+            <label for="${escapeAttr(fieldId)}"><span>Next box</span><input id="${escapeAttr(fieldId)}" data-studio-node-input maxlength="64" placeholder="${mockId ? "Name a component and its owner" : "Example: gateway replica [request owner]"}" ${disabled ? "disabled" : ""}></label>
+            <button class="secondary-button compact" type="button" data-studio-add-node="${escapeAttr(field.id)}" ${disabled ? "disabled" : ""}>Add box</button>
+          </div>
+          <div class="studio-diagram-canvas" role="list" aria-label="Student-created component path">
+            ${nodes.length ? nodes.map((node, index) => `
+              <div class="studio-diagram-node" role="listitem">
+                <strong>${escapeHTML(node)}</strong>
+                <div>
+                  <button type="button" data-studio-node-action="left" data-studio-node-field="${escapeAttr(field.id)}" data-studio-node-index="${index}" aria-label="Move ${escapeAttr(node)} left" ${disabled || index === 0 ? "disabled" : ""}>←</button>
+                  <button type="button" data-studio-node-action="right" data-studio-node-field="${escapeAttr(field.id)}" data-studio-node-index="${index}" aria-label="Move ${escapeAttr(node)} right" ${disabled || index === nodes.length - 1 ? "disabled" : ""}>→</button>
+                  <button type="button" data-studio-node-action="remove" data-studio-node-field="${escapeAttr(field.id)}" data-studio-node-index="${index}" aria-label="Remove ${escapeAttr(node)}" ${disabled ? "disabled" : ""}>×</button>
+                </div>
+              </div>${index < nodes.length - 1 ? '<span class="studio-diagram-arrow" aria-hidden="true">→</span>' : ""}
+            `).join("") : '<p class="studio-diagram-empty">Add the first component. The path will grow here.</p>'}
+          </div>
+          <small data-studio-counter class="${nodes.length >= field.minNodes ? "complete" : ""}">${nodes.length}/${field.minNodes} boxes</small>
+        </fieldset>
+      `;
+    }
+    if (field.kind === "decision") {
+      if (mockId) {
+        const minimum = Number(field.minChars || 120);
+        return `
+          <label class="studio-field" for="${escapeAttr(fieldId)}">
+            <span><strong>${escapeHTML(field.label)}</strong><small>Choose a default, name a credible alternative, and state the condition that reverses your choice.</small></span>
+            <textarea id="${escapeAttr(fieldId)}" data-studio-field="${escapeAttr(field.id)}" data-studio-min="${minimum}" placeholder="Write the choice, cost, alternative, and reversal condition." ${disabled ? "disabled" : ""}>${escapeHTML(value)}</textarea>
+            <small data-studio-counter class="${value.trim().length >= minimum ? "complete" : ""}">${value.trim().length}/${minimum} characters</small>
+          </label>
+        `;
+      }
+      const selected = field.options.find((option) => option.id === value);
+      return `
+        <fieldset class="studio-field studio-decision-field">
+          <legend>${escapeHTML(field.label)}</legend>
+          <p>${escapeHTML(field.prompt)}</p>
+          <div class="studio-decision-options">${field.options.map((option) => `<button type="button" data-studio-option="${escapeAttr(option.id)}" data-studio-option-field="${escapeAttr(field.id)}" aria-pressed="${value === option.id}" ${disabled ? "disabled" : ""}><strong>${escapeHTML(option.label)}</strong><span>${escapeHTML(option.consequence)}</span></button>`).join("")}</div>
+          <small data-studio-counter>${selected ? `Selected: ${escapeHTML(selected.label)}` : "Choose one default. Your written failure plan should state when it stops fitting."}</small>
+        </fieldset>
+      `;
+    }
+    return `
+      <label class="studio-field" for="${escapeAttr(fieldId)}">
+        <span><strong>${escapeHTML(field.label)}</strong>${mockId ? "" : `<small>${escapeHTML(field.prompt)}</small>`}</span>
+        <textarea id="${escapeAttr(fieldId)}" data-studio-field="${escapeAttr(field.id)}" data-studio-min="${Number(field.minChars || 1)}" placeholder="${escapeAttr(mockId ? "Write this artifact from your questions and stated assumptions." : field.placeholder)}" ${disabled ? "disabled" : ""}>${escapeHTML(value)}</textarea>
+        <small data-studio-counter class="${value.trim().length >= field.minChars ? "complete" : ""}">${value.trim().length}/${field.minChars} characters</small>
+      </label>
+    `;
+  }
+
+  function renderGrowingDesignBoard(studio, workbook) {
+    return `
+      <aside class="growing-design-board" aria-labelledby="growing-board-${escapeAttr(studio.id)}">
+        <div class="growing-board-head"><span class="eyebrow">Growing interview board</span><h3 id="growing-board-${escapeAttr(studio.id)}">Your design, not the answer key</h3></div>
+        <ol>${studio.phases.map((phase) => {
+          const record = designPhaseRecord(workbook, phase.id);
+          const values = phase.fields.map((field) => field.kind === "diagram"
+            ? designDiagramNodes(record.fields[field.id]).join(" → ")
+            : String(record.fields[field.id] || "").trim()).filter(Boolean);
+          const complete = designPhaseComplete(phase, record);
+          const summary = values.length ? values.join(" · ").slice(0, 190) : "No artifact yet.";
+          return `<li class="${complete ? "complete" : values.length ? "started" : ""}"><span>${escapeHTML(phase.number)}</span><div><strong>${escapeHTML(phase.short)}</strong><p>${escapeHTML(summary)}${values.join(" · ").length > 190 ? "…" : ""}</p></div><small>${complete ? "recorded" : values.length ? "draft" : "open"}</small></li>`;
+        }).join("")}</ol>
+      </aside>
+    `;
+  }
+
+  function renderDesignReference(studio, phase) {
+    const showEvolution = ["sketch", "evolve"].includes(phase.id);
+    const showTradeoffs = phase.id === "defend";
+    return `
+      <section class="studio-reference" aria-labelledby="studio-reference-${escapeAttr(studio.id)}-${escapeAttr(phase.id)}">
+        <div class="studio-reference-heading">
+          <div><span class="eyebrow">Worked design under the stated assumptions</span><h3 id="studio-reference-${escapeAttr(studio.id)}-${escapeAttr(phase.id)}">Compare structure, then revise your board</h3></div>
+          <p>${escapeHTML(phase.coach.lead)}</p>
+        </div>
+        <div class="studio-reference-table" role="table" aria-label="Worked artifact comparison">
+          <div class="studio-reference-row studio-reference-row-head" role="row"><span role="columnheader">Decision</span><span role="columnheader">One defensible answer</span><span role="columnheader">Why it follows</span></div>
+          ${phase.coach.rows.map((row) => `<div class="studio-reference-row" role="row"><strong role="cell" data-label="Decision">${escapeHTML(row[0])}</strong><span role="cell" data-label="One defensible answer">${escapeHTML(row[1])}</span><span role="cell" data-label="Why it follows">${escapeHTML(row[2])}</span></div>`).join("")}
+        </div>
+        ${showEvolution ? `${renderWorkedTopology(studio)}${renderArchitectureEvolution(studio)}` : ""}
+        ${showTradeoffs ? renderDesignTradeoffs(studio) : ""}
+      </section>
+    `;
+  }
+
+  function renderArchitectureEvolution(studio) {
+    return `
+      <section class="architecture-evolution" aria-labelledby="architecture-evolution-${escapeAttr(studio.id)}">
+        <div><span class="eyebrow">Progressive architecture</span><h4 id="architecture-evolution-${escapeAttr(studio.id)}">Each revision pays for one new requirement or failure</h4></div>
+        <ol>${studio.evolution.map((stage, index) => `<li><div class="evolution-version"><span>${escapeHTML(stage.version)}</span><strong>${escapeHTML(stage.title)}</strong></div><p>${escapeHTML(stage.reason)}</p><div class="evolution-lanes">${stage.lanes.map((lane) => { const nodes = lane[1].split(/\s(?:→|·)\s/u); return `<div><strong>${escapeHTML(lane[0])}</strong><div class="evolution-lane-flow">${nodes.map((node, nodeIndex) => `<span>${escapeHTML(node)}</span>${nodeIndex < nodes.length - 1 ? '<i aria-hidden="true">→</i>' : ""}`).join("")}</div></div>`; }).join("")}</div>${index < studio.evolution.length - 1 ? '<i class="evolution-next" aria-hidden="true">→</i>' : ""}</li>`).join("")}</ol>
+      </section>
+    `;
+  }
+
+  function renderWorkedTopology(studio) {
+    const topology = studio.workedTopology;
+    if (!topology) return "";
+    return `
+      <section class="worked-topology" aria-labelledby="worked-topology-${escapeAttr(studio.id)}">
+        <div><span class="eyebrow">Worked topology</span><h4 id="worked-topology-${escapeAttr(studio.id)}">${escapeHTML(topology.title)}</h4></div>
+        <div class="worked-topology-board" role="img" aria-label="${escapeAttr(topology.lanes.map(([label, nodes]) => `${label}: ${nodes.join(" to ")}`).join(". "))}">
+          ${topology.lanes.map(([label, nodes]) => `<div class="worked-topology-lane"><strong>${escapeHTML(label)}</strong><div>${nodes.map((node, index) => `<span>${escapeHTML(node)}</span>${index < nodes.length - 1 ? '<i aria-hidden="true">→</i>' : ""}`).join("")}</div></div>`).join("")}
+        </div>
+      </section>
+    `;
+  }
+
+  function renderDesignTradeoffs(studio) {
+    return `
+      <section class="studio-tradeoffs" aria-labelledby="studio-tradeoffs-${escapeAttr(studio.id)}">
+        <div><span class="eyebrow">Accepted alternatives</span><h4 id="studio-tradeoffs-${escapeAttr(studio.id)}">Defend a condition, not a memorized product</h4></div>
+        <div class="table-scroll"><table><thead><tr><th>Boundary</th><th>Default here</th><th>Credible alternative</th><th>Reversal condition</th></tr></thead><tbody>${studio.tradeoffs.map((row) => `<tr>${row.map((cell) => `<td>${escapeHTML(cell)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>
+      </section>
+    `;
+  }
+
+  function guidedStudioComplete(studioId, moduleId) {
+    const studio = systemDesignStudios[studioId];
+    if (!studio) return false;
+    const workbook = designWorkbook(studioId);
+    return (studio.guidedModules[moduleId] || []).every((phaseId) => {
+      const phase = studio.phases.find((entry) => entry.id === phaseId);
+      return phase && designPhaseComplete(phase, designPhaseRecord(workbook, phaseId));
+    });
+  }
+
+  function refreshSystemDesignStudio(root, { focusPhase = false, focusSelector = null } = {}) {
+    if (!root) return;
+    const studioId = root.dataset.systemDesignStudio;
+    const moduleId = root.dataset.studioModule || null;
+    const mockId = root.dataset.studioMock || null;
+    const marker = `${studioId}:${moduleId || ""}:${mockId || ""}`;
+    root.outerHTML = renderSystemDesignStudio(studioId, { moduleId, mockId });
+    if (!focusPhase && !focusSelector) return;
+    requestAnimationFrame(() => {
+      const replacement = [...document.querySelectorAll("[data-system-design-studio]")].find((entry) => `${entry.dataset.systemDesignStudio}:${entry.dataset.studioModule || ""}:${entry.dataset.studioMock || ""}` === marker);
+      replacement?.querySelector(focusSelector || ".studio-phase h3")?.focus({ preventScroll: true });
+    });
+  }
+
+  function maybeCompleteSystemDesignLab(moduleId) {
+    const studioId = ["production-fleet", "telemetry-recovery"].includes(moduleId) ? "gateway" : "crawler";
+    const model = state.designs[moduleId] || {};
+    const modelComplete = Boolean(model.modelChecked || model.checked);
+    if (!modelComplete || !guidedStudioComplete(studioId, moduleId)) return false;
+    completeLab(moduleId, "Design artifacts and executable model evidence recorded.");
+    return true;
+  }
+
+  function invalidateStudioEvidence(root) {
+    const moduleId = root?.dataset.studioModule;
+    if (moduleId && state.completedLabs.includes(moduleId)) {
+      state.completedLabs = state.completedLabs.filter((id) => id !== moduleId);
+      updateProgress();
+      renderDrawer(parseRoute());
+      const chip = document.querySelector(".lab-header .completion-chip");
+      if (chip) {
+        chip.textContent = "Evidence required";
+        chip.classList.remove("complete");
+      }
+    }
+    const mockId = root?.dataset.studioMock;
+    const saved = mockId ? state.mockScores[mockId] : null;
+    if (saved?.attemptId && saved.attemptId === activeTimer?.attemptId) delete state.mockScores[mockId];
+  }
+
+  function updateStudioDiagram(root, fieldId, nodes) {
+    const studioId = root?.dataset.systemDesignStudio;
+    const mockId = root?.dataset.studioMock || null;
+    const workbook = designWorkbook(studioId, { mockId });
+    const phase = systemDesignStudios[studioId]?.phases.find((entry) => entry.id === workbook.activePhase);
+    if (!phase || mockDesignLocked(mockId)) return;
+    const record = designPhaseRecord(workbook, phase.id);
+    const now = new Date().toISOString();
+    record.fields[fieldId] = nodes.join("\n");
+    record.fieldUpdatedAt[fieldId] = now;
+    record.verified = false;
+    workbook.updatedAt = now;
+    workbook.attemptId = mockId ? activeTimer?.attemptId || null : workbook.attemptId;
+    invalidateStudioEvidence(root);
+    saveState();
+    refreshSystemDesignStudio(root, { focusSelector: "[data-studio-node-input]" });
   }
 
   function defaultFleetConfig() {
@@ -1443,6 +1791,7 @@
           <span class="eyebrow">Fleet capacity model</span>
           <h2>Keep a provider quota true across replicas</h2>
           <p>Inject a fleet failure, then compare what each ownership strategy admits, sheds, or delegates.</p>
+          <p class="model-scale-note">This is a reduced-scale ratio model: 150 offered attempts and 200 provider slots stand in for the larger worksheet. Preserve the ratios when you map a result back to your capacity estimate.</p>
           <label>Failure scenario<select name="scenario">
             ${selectOptions([
               ["coordinator-partition", "Capacity coordinator partition"],
@@ -1678,74 +2027,6 @@
     if (value >= 1e6) return `${(value / 1e6).toFixed(1)} MB`;
     if (value >= 1e3) return `${(value / 1e3).toFixed(1)} KB`;
     return `${Math.round(value)} B`;
-  }
-
-  function designConsequence(field, value) {
-    const consequences = {
-      health: {
-        "local-aggregate": "Fast local reaction, slower fleet hints, no shared read in the hot path.",
-        "shared-read": "The shared store becomes a latency and availability dependency.",
-        "local-only": "Replicas react independently and cannot coordinate account-level evidence."
-      },
-      quota: {
-        leases: "The fleet stays inside the account budget without one central call per request.",
-        "local-caps": "Replica count multiplies the effective provider cap.",
-        "central-call": "Exact accounting adds a hot-path dependency and a new overload point."
-      },
-      config: {
-        versioned: "Replicas can reject stale policy and keep a known usable snapshot.",
-        mutable: "Partial updates can expose an invalid mixed state.",
-        startup: "A provider incident cannot change routing until restart."
-      },
-      telemetry: {
-        "bounded-async": "A slow sink causes explicit telemetry loss, not unbounded request memory.",
-        synchronous: "The sink adds latency and can fail requests.",
-        unbounded: "A long outage can exhaust process memory."
-      },
-      audit: {
-        "durable-event": "Stable IDs make replay and consumer deduplication possible.",
-        "best-effort": "Loss is acceptable only if the record is not a billing or audit contract.",
-        "request-db": "Strong durability now shares the request latency and failure budget."
-      },
-      tracing: {
-        "logical-child": "One user request stays connected to every physical provider attempt.",
-        single: "Retry and hedge behavior becomes hard to attribute.",
-        "provider-request-id": "Unbounded identifiers create unsafe metric cardinality."
-      }
-    };
-    return consequences[field]?.[value] || "Choose an option to expose its consequence.";
-  }
-
-  function expectedDesignValues(moduleId) {
-    return moduleId === "production-fleet"
-      ? { health: "local-aggregate", quota: "leases", config: "versioned" }
-      : { telemetry: "bounded-async", audit: "durable-event", tracing: "logical-child" };
-  }
-
-  function designRationaleHolds(moduleId, rationale) {
-    const text = String(rationale || "").trim();
-    const sentenceCount = text.split(/[.!?]+/).filter((part) => part.trim().length >= 12).length;
-    const vocabulary = moduleId === "production-fleet"
-      ? ["quota", "lease", "local", "health", "expiry", "expire", "shed", "capacity", "replica", "version", "known good", "failure"]
-      : ["bound", "queue", "drop", "replay", "dedup", "event", "audit", "span", "attempt", "sink", "latency", "failure"];
-    const normalized = text.toLowerCase();
-    const concepts = vocabulary.filter((term) => normalized.includes(term)).length;
-    return text.length >= 100 && sentenceCount >= 2 && concepts >= 3;
-  }
-
-  function renderFailureReadout(failure, moduleId) {
-    if (!failure) return `<p>Choose a failure and state what remains available.</p>`;
-    const copy = {
-      "Shared health store is unavailable": "Forwarding should continue from local state and the last valid, expiring fleet hint. New global policy may pause.",
-      "One zone cannot reach Provider A": "Local observations should remove A in that zone without declaring A globally dead.",
-      "All replicas restart": "Start from conservative caps and cold health. Probe or ramp traffic instead of restoring full weight at once.",
-      "Surviving provider lacks failover capacity": "Admission control must shed excess work. Routing cannot create missing upstream capacity.",
-      "Log sink stops accepting writes": "The bounded telemetry queue fills, then applies its stated loss policy while requests continue.",
-      "Collector queue is full": "Record dropped telemetry and queue saturation. Adding senders may add pressure to the same blocked sink.",
-      "Clients cancel long requests": "Propagate cancellation, release permits once, and classify intentional cancellation as neutral health evidence.",
-      "A bad config names a missing provider": "Reject the new version atomically and keep the last known usable config."
-    };
-    return `<p><strong>Expected boundary:</strong> ${escapeHTML(copy[failure] || `State the request-path behavior for ${moduleId}.`)}</p>`;
   }
 
   function defaultPipelineConfig() {
@@ -2072,17 +2353,19 @@
       ];
     }
     return [
-      { at: 0, label: "Requirements" },
-      { at: Math.round(mock.minutes * 15), label: "Numbers" },
-      { at: Math.round(mock.minutes * 30), label: "Design" },
-      { at: Math.round(mock.minutes * 45), label: "Failures" },
-      { at: Math.round(mock.minutes * 55), label: "Defense" }
+      { at: 0, label: "Scope" },
+      { at: 5 * 60, label: "Requirements" },
+      { at: 10 * 60, label: "Numbers" },
+      { at: 17 * 60, label: "Entities" },
+      { at: 25 * 60, label: "First sketch" },
+      { at: 35 * 60, label: "Scale and faults" },
+      { at: 50 * 60, label: "Defense" }
     ];
   }
 
   function mockFollowupUnlockAt(mock, index) {
     const coding = [22, 37, 52, 64].map((minutes) => minutes * 60);
-    const design = [0.25, 0.5, 0.75, 0.9].map((ratio) => Math.round(mock.minutes * 60 * ratio));
+    const design = [0.2, 0.4, 0.6, 0.78, 0.9].map((ratio) => Math.round(mock.minutes * 60 * ratio));
     return (mock.id === "ai-gateway-coding" ? coding : design)[index] || mock.minutes * 60;
   }
 
@@ -2095,7 +2378,7 @@
     return `<section class="rubric-panel" aria-labelledby="rubric-title"><span class="eyebrow">Score after answering aloud</span><h2 id="rubric-title">Evidence rubric</h2><p>Use 0 for missing, 1 for partial, and 2 for clear and defended.</p>
       <div class="mock-objective-evidence"><strong>Required artifacts from this attempt</strong>${objectiveEvidence.map((item) => `<div class="${item.ok ? "pass" : "pending"}"><span aria-hidden="true">${item.ok ? "✓" : "○"}</span><span>${escapeHTML(item.label)}</span>${item.route && !item.ok ? `<button class="text-button" type="button" data-route="${escapeAttr(item.route)}">Open</button>` : ""}</div>`).join("")}</div>
       <div class="rubric-list">${mock.rubric.map((item, index) => `<label><span><strong>${escapeHTML(item.label)}</strong><small>${escapeHTML(item.detail)}</small></span><select data-rubric-score="${index}" aria-label="Score ${escapeAttr(item.label)}"><option value="">Not scored</option><option value="0" ${saved.scores?.[index] === 0 ? "selected" : ""}>0</option><option value="1" ${saved.scores?.[index] === 1 ? "selected" : ""}>1</option><option value="2" ${saved.scores?.[index] === 2 ? "selected" : ""}>2</option></select></label>`).join("")}</div>
-      <label class="mock-evidence-check"><input type="checkbox" data-mock-performed><span>I completed this timed attempt before revealing the rubric, and the notes record my decisions and failure analysis.</span></label>
+      <label class="mock-evidence-check"><input type="checkbox" data-mock-performed><span>I completed this timed attempt before revealing the rubric, and the ${mock.id === "ai-gateway-coding" ? "notes" : "design board"} records my decisions and failure analysis.</span></label>
       <button class="primary-button" type="button" data-score-mock>Record mock score</button><div class="mock-score-readout">${saved.percent !== undefined ? `<strong>${saved.percent}%</strong><span>${saved.percent >= 70 ? "Promising self-score; verify the weakest row" : "Schedule another rep"}</span>` : "Score every row after completing the rep."}</div>
       ${saved.percent !== undefined ? renderMockRetrospective(mock, saved) : ""}
     </section>`;
@@ -2108,6 +2391,7 @@
     const saved = historical.attemptId && historical.attemptId === activeTimer.attemptId ? historical : { scores: {} };
     const notes = state.mockNotes[mock.id] || "";
     const checkpoints = mockCheckpointPlan(mock);
+    const designStudioId = mock.track === "gateway-design" ? "gateway" : mock.track === "crawler-design" ? "crawler" : null;
     renderBreadcrumbs([{ label: "Control room", route: "home" }, { label: trackLabels[mock.track] }, { label: "Mock interview" }]);
     view.innerHTML = `
       <section class="mock-view" data-mock-id="${escapeAttr(mock.id)}">
@@ -2119,14 +2403,33 @@
         <section class="mock-prompt" aria-labelledby="mock-prompt-title"><span class="eyebrow">Candidate prompt</span><h2 id="mock-prompt-title">Design or build from this brief</h2><p>${escapeHTML(mock.prompt)}</p></section>
         ${mock.id === "ai-gateway-coding" ? `<section class="mock-code-rep" aria-labelledby="mock-code-title"><div class="section-heading"><div><span class="eyebrow">Timed implementation</span><h2 id="mock-code-title">Write and test the request path here</h2></div></div>${renderCodeLab(moduleById.get("coding-execution"))}</section>` : ""}
         ${mock.id === "ai-gateway-coding" ? `<section class="mock-benchmark-rep" aria-labelledby="mock-benchmark-title"><div class="section-heading"><div><span class="eyebrow">Measured comparison</span><h2 id="mock-benchmark-title">Run the benchmark checkpoints here</h2><p>Save two adaptive-routing runs and two concurrency runs. Each pair needs one changed control, a pre-run hypothesis, and a post-run decision.</p></div></div>${renderGatewayConsole("lab-adaptive-routing", false)}${renderGatewayConsole("lab-concurrency-resilience", false)}</section>` : ""}
+        ${designStudioId ? renderSystemDesignStudio(designStudioId, { mockId: mock.id }) : ""}
         <div class="mock-layout">
-          <section class="mock-work"><label><span>Whiteboard or coding notes</span><textarea data-mock-notes placeholder="Requirements, estimates, invariants, decisions, failure behavior...">${escapeHTML(notes)}</textarea></label><div class="followup-deck"><h2>Checkpoint follow-ups</h2>${mock.followups.map((followup, index) => { const unlockAt = mockFollowupUnlockAt(mock, index); const unlocked = activeTimer.elapsed >= unlockAt; return `<div class="followup-card" data-followup-index="${index}" data-unlock-at="${unlockAt}"><div class="followup-locked" ${unlocked ? "hidden" : ""}><span>Card ${index + 1}</span><small>Unlocks at ${formatClock(unlockAt)}</small></div><details ${unlocked ? "" : "hidden"}><summary>Card ${index + 1}</summary><p>${escapeHTML(followup)}</p></details></div>`; }).join("")}</div></section>
+          <section class="mock-work"><label><span>${designStudioId ? "Scratchpad for interviewer answers" : "Whiteboard or coding notes"}</span><textarea data-mock-notes placeholder="${designStudioId ? "Questions, changed assumptions, calculations, and interviewer feedback..." : "Requirements, estimates, invariants, decisions, failure behavior..."}">${escapeHTML(notes)}</textarea></label><div class="followup-deck"><h2>Checkpoint follow-ups</h2>${mock.followups.map((followup, index) => { const unlockAt = mockFollowupUnlockAt(mock, index); const unlocked = activeTimer.elapsed >= unlockAt; return `<div class="followup-card" data-followup-index="${index}" data-unlock-at="${unlockAt}"><div class="followup-locked" ${unlocked ? "hidden" : ""}><span>Card ${index + 1}</span><small>Unlocks at ${formatClock(unlockAt)}</small></div><details ${unlocked ? "" : "hidden"}><summary>Card ${index + 1}</summary><p>${escapeHTML(followup)}</p></details></div>`; }).join("")}</div></section>
           ${renderMockRubric(mock, saved)}
         </div>
+        ${designStudioId && saved.percent !== undefined ? renderMockDesignReference(designStudioId) : ""}
       </section>
     `;
+    applyMockAttemptControlLock();
     if (activeTimer.running) startTimerInterval();
     saveState();
+  }
+
+  function renderMockDesignReference(studioId) {
+    const studio = systemDesignStudios[studioId];
+    if (!studio) return "";
+    return `
+      <section class="mock-reference" aria-labelledby="mock-reference-${escapeAttr(studioId)}">
+        <div class="section-heading"><div><span class="eyebrow">Open after scoring</span><h2 id="mock-reference-${escapeAttr(studioId)}">Compare every artifact, then choose one revision</h2><p>This is one defensible design under the practice assumptions. Compare its reasoning with your board and keep an alternative when its cost fits a different requirement.</p></div></div>
+        <div class="mock-reference-phases">
+          ${studio.phases.map((phase) => `<details><summary><span>${escapeHTML(phase.number)}</span><strong>${escapeHTML(phase.short)}</strong><small>${escapeHTML(phase.title)}</small></summary><p>${escapeHTML(phase.coach.lead)}</p><div class="studio-reference-table">${phase.coach.rows.map((row) => `<div class="studio-reference-row"><strong data-label="Decision">${escapeHTML(row[0])}</strong><span data-label="One defensible answer">${escapeHTML(row[1])}</span><span data-label="Why it follows">${escapeHTML(row[2])}</span></div>`).join("")}</div></details>`).join("")}
+        </div>
+        ${renderWorkedTopology(studio)}
+        ${renderArchitectureEvolution(studio)}
+        ${renderDesignTradeoffs(studio)}
+      </section>
+    `;
   }
 
   function freshMockTimer(mock) {
@@ -2137,6 +2440,7 @@
       started: false,
       elapsed: 0,
       startedAt: null,
+      endedAt: null,
       attemptId: null,
       rubricRevealed: false,
       elapsedAtRunStart: 0,
@@ -2147,18 +2451,27 @@
   function mockObjectiveEvidence(mock) {
     const timerUsed = activeTimer?.mockId === mock.id && Number(activeTimer.elapsed || 0) >= mock.minutes * 60;
     const attemptStartedAt = activeTimer?.startedAt || null;
+    const attemptEndedAt = activeTimer?.endedAt || null;
+    const attemptId = activeTimer?.attemptId || null;
+    const withinAttempt = (value) => {
+      const timestamp = new Date(value || 0).getTime();
+      const startedAt = new Date(attemptStartedAt || 0).getTime();
+      const endedAt = new Date(attemptEndedAt || 0).getTime();
+      return endedAt > startedAt && timestamp >= startedAt && timestamp <= endedAt;
+    };
     const items = [{
       ok: timerUsed,
       label: timerUsed ? `Full ${mock.minutes}-minute timer completed` : `Complete the ${mock.minutes}-minute timer`
     }];
-    if (mock.id !== "ai-gateway-coding") return items;
+    if (mock.id !== "ai-gateway-coding") return [...mockDesignObjectiveEvidence(mock), ...items];
     const codeResult = state.codeResults["build-gateway"];
     const currentSource = state.codeDrafts["build-gateway"] || codeExercises["coding-execution"].starter;
     const codeIsFresh = Boolean(
       attemptStartedAt
       && codeResult?.passed === true
+      && codeResult.attemptId === attemptId
       && codeResult.sourceFingerprint === Sim.stableFingerprint({ source: currentSource })
-      && new Date(codeResult.ranAt || 0).getTime() >= new Date(attemptStartedAt).getTime()
+      && withinAttempt(codeResult.ranAt)
     );
     return [
       {
@@ -2167,16 +2480,48 @@
         route: "lab/coding-execution"
       },
       {
-        ok: Boolean(gatewayComparisonEvidence("adaptive-routing", attemptStartedAt)),
+        ok: Boolean(gatewayComparisonEvidence("adaptive-routing", attemptStartedAt, attemptEndedAt, attemptId)),
         label: "Fresh adaptive-routing comparison includes a measured change and decision",
         route: "lab/adaptive-routing"
       },
       {
-        ok: Boolean(gatewayComparisonEvidence("concurrency-resilience", attemptStartedAt)),
+        ok: Boolean(gatewayComparisonEvidence("concurrency-resilience", attemptStartedAt, attemptEndedAt, attemptId)),
         label: "Fresh concurrency comparison includes a measured change and decision",
         route: "lab/concurrency-resilience"
       },
       ...items
+    ];
+  }
+
+  function mockDesignObjectiveEvidence(mock) {
+    const studioId = mock.track === "gateway-design" ? "gateway" : mock.track === "crawler-design" ? "crawler" : null;
+    const studio = studioId ? systemDesignStudios[studioId] : null;
+    const workbook = state.mockDesignWorkbooks[mock.id];
+    const startedAt = new Date(activeTimer?.startedAt || 0).getTime();
+    const endedAt = new Date(activeTimer?.endedAt || 0).getTime();
+    const attemptMatches = Boolean(workbook && workbook.attemptId === activeTimer?.attemptId);
+    const withinAttempt = (value) => {
+      const timestamp = new Date(value || 0).getTime();
+      return endedAt > startedAt && timestamp >= startedAt && timestamp <= endedAt;
+    };
+    const fresh = (phaseId) => {
+      const phase = studio?.phases.find((entry) => entry.id === phaseId);
+      const record = workbook?.phases?.[phaseId];
+      return Boolean(
+        attemptMatches
+        && phase
+        && record
+        && designPhaseComplete(phase, record)
+        && withinAttempt(record.verifiedAt)
+        && phase.fields.every((field) => withinAttempt(record.fieldUpdatedAt?.[field.id]))
+      );
+    };
+    if (!studio) return [];
+    return [
+      { ok: fresh("scope") && fresh("requirements"), label: "Fresh scope, functional requirements, non-functional requirements, assumptions, and non-goals" },
+      { ok: fresh("scale") && fresh("entities"), label: "Fresh capacity worksheet, entity ownership model, and API or event contracts" },
+      { ok: fresh("sketch") && fresh("evolve"), label: "Fresh healthy trace, first architecture, state ownership, and scaled failure behavior" },
+      { ok: fresh("defend"), label: "Fresh failure walks, trade-off reversals, and two-minute recap" }
     ];
   }
 
@@ -2215,6 +2560,10 @@
     activeTimer.elapsed = Math.min(total, Number(activeTimer.elapsedAtRunStart || 0) + segmentSeconds);
     activeTimer.remaining = Math.max(0, total - activeTimer.elapsed);
     if (activeTimer.remaining === 0) {
+      if (!activeTimer.endedAt) {
+        const remainingAtRunStart = Math.max(0, total - Number(activeTimer.elapsedAtRunStart || 0));
+        activeTimer.endedAt = new Date(Number(activeTimer.runStartedAtMs || nowMs) + remainingAtRunStart * 1000).toISOString();
+      }
       activeTimer.running = false;
       activeTimer.elapsedAtRunStart = activeTimer.elapsed;
       activeTimer.runStartedAtMs = null;
@@ -2261,6 +2610,34 @@
       reveal.disabled = !ready;
       reveal.textContent = ready ? "Reveal rubric" : `Available after ${formatClock(activeTimer.remaining)}`;
     }
+    if (activeTimer.remaining === 0) {
+      const root = document.querySelector(`[data-studio-mock="${CSS.escape(activeTimer.mockId)}"]`);
+      root?.querySelectorAll("[data-studio-field], [data-studio-option], [data-studio-node-input], [data-studio-add-node], [data-studio-node-action], [data-check-studio-phase]").forEach((control) => {
+        control.disabled = true;
+      });
+      const status = root?.querySelector("[data-studio-phase-status]");
+      if (status) status.textContent = "Time is complete. This attempt is frozen for scoring.";
+    }
+    applyMockAttemptControlLock();
+  }
+
+  function applyMockAttemptControlLock() {
+    const root = document.querySelector(".mock-view");
+    if (!root || !activeTimer) return;
+    const locked = !activeTimer.started || !activeTimer.running || activeTimer.remaining === 0;
+    root.querySelectorAll([
+      ".mock-code-rep input",
+      ".mock-code-rep textarea",
+      ".mock-code-rep select",
+      ".mock-code-rep button",
+      ".mock-benchmark-rep input",
+      ".mock-benchmark-rep textarea",
+      ".mock-benchmark-rep select",
+      ".mock-benchmark-rep button",
+      "[data-mock-notes]"
+    ].join(", ")).forEach((control) => {
+      control.disabled = locked;
+    });
   }
 
   function stopTimer(clearRunning = true) {
@@ -2673,6 +3050,129 @@
       return;
     }
 
+    const studioPhaseButton = event.target.closest("[data-studio-phase]");
+    if (studioPhaseButton) {
+      const root = studioPhaseButton.closest("[data-system-design-studio]");
+      if (!root) return;
+      const workbook = designWorkbook(root.dataset.systemDesignStudio, { mockId: root.dataset.studioMock || null });
+      workbook.activePhase = studioPhaseButton.dataset.studioPhase;
+      saveState();
+      refreshSystemDesignStudio(root, { focusPhase: true });
+      announce(`Opened the ${studioPhaseButton.textContent.trim()} design phase.`);
+      return;
+    }
+
+    const addStudioNode = event.target.closest("[data-studio-add-node]");
+    if (addStudioNode) {
+      const root = addStudioNode.closest("[data-system-design-studio]");
+      const input = addStudioNode.parentElement?.querySelector("[data-studio-node-input]");
+      const node = String(input?.value || "").trim();
+      const studioId = root?.dataset.systemDesignStudio;
+      const mockId = root?.dataset.studioMock || null;
+      const workbook = designWorkbook(studioId, { mockId });
+      const phase = systemDesignStudios[studioId]?.phases.find((entry) => entry.id === workbook.activePhase);
+      const fieldId = addStudioNode.dataset.studioAddNode;
+      const nodes = designDiagramNodes(designPhaseRecord(workbook, phase?.id).fields[fieldId]);
+      if (node.length < 3) {
+        showToast("Name the component before adding the box.");
+        input?.focus();
+        return;
+      }
+      if (nodes.some((entry) => entry.toLowerCase() === node.toLowerCase())) {
+        showToast("That box is already in the path.");
+        input?.focus();
+        return;
+      }
+      if (nodes.length >= 12) {
+        showToast("Keep the main path to 12 boxes or fewer.");
+        return;
+      }
+      updateStudioDiagram(root, fieldId, [...nodes, node]);
+      announce(`Added ${node} to the topology.`);
+      return;
+    }
+
+    const studioNodeAction = event.target.closest("[data-studio-node-action]");
+    if (studioNodeAction) {
+      const root = studioNodeAction.closest("[data-system-design-studio]");
+      const studioId = root?.dataset.systemDesignStudio;
+      const mockId = root?.dataset.studioMock || null;
+      const workbook = designWorkbook(studioId, { mockId });
+      const phase = systemDesignStudios[studioId]?.phases.find((entry) => entry.id === workbook.activePhase);
+      const fieldId = studioNodeAction.dataset.studioNodeField;
+      const nodes = designDiagramNodes(designPhaseRecord(workbook, phase?.id).fields[fieldId]);
+      const index = Number(studioNodeAction.dataset.studioNodeIndex);
+      const action = studioNodeAction.dataset.studioNodeAction;
+      if (!Number.isInteger(index) || !nodes[index]) return;
+      if (action === "remove") nodes.splice(index, 1);
+      if (action === "left" && index > 0) [nodes[index - 1], nodes[index]] = [nodes[index], nodes[index - 1]];
+      if (action === "right" && index < nodes.length - 1) [nodes[index + 1], nodes[index]] = [nodes[index], nodes[index + 1]];
+      updateStudioDiagram(root, fieldId, nodes);
+      announce(action === "remove" ? "Removed the topology box." : "Reordered the topology path.");
+      return;
+    }
+
+    const studioOption = event.target.closest("[data-studio-option]");
+    if (studioOption) {
+      const root = studioOption.closest("[data-system-design-studio]");
+      if (!root || studioOption.disabled) return;
+      const studioId = root.dataset.systemDesignStudio;
+      const mockId = root.dataset.studioMock || null;
+      const workbook = designWorkbook(studioId, { mockId });
+      const phase = systemDesignStudios[studioId]?.phases.find((entry) => entry.id === workbook.activePhase);
+      if (!phase) return;
+      const record = designPhaseRecord(workbook, phase.id);
+      const fieldId = studioOption.dataset.studioOptionField;
+      record.fields[fieldId] = studioOption.dataset.studioOption;
+      record.fieldUpdatedAt[fieldId] = new Date().toISOString();
+      record.guidedDecisions[fieldId] = true;
+      record.verified = false;
+      workbook.attemptId = mockId ? activeTimer?.attemptId || null : workbook.attemptId;
+      invalidateStudioEvidence(root);
+      saveState();
+      refreshSystemDesignStudio(root, { focusSelector: `[data-studio-option="${CSS.escape(studioOption.dataset.studioOption)}"]` });
+      announce(`Selected ${studioOption.querySelector("strong")?.textContent || "the design option"}.`);
+      return;
+    }
+
+    const checkStudioPhase = event.target.closest("[data-check-studio-phase]");
+    if (checkStudioPhase) {
+      const root = checkStudioPhase.closest("[data-system-design-studio]");
+      if (!root || checkStudioPhase.disabled) return;
+      const studioId = root.dataset.systemDesignStudio;
+      const mockId = root.dataset.studioMock || null;
+      const moduleId = root.dataset.studioModule || null;
+      const studio = systemDesignStudios[studioId];
+      const phase = studio?.phases.find((entry) => entry.id === checkStudioPhase.dataset.checkStudioPhase);
+      const workbook = designWorkbook(studioId, { mockId });
+      const record = phase ? designPhaseRecord(workbook, phase.id) : null;
+      if (!phase || !record) return;
+      const missing = phase.fields.filter((field) => !designFieldComplete(field, record));
+      if (missing.length) {
+        const status = root.querySelector("[data-studio-phase-status]");
+        status.textContent = `Finish ${missing.map((field) => field.label).join(" and ")}. Use distinct sections, concrete names or units, and causal reasoning.`;
+        status.classList.add("error");
+        const first = missing[0];
+        const selector = first.kind === "decision"
+          ? `[data-studio-option-field="${CSS.escape(first.id)}"]`
+          : `[data-studio-field="${CSS.escape(first.id)}"]`;
+        root.querySelector(selector)?.focus();
+        announce(status.textContent);
+        return;
+      }
+      const now = new Date().toISOString();
+      record.attempted = true;
+      record.verified = true;
+      record.verifiedAt = now;
+      workbook.updatedAt = now;
+      workbook.attemptId = mockId ? activeTimer?.attemptId || null : workbook.attemptId;
+      saveState();
+      if (moduleId) maybeCompleteSystemDesignLab(moduleId);
+      refreshSystemDesignStudio(root, { focusSelector: "[data-studio-phase-status]" });
+      announce(mockId ? `${phase.short} evidence recorded for this attempt.` : `${phase.short} recorded. The worked comparison is now available.`);
+      return;
+    }
+
     const checkButton = event.target.closest("[data-check-answer]");
     if (checkButton) {
       const root = checkButton.closest("[data-check-id]");
@@ -2811,6 +3311,7 @@
         warnings: structuredClone(activeGatewayRun.warnings || []),
         fingerprint: activeGatewayRun.fingerprint || Sim.stableFingerprint(activeGatewayRun.config || {}),
         savedAt: new Date().toISOString(),
+        attemptId: activeTimer?.running && activeTimer.mockId === "ai-gateway-coding" ? activeTimer.attemptId : null,
         hypothesis: activeGatewayRun.evidence.hypothesis,
         note: interpretation
       };
@@ -2844,6 +3345,7 @@
       state.codeResults[exerciseId] = {
         ...result,
         sourceFingerprint: Sim.stableFingerprint({ source: editor.value }),
+        attemptId: activeTimer?.running && activeTimer.mockId === "ai-gateway-coding" ? activeTimer.attemptId : null,
         ranAt: new Date().toISOString()
       };
       saveState();
@@ -2855,6 +3357,7 @@
         const moduleId = Object.entries(codeExercises).find(([, exercise]) => exercise.id === exerciseId)?.[0];
         completeLab(moduleId, "All tests passed. Lab evidence recorded.");
       }
+      applyMockAttemptControlLock();
       announce(result.passed ? "All browser tests passed." : `${result.failed} browser tests failed.`);
       return;
     }
@@ -2985,45 +3488,9 @@
         config: structuredClone(run.config),
         recordedAt: new Date().toISOString()
       };
-      if (state.designs[moduleId].boardChecked) {
-        completeLab(moduleId, "Model and architecture evidence recorded.");
-      } else {
+      if (!maybeCompleteSystemDesignLab(moduleId)) {
         saveState();
-        showToast("Model evidence recorded. Complete the architecture board next.");
-      }
-      return;
-    }
-
-    const checkDesignButton = event.target.closest("[data-check-design]");
-    if (checkDesignButton) {
-      const moduleId = checkDesignButton.dataset.checkDesign;
-      const design = state.designs[moduleId] || {};
-      const required = moduleId === "production-fleet" ? ["health", "quota", "config"] : ["telemetry", "audit", "tracing"];
-      const expected = expectedDesignValues(moduleId);
-      const missing = required.filter((field) => !design[field]);
-      const unsafe = required.filter((field) => design[field] && design[field] !== expected[field]);
-      const status = checkDesignButton.parentElement.querySelector("[data-design-status]");
-      if (missing.length || !design.failure) {
-        status.textContent = "Choose every boundary and inject one failure before checking the design.";
-        status.classList.add("error");
-      } else if (unsafe.length) {
-        status.textContent = `Revisit ${unsafe.join(", ")}. Its consequence conflicts with the request-path or ownership invariant.`;
-        status.classList.add("error");
-      } else if (!designRationaleHolds(moduleId, design.rationale)) {
-        status.textContent = "Write 2 to 4 complete sentences that connect at least three system concepts to the invariant, failure behavior, and trade-off.";
-        status.classList.add("error");
-      } else {
-        design.boardChecked = true;
-        state.designs[moduleId] = design;
-        if (design.modelChecked) {
-          completeLab(moduleId, "Model and architecture evidence recorded.");
-          status.textContent = "Architecture evidence recorded. The full lab gate now holds.";
-        } else {
-          saveState();
-          showToast("Architecture evidence recorded. Run and defend the executable model next.");
-          status.textContent = "Architecture evidence recorded. The executable model is still required.";
-        }
-        status.classList.remove("error");
+        showToast("Model evidence recorded. Verify every design artifact assigned to this module next.");
       }
       return;
     }
@@ -3144,11 +3611,15 @@
       }
       state.designs[moduleId] = {
         checked: true,
+        modelChecked: true,
         defense,
         config: structuredClone(run.config || run.controls),
         recordedAt: new Date().toISOString()
       };
-      completeLab(moduleId, "Model invariants and design defense recorded.");
+      if (!maybeCompleteSystemDesignLab(moduleId)) {
+        saveState();
+        showToast("Model evidence recorded. Verify every design artifact assigned to this module next.");
+      }
       return;
     }
 
@@ -3166,6 +3637,7 @@
           activeTimer.startedAt = new Date().toISOString();
           activeTimer.attemptId = crypto.randomUUID();
           activeTimer.rubricRevealed = false;
+          delete state.mockDesignWorkbooks[activeTimer.mockId];
         }
         activeTimer.elapsedAtRunStart = activeTimer.elapsed;
         activeTimer.runStartedAtMs = Date.now();
@@ -3173,6 +3645,8 @@
         startTimerInterval();
       }
       refreshTimerDisplay();
+      const mockStudio = document.querySelector(`[data-studio-mock="${CSS.escape(activeTimer.mockId)}"]`);
+      if (mockStudio) refreshSystemDesignStudio(mockStudio);
       return;
     }
 
@@ -3182,6 +3656,7 @@
       activeTimer = freshMockTimer(mock);
       delete state.mockNotes[mock.id];
       delete state.mockNoteUpdatedAt[mock.id];
+      delete state.mockDesignWorkbooks[mock.id];
       saveState();
       renderMock(mock);
       showToast("Mock attempt reset.");
@@ -3219,12 +3694,17 @@
         return;
       }
       const notes = String(state.mockNotes[mock.id] || "").trim();
-      if (notes.length < 120) {
+      if (mock.id === "ai-gateway-coding" && notes.length < 120) {
         showToast("Record at least 120 characters of requirements, decisions, and failure behavior first.");
         root.querySelector("[data-mock-notes]")?.focus();
         return;
       }
-      if (!activeTimer.startedAt || new Date(state.mockNoteUpdatedAt[mock.id] || 0).getTime() < new Date(activeTimer.startedAt).getTime()) {
+      if (mock.id === "ai-gateway-coding" && (
+        !activeTimer.startedAt
+        || !activeTimer.endedAt
+        || new Date(state.mockNoteUpdatedAt[mock.id] || 0).getTime() < new Date(activeTimer.startedAt).getTime()
+        || new Date(state.mockNoteUpdatedAt[mock.id] || 0).getTime() > new Date(activeTimer.endedAt).getTime()
+      )) {
         showToast("Add or revise your notes during this timed attempt before scoring.");
         root.querySelector("[data-mock-notes]")?.focus();
         return;
@@ -3303,6 +3783,7 @@
     if (event.target.closest("#reset-progress")) {
       if (!confirm("Reset all Decagon course progress, notes, benchmarks, and mock scores?")) return;
       localStorage.removeItem(storageKey);
+      localStorage.removeItem(previousStorageKey);
       state = structuredClone(defaultState);
       activeQuiz = null;
       activeGatewayRun = null;
@@ -3317,6 +3798,37 @@
   });
 
   document.addEventListener("input", (event) => {
+    if (event.target.matches("[data-studio-field]")) {
+      const root = event.target.closest("[data-system-design-studio]");
+      const studioId = root?.dataset.systemDesignStudio;
+      const mockId = root?.dataset.studioMock || null;
+      const workbook = designWorkbook(studioId, { mockId });
+      const phase = systemDesignStudios[studioId]?.phases.find((entry) => entry.id === workbook.activePhase);
+      if (phase) {
+        const record = designPhaseRecord(workbook, phase.id);
+        const fieldId = event.target.dataset.studioField;
+        record.fields[fieldId] = event.target.value;
+        record.fieldUpdatedAt[fieldId] = new Date().toISOString();
+        delete record.guidedDecisions[fieldId];
+        record.verified = false;
+        workbook.updatedAt = new Date().toISOString();
+        workbook.attemptId = mockId ? activeTimer?.attemptId || null : workbook.attemptId;
+        invalidateStudioEvidence(root);
+        const counter = event.target.closest(".studio-field")?.querySelector("[data-studio-counter]");
+        const length = event.target.value.trim().length;
+        const minimum = Number(event.target.dataset.studioMin || 1);
+        if (counter) {
+          counter.textContent = `${length}/${minimum} characters`;
+          counter.classList.toggle("complete", length >= minimum);
+        }
+        const status = root.querySelector("[data-studio-phase-status]");
+        if (status) {
+          status.textContent = "Draft changed. Recheck this phase when the artifact is ready.";
+          status.classList.remove("complete", "error");
+        }
+        saveState();
+      }
+    }
     if (event.target.matches("[data-code-editor]")) {
       const root = event.target.closest("[data-code-exercise]");
       const exerciseId = root.dataset.codeExercise;
@@ -3332,22 +3844,6 @@
         }
       }
       saveState();
-    }
-    if (event.target.matches("[data-design-field]")) {
-      const root = event.target.closest("[data-design-board]");
-      const design = state.designs[root.dataset.designBoard] || {};
-      design[event.target.dataset.designField] = event.target.value;
-      design.boardChecked = false;
-      state.designs[root.dataset.designBoard] = design;
-      saveState();
-      if (event.target.tagName === "SELECT" && event.target.dataset.designField !== "failure") {
-        const small = event.target.closest("label")?.querySelector("small");
-        if (small) small.textContent = designConsequence(event.target.dataset.designField, event.target.value);
-      }
-      if (event.target.dataset.designField === "failure") {
-        const readout = root.querySelector("[data-failure-readout]");
-        if (readout) readout.innerHTML = renderFailureReadout(event.target.value, root.dataset.designBoard);
-      }
     }
     if (event.target.matches("[data-mock-notes]")) {
       const root = event.target.closest("[data-mock-id]");
