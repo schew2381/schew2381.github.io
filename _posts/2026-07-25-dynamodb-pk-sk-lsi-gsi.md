@@ -5,24 +5,24 @@ categories: [dynamodb, internals]
 tags: [aws, dynamodb, database, index]
 ---
 
-DynamoDB has no query planner.
-A SQL database lets you filter or sort on any column and trusts the optimizer to find a path to the answer.
-DynamoDB makes you choose that path yourself through the way you lay out the keys, and a read the layout doesn't support falls back to scanning the whole table.
+DynamoDB has no query planner. Where a SQL database lets you filter or sort on any column and trusts the optimizer to find a path to the answer, DynamoDB makes you design that path yourself through the way you lay out the keys. Anything the layout doesn't support falls back to scanning the whole table, so the keys are the design.
 
-So the keys are the design.
-Four pieces make up that design: the partition key (PK) and sort key (SK) that define a table's primary key, plus two secondary index types that give the same items new read paths, the local secondary index (LSI) and the global secondary index (GSI).
-LSIs and GSIs only make sense once PK and SK are clear, so start there.
+Four pieces make up that design:
+
+1. The partition key (PK) picks which physical partition an item lives on.
+2. The sort key (SK) orders items within a partition.
+3. A local secondary index (LSI) re-sorts a partition under a different sort key.
+4. A global secondary index (GSI) regroups items under a brand-new partition key.
+
+The two indexes build on the primary key, so start with PK and SK.
 
 ## Partition key and sort key
 
-Every DynamoDB table needs a primary key that uniquely identifies each item.
-It takes one of two forms: a partition key on its own, or a partition key paired with a sort key.
+Every DynamoDB table needs a primary key that uniquely identifies each item. It takes one of two forms: a partition key on its own, or a partition key paired with a sort key.
 
-The partition key decides where an item physically lives.
-DynamoDB runs the PK value through a hash function and uses the result to pick one of the [partitions](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.Partitions.html) the table is spread across, so every item with the same PK lands on the same partition, stored together.
+The partition key decides where an item physically lives. DynamoDB runs the PK value through a hash function and uses the result to pick one of the [partitions](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.Partitions.html) the table is spread across, so every item with the same PK lands on the same partition, stored together.
 
-The sort key orders items within that partition.
-With a composite key one PK holds many items, and DynamoDB keeps them sorted by SK on disk, so a query can ask for a contiguous range and get it back in order without sorting anything at request time.
+The sort key orders items within that partition. With a composite key one PK holds many items, kept sorted by SK on disk, so a query can ask for a contiguous range and get it back in order without sorting anything at request time.
 
 ```text
 hash("CUSTOMER#A")
@@ -39,10 +39,9 @@ hash("CUSTOMER#A")
 
 The PK maps to storage, and the SK organizes what's inside it.
 
-## An orders table
+## Example: the `Orders` table
 
-Take an order-tracking system.
-The table uses `CustomerID` as the PK and `OrderID` as the SK, with a few more attributes on each item:
+An order-tracking table keys on `CustomerID` as the PK and `OrderID` as the SK:
 
 | CustomerID | OrderID | OrderDate | Status | TotalAmount |
 |---|---|---|---|---:|
@@ -51,11 +50,9 @@ The table uses `CustomerID` as the PK and `OrderID` as the SK, with a few more a
 | `CUSTOMER#A` | `ORDER#1042` | `2026-07-25T16:12:00Z` | `PENDING` | 18.00 |
 | `CUSTOMER#B` | `ORDER#2003` | `2026-07-23T11:45:00Z` | `PENDING` | 55.00 |
 
-The composite key fits because one customer owns many orders, and each `CustomerID + OrderID` pair points at exactly one of them.
+One customer owns many orders, so the composite key fits: each `CustomerID + OrderID` pair points at exactly one item.
 
-This layout answers one question directly: give me a customer's orders.
-DynamoDB hashes `CUSTOMER#A`, goes straight to that partition, and a `Query` returns `ORDER#1007`, `ORDER#1011`, and `ORDER#1042` in `OrderID` order.
-Fetching a single known order is a `GetItem` on the exact key:
+This answers one read directly. DynamoDB hashes `CUSTOMER#A`, jumps to that partition, and a `Query` returns its orders in `OrderID` order. A single known order is a `GetItem` on the exact key:
 
 ```text
 PK = "CUSTOMER#A"
@@ -64,76 +61,39 @@ SK = "ORDER#1007"
 
 ## New access patterns
 
-Then the requirements grow.
+Then the requirements grow, and now we want to query for:
 
-The account screen wants Customer A's orders newest first, ordered by `OrderDate` instead of `OrderID`.
-The operations team wants every order with `Status = PENDING`, across all customers, so they can work the backlog.
+1. A single customer's orders sorted by `OrderDate` instead of `OrderID`.
+2. Every order with `Status = PENDING`, across all customers.
 
-The table answers neither from its keys.
-It sorts each customer's orders by `OrderID`, and `Status` isn't a key at all.
-Both reads fall back to a [`Scan`](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Scan.html), which reads every item before filtering, so returning ten pending orders can burn reads on thousands of shipped ones.
+Neither works on our table. It sorts each customer's orders by `OrderID`, and `Status` isn't a key at all, so both reads fall back to a [`Scan`](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Scan.html) that reads every item before filtering. Returning ten pending orders can burn reads on thousands of shipped ones.
 
-An index stores the same items under a different key layout that DynamoDB keeps in sync for you.
-There are two kinds, and they split on one question: does the index keep the table's partition key, or choose a new one?
+So how do we serve these without a scan? An index stores the same items under a different key layout that DynamoDB keeps in sync for you. The two kinds differ by one choice: keep the table's partition key, or pick a new one.
 
 ## Local secondary index (LSI)
 
-An LSI keeps the table's partition key and swaps in a new sort key.
-Same grouping, different order.
+An LSI keeps the table's partition key and gives it a new sort key. Same grouping, different order. Its entries live on the same physical partition as the base item, which is what "local" means, and because the index sits right next to that data, an LSI can serve strongly consistent reads.
 
-Its entries live on the same physical partition as the base item, which is what "local" refers to.
-Because the index sits next to the data it mirrors, an LSI can serve strongly consistent reads.
-
-The newest-orders query needs a sort key built from the date, and DynamoDB won't derive one from `OrderDate` on its own.
-The writer stores an explicit attribute on each order instead:
+For the newest-orders read, build an LSI with `CustomerID` as the PK and `OrderDate` as the SK. The ISO timestamps sort chronologically on their own, so no extra work is needed to order them:
 
 ```text
-OrderDateKey =
-2026-07-25T16:12:00.000000Z|CUSTOMER#A|ORDER#1042
+Base table (Customer A)       LSI (Customer A)
+sorted by OrderID             sorted by OrderDate
+
+ORDER#1007   07-24            07-22   ORDER#1011
+ORDER#1011   07-22    ──►     07-24   ORDER#1007
+ORDER#1042   07-25            07-25   ORDER#1042
 ```
 
-Every timestamp uses the same fixed-width UTC form and the IDs never contain `|`, so the string sorts chronologically and no two orders collapse to the same value.
-The LSI keeps `CustomerID` as its PK and uses `OrderDateKey` as its SK:
+Now the account screen queries `CUSTOMER#A` in descending order and stops after 20 items, with no full-history read and no sorting in the app.
 
-```text
-Base table, Customer A
-sorted by OrderID
-
-ORDER#1007
-    │
-ORDER#1011
-    │
-ORDER#1042
-
-same PK, alternate SK
-    │
-    ▼
-
-LSI, Customer A
-sorted by OrderDateKey
-
-07-22...|A|1011
-    │
-07-24...|A|1007
-    │
-07-25...|A|1042
-```
-
-Now the account screen queries `CUSTOMER#A` in descending order and stops after 20 items, with no full-history read and no application-side sort.
-
-The constraints are strict.
-An LSI must be defined when the table is created and can't be added later, and one PK's base items plus its LSI entries have to stay under the [10 GB item-collection limit](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/LSI.html).
-And because it only reorders a single customer's items, an LSI still can't reach across customers to gather every pending order.
+The cost of sharing a partition is a set of hard limits. An LSI has to be declared when the table is created and can't be added later, and one partition key's base items plus its LSI entries must stay under [10 GB](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/LSI.html). And since it only reorders one customer's items, it still can't reach across customers.
 
 ## Global secondary index (GSI)
 
-A GSI drops the table's partition key and defines its own PK and SK, so it can regroup items by an attribute the table never keyed on.
+A GSI drops the table's partition key and defines its own PK and SK, so it can regroup items by an attribute the table never keyed on. Under the hood it's essentially a separate table: DynamoDB copies each write into the GSI in the background, which is why GSI reads are [eventually consistent](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GSI.html) and trail the table by a small lag.
 
-Under the hood it behaves like a separate table.
-DynamoDB copies each write into the GSI in the background, which is why GSI reads are [eventually consistent](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GSI.html): the index trails the table by a small, usually sub-second, lag.
-
-For the operations queue, the GSI uses `Status` as its PK and `OrderDateKey` as its SK.
-Orders that lived in different customer partitions now sit together under `PENDING`:
+For the operations queue, build a GSI with `Status` as the PK and `OrderDate` as the SK. Orders that lived in different customer partitions now sit together under `PENDING`:
 
 ```text
 Orders table
@@ -151,11 +111,9 @@ PENDING / 07-23 / B / 2003
 PENDING / 07-25 / A / 1042
 ```
 
-The queue queries `Status = PENDING` in date order and pages through the results.
-A GSI still reads from one PK per query, so it needs a `Status` value even though the index spans every customer.
+The queue queries `Status = PENDING` in date order and pages through the results. A GSI still reads from one PK per query, so it needs a `Status` value even though the index spans every customer.
 
-Its separate key space is what makes it flexible.
-A GSI can be added or dropped at any time, carries no 10 GB collection limit, and runs on its own capacity, metered apart from the table.
+Unlike an LSI, a GSI can be added or dropped at any time, has no 10 GB limit, and runs on its own capacity, metered apart from the table.
 
 ## One write, three read paths
 
@@ -175,12 +133,12 @@ One table write
                │
        ├─ LSI (same PK)
        │  ├─ PK CustomerID
-       │  ├─ SK OrderDateKey
+       │  ├─ SK OrderDate
        │  └─ Read: customer by date
        │
        └─ GSI (async)
           ├─ PK Status
-          ├─ SK OrderDateKey
+          ├─ SK OrderDate
           └─ Read: status by date
 ```
 
@@ -201,36 +159,26 @@ The two look alike in a query but promise different things:
 | Size limit | 10 GB per partition key | None |
 | Capacity | Shares the table's | Its own, metered separately |
 
-When you're unsure, reach for a GSI.
-It can be added after the table exists, scales past 10 GB, and doesn't force a decision at creation time.
-An LSI earns its place only when you need strongly consistent reads on an alternate sort and you're confident one partition key's data stays small, and both of those have to be known before the table exists.
+Default to a GSI. It can be added after the table exists, scales past 10 GB, and doesn't lock in a decision at creation time. An LSI earns its place only when you need strongly consistent reads on an alternate sort of one partition's data, and that has to be known before the table exists.
+
+Either way, choose the table's own key for the dominant read first, then add an index per remaining pattern. Every index costs storage and write throughput, so create one for a read you actually serve, not for an attribute that might be useful someday.
 
 ## When one status gets busy
 
-The status GSI makes the operations queue cheap by concentrating pending orders under one PK.
-As the queue grows, that same concentration can turn `PENDING` into a hot key.
+The status GSI works because it piles every pending order under one PK. That is also its weak point. Each partition has a fixed throughput ceiling, and since new orders all start as `PENDING`, the writes and the queue's reads pound the same `Status = PENDING` partition:
 
-A common fix adds a stable shard to the index PK:
+1. Orders arrive and all hash to the single `PENDING` partition.
+2. That partition nears its read and write throughput limit.
+3. DynamoDB throttles requests to it while the rest of the table sits idle.
+
+That is a hot partition. The fix is to [shard the GSI key](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-indexes-gsi-sharding.html): append a small suffix so one status spreads across many partitions.
 
 ```text
-PENDING
-   │
-   ├─ PENDING#00
-   ├─ PENDING#01
-   ├─ ...
-   └─ PENDING#15
+PENDING            PENDING#00
+                   PENDING#01
+   split into      PENDING#02
+      ──►          ...
+                   PENDING#15
 ```
 
-Writes spread across 16 key values, and reads query those shards in parallel and merge their date-ordered results.
-Write distribution improves at the cost of read fan-out and an application-side merge.
-
-## Choosing keys
-
-Pick the table key for the dominant read, then add indexes for the rest.
-If newest-by-date is the main customer read, `OrderDate#OrderID` may belong in the table SK from the start, which removes the LSI but changes the direct order-ID path.
-
-For this table, the customer-by-date path fits an LSI only when it's known at creation, needs strong reads, and has a safe item-collection bound.
-The cross-customer status path needs a GSI and accepts eventually consistent reads plus its own index cost.
-
-Every index adds storage and write work.
-Create one for a named access pattern, not because an attribute might be useful someday.
+On write, pick a suffix at random, turning `PENDING` into `PENDING#00` through `PENDING#15`, so the load lands on 16 partitions instead of one. On read, query all 16 shards in parallel and merge their date-ordered results. Throughput scales with the shard count, at the cost of fan-out reads and an application-side merge.
