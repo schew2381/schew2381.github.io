@@ -5,11 +5,29 @@ categories: [dynamodb, internals]
 tags: [aws, dynamodb, database, index]
 ---
 
-The first version of an orders table has one job: fetch an order when the customer and order ID are known.
-A composite `CustomerID + OrderID` key makes that read direct.
+An orders table rarely serves a single read.
+Fetch one order by customer and ID, list a customer's newest orders, pull every pending order across all customers: each read wants the same items arranged a different way.
 
-Then product needs each customer's newest orders, while operations needs one queue of pending orders across every customer.
-Those two requirements add two more key paths over the same items.
+DynamoDB has no query planner to choose an access path, so you arrange the data yourself with four constructs.
+The partition key (PK) and sort key (SK) form a table's primary key, and two secondary index types, the local secondary index (LSI) and the global secondary index (GSI), add alternate arrangements.
+This post defines each one and shows which read it serves, working through one orders table.
+
+## How DynamoDB stores data
+
+DynamoDB spreads a table across many physical partitions and uses the partition key to decide where each item lands.
+It hashes the PK value, so items that share a PK sit together in one collection and every read starts by naming a single PK.
+
+Within a collection the sort key orders the items.
+A primary key is either a PK on its own, where each PK holds one item, or a composite PK and SK, where one PK holds many items and a query returns a range of them in sort-key order.
+
+Those two keys fix one arrangement, and one arrangement answers one shape of read well.
+A secondary index gives the same items a second arrangement that DynamoDB maintains as writes land, and it comes in two forms.
+
+A local secondary index keeps the table's PK and swaps in a different sort key.
+It re-sorts each collection without changing which items group together, and it stores its entries beside the table's own partitions, which is the sense in which it is local.
+
+A global secondary index defines its own PK and SK in a separate key space.
+That lets a read start from an attribute the table never used as a key, regrouping the items rather than only reordering them.
 
 ## The overview
 
@@ -59,20 +77,16 @@ Partition key (PK): CustomerID
 Sort key (SK):      OrderID
 ```
 
-A DynamoDB primary key can be a PK alone or a composite PK and SK.
-This table needs the composite form because one customer owns many orders, with each `CustomerID + OrderID` pair identifying one item.
+The composite form fits because one customer owns many orders, and each `CustomerID + OrderID` pair identifies one item.
 
-`GetItem` can fetch the known order directly:
+`GetItem` fetches the known order directly:
 
 ```text
 PK = "CUSTOMER#A"
 SK = "ORDER#1007"
 ```
 
-DynamoDB hashes the PK into its [managed partition space](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.Partitions.html).
-Items with the same PK form a logical item collection, while the SK orders query results inside that collection.
-
-A `Query` for `CUSTOMER#A` therefore returns `ORDER#1007`, `ORDER#1011`, and `ORDER#1042` in SK order.
+Every `CUSTOMER#A` order lands in the [same partition](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.Partitions.html), so a `Query` for `CUSTOMER#A` returns `ORDER#1007`, `ORDER#1011`, and `ORDER#1042` in SK order.
 It can narrow that range or reverse it, but the ordering field is still `OrderID`.
 
 That key serves the original lookup, but the history screen needs a different ordering within the same customer.
@@ -96,7 +110,7 @@ Every timestamp uses the same fixed-width UTC form and the IDs exclude `|`.
 Those encoding rules preserve chronological byte order and prevent two component tuples from producing the same scalar key.
 
 The writer stores `OrderDateKey` with each order because DynamoDB does not derive index keys from other fields.
-A Local Secondary Index keeps `CustomerID` as the PK and uses this attribute as a second SK:
+An LSI keeps `CustomerID` as the PK and uses this attribute as a second SK:
 
 ```text
 Base table, Customer A
@@ -125,8 +139,7 @@ sorted by OrderDateKey
 The LSI can query `CUSTOMER#A` in descending SK order and stop after 20 items.
 No application-side sort or read of the customer's full history is needed.
 
-"Local" describes the storage boundary.
-Sharing the table's item collection enables strong reads and imposes two constraints:
+Sharing the table's item collection is what lets an LSI serve strong reads, and it imposes two constraints:
 
 - The LSI must be declared with the table and cannot be added or deleted later.
 
@@ -142,7 +155,7 @@ Neither the table nor the LSI has `Status` as its PK, leaving a [`Scan`](https:/
 A scan reads items before applying its filter.
 Returning ten pending orders can therefore consume reads for thousands of shipped and cancelled orders.
 
-A Global Secondary Index creates another key space:
+A GSI creates another key space:
 
 ```text
 GSI PK: Status
@@ -168,7 +181,7 @@ PENDING / 07-25 / A / 1042
 ```
 
 The queue queries the GSI with `Status = PENDING` in descending SK order and stops at its page limit.
-"Global" does not remove the need for a partition key because every GSI query still supplies the index PK.
+A GSI still reads from one PK per query, so the index needs a PK value even though it spans every customer.
 
 DynamoDB updates the GSI [asynchronously](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GSI.html) after the table write, so GSI reads are eventually consistent.
 Its separate partition space lets the index be added or deleted later and removes the LSI-specific 10 GB item-collection limit.
@@ -188,83 +201,6 @@ The LSI and GSI serve similar-looking queries, but they make different storage a
 | Read consistency | Eventual or strong | Eventual only |
 | Size boundary | 10 GB per table-PK item collection | No LSI-style 10 GB limit |
 | Capacity | Uses table capacity | Scales and meters separately |
-
-## The same reads in PostgreSQL and MySQL
-
-PostgreSQL and MySQL separate the query from the access path.
-For these reads, the useful B-tree order starts with the equality predicate and continues with the requested sort.
-
-The same key definitions run on PostgreSQL 18 and MySQL 8.4:
-
-```sql
-ALTER TABLE orders
-    ADD PRIMARY KEY (
-        customer_id,
-        order_id
-    );
-
-CREATE INDEX orders_by_customer_date
-    ON orders (
-        customer_id,
-        order_date DESC,
-        order_id DESC
-    );
-
-CREATE INDEX orders_by_status_date
-    ON orders (
-        status,
-        order_date DESC,
-        customer_id DESC,
-        order_id DESC
-    );
-```
-
-The three reads also use the same SQL in both engines:
-
-```sql
--- One known order
-SELECT
-    order_id,
-    order_date,
-    status,
-    total_amount
-FROM orders
-WHERE customer_id = 'CUSTOMER#A'
-  AND order_id = 'ORDER#1007';
-
--- One customer's newest orders
-SELECT
-    order_id,
-    order_date,
-    status,
-    total_amount
-FROM orders
-WHERE customer_id = 'CUSTOMER#A'
-ORDER BY
-    order_date DESC,
-    order_id DESC
-LIMIT 20;
-
--- Newest pending orders
-SELECT
-    customer_id,
-    order_id,
-    order_date,
-    total_amount
-FROM orders
-WHERE status = 'PENDING'
-ORDER BY
-    order_date DESC,
-    customer_id DESC,
-    order_id DESC
-LIMIT 20;
-```
-
-The customer/date index resembles the LSI because the grouping remains one customer, while the status/date index resembles the GSI because `status` becomes the leading lookup value.
-That comparison ends at the access pattern because SQL lets the optimizer choose an index, while a DynamoDB request targets the table or a named index and supplies its PK.
-
-[PostgreSQL multicolumn B-trees](https://www.postgresql.org/docs/current/indexes-multicolumn.html) favor constraints on leading columns, while [MySQL composite indexes](https://dev.mysql.com/doc/refman/8.4/en/multiple-column-indexes.html) use their leftmost prefixes for lookups.
-The complete seeded [PostgreSQL 18 script](https://github.com/schew2381/schew2381.github.io/blob/main/examples/dynamodb-keys/postgresql.sql) and [MySQL 8.4 script](https://github.com/schew2381/schew2381.github.io/blob/main/examples/dynamodb-keys/mysql.sql) are on GitHub.
 
 ## When one status gets busy
 
