@@ -1,5 +1,5 @@
 ---
-title: "(Pt. 4 Postgres vs MySQL) Page Splits, TOAST, and UUIDs"
+title: "(Pt. 4) Postgres vs MySQL: Page Splits, TOAST, and UUIDs"
 date: 2026-07-26 09:45:00 -0700
 categories: [databases, internals]
 tags: [postgres, mysql, innodb, toast, uuid]

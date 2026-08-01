@@ -1,5 +1,5 @@
 ---
-title: "(Pt. 2 Postgres vs MySQL) MVCC + Vacuum vs Undo Log"
+title: "(Pt. 2) Postgres vs MySQL: MVCC + Vacuum vs Undo Log"
 date: 2026-07-26 09:15:00 -0700
 categories: [databases, internals]
 tags: [postgres, mysql, innodb, mvcc, vacuum]

@@ -1,5 +1,5 @@
 ---
-title: "(Pt. 3 Postgres vs MySQL) HOT Updates"
+title: "(Pt. 3) Postgres vs MySQL: HOT Updates"
 date: 2026-07-26 09:30:00 -0700
 categories: [databases, internals]
 tags: [postgres, mysql, mvcc, hot, index]

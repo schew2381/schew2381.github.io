@@ -1,5 +1,5 @@
 ---
-title: "(Pt. 1 Postgres vs MySQL) Clustered Index vs Heap"
+title: "(Pt. 1) Postgres vs MySQL: Clustered Index vs Heap"
 date: 2026-07-26 09:00:00 -0700
 categories: [databases, internals]
 tags: [postgres, mysql, innodb, index, storage]

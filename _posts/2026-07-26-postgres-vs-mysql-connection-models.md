@@ -1,5 +1,5 @@
 ---
-title: "(Pt. 5 Postgres vs MySQL) Connections, Processes vs Threads"
+title: "(Pt. 5) Postgres vs MySQL: Connections, Processes vs Threads"
 date: 2026-07-26 10:00:00 -0700
 categories: [databases, internals]
 tags: [postgres, mysql, connections, processes, threads]
