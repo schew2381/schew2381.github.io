@@ -12,15 +12,17 @@ tags: [csi, performance, caching, prefetch, s3, mincore]
 > 4. Node caches and startup hot sets (this post)
 {: .prompt-info }
 
-Lazy block fetch makes a mount instant and moves the cost to the first read. Two changes to sandbox-blockstore went after that cost from opposite directions: share the fetched bytes between Pods on a node, and fetch the right bytes before anyone asks.
+A Pod in the warm pool passed its readiness probe, sat there reporting `Ready`, and then took 59.3 seconds to answer its first `git status`.
 
-The second one started from a warm-pool Pod that Kubernetes reported as `Ready` and on which the first `git status` took 59.3 seconds.
+Nothing was broken. That's the part worth sitting with. Lazy block fetch works exactly as designed, and what it does is move the cost out of the mount and into the first read, which is great right up until the first read is the one a user is waiting on.
+
+Two changes went after that cost from opposite ends. One shares fetched bytes between Pods on a node, so the second Pod doesn't repay what the first one already paid. The other fetches the right bytes before anybody asks for them. Neither one subsumes the other, and the reason is more interesting than either change.
 
 ## Where the time actually went
 
-A warm-pool Pod passes its readiness probe once the volume is mounted and the container is up, which takes well under a second because the mount is only a header read. Nothing in that readiness signal knows whether a single byte of file content is on the node.
+Readiness is the trap. A warm-pool Pod passes its probe once the volume is mounted and the container is up, and Part 3's mount is a header read plus some local setup, so that happens in well under a second. Nothing in that signal has any opinion about whether a single byte of file content is on the node, because from kubelet's point of view the volume is mounted and the filesystem is there.
 
-So the Pod sat there `Ready`, and then a real request arrived:
+Then a real request arrives:
 
 ```text
 git status over 62,115 index entries
@@ -32,11 +34,11 @@ git status over 62,115 index entries
                                                  S3 range GET
 ```
 
-The read pattern is thousands of small reads scattered across the image, and every one that lands in an unfetched chunk blocks on a round trip. `Ready` was true and the Pod was useless for a minute.
+62,115 index entries, each one a `stat` and often a read, scattered across an 8 GiB image with no locality worth speaking of. Every read landing in an unfetched chunk blocks on a round trip to object storage. So `Ready` was true, the health checks were green, and the Pod was useless for a minute.
 
 ## Change one: share the cache across Pods
 
-[PR #52](https://github.com/Greenbax/sandbox-blockstore/pull/52) added the node-shared read cache whose mechanics are in Part 3. What's left is what it bought.
+The first change is the node-shared read cache. Part 3 covers its mechanics, so what's left is what it bought.
 
 The premise is that the read side stays byte-identical to S3 for a volume's whole life, so N Pods on one template can point at one cache file:
 
@@ -50,7 +52,7 @@ The premise is that the read side stays byte-identical to S3 for a volume's whol
   3 copies, 3x the GETs                 1 copy, only the first Pod pays
 ```
 
-The second Pod on a template reads from local disk what the first Pod paid an S3 round trip for. Measured across a full development environment startup, empty node cache against populated:
+Which means the second Pod on a template reads from local disk what the first Pod paid a round trip for. Here's a full development environment startup measured twice, once on an empty node cache and once on a populated one:
 
 | Phase | Empty | Populated | Saved | Improvement |
 |---|---|---|---|---|
@@ -60,24 +62,19 @@ The second Pod on a template reads from local disk what the first Pod paid an S3
 | Final dev sync | 2.726s | 1.265s | 1.461s | 53.59% |
 | **Total startup** | **52.009s** | **30.651s** | **21.358s** | **41.07%** |
 
-The phases, in order:
+Those phases, in order, are the sentinel wait blocking until the CSI-mounted codebase is readable, then a concurrent stretch installing Claude plugins while PostgreSQL, Redis, and OpenSearch come up, then whatever's left of PostgreSQL and OpenSearch finishing, then a final sync rechecking the toolchain, dependencies, generated files, and the step cache.
 
-1. Mount sentinel wait blocks until the CSI-mounted codebase is readable.
-2. Plugins and services install Claude plugins while PostgreSQL, Redis, and OpenSearch start.
-3. Remaining service wait is mostly PostgreSQL and OpenSearch finishing.
-4. Final dev sync rechecks the toolchain, dependencies, generated files, and the step cache.
+The sentinel wait is the row that explains the rest. It goes from 1.182s to 0.010s, because that phase is nothing but first-read latency and there's no first read left to pay for. Every other row is the same effect diluted by however much real CPU work that phase also happens to do.
 
-The sentinel wait dropping from 1.182s to 0.010s is the shape of the whole result. That phase is pure first-read latency, and with the chunks already local there's nothing left to wait for.
+Nothing about the workload changed between the two columns. Same bytes, same order, same everything. 21 of those 52 seconds were one Pod refetching what another Pod on the same machine already had sitting on local disk.
 
-Nothing about the workload changed between the two columns. The same bytes get read in the same order, and 21 seconds of it was one Pod refetching what another Pod on the same node already had.
-
-It shipped default-off behind `--shared-read-cache`, which is the right call for a change that introduces cross-Pod sharing of an mmap'd file.
+It shipped default-off behind `--shared-read-cache`, which was the right call. Cross-Pod sharing of an mmap'd file is exactly the kind of change where the failure mode is subtle and the blast radius is every Pod on the node.
 
 ## Change two: fetch the startup set before the Pod is Ready
 
-Sharing helps the second Pod. The first one still pays, and on a fresh node every Pod is the first one.
+Sharing fixes the second Pod. The first one still pays in full, and on a freshly scaled-up node every Pod is the first one, which is also precisely when a burst of Pods is arriving.
 
-[PR #56](https://github.com/Greenbax/sandbox-blockstore/pull/56) went at it from the other side. The set of chunks that `git status` touches is a property of the template rather than of the Pod, so it can be recorded once at build time and fetched during the mount.
+The second change comes at it from the other side, and it starts from noticing who the read set actually belongs to. What `git status` touches isn't a fact about this Pod or this request. It's a fact about the template's contents, fixed at build time, identical for every Pod that ever boots from it. So record it once, and prefetch it during the mount:
 
 ```text
 phase 1  at template build time
@@ -102,7 +99,9 @@ phase 2  at mount time on a warm node
 
 ### Recording it
 
-The recording pass runs in `template-builder` under `--record-startup-hotset`. It measures which parts of the *backing file* a workload touched by reading the kernel's own page-cache accounting, which means the answer comes from the same layer that will later serve the chunks.
+The obvious way to record a read set is to trace the workload: `strace`, or an eBPF probe on `read`, or instrumenting the chunker itself. All of those tell you which file offsets the application asked for, which is not the question. The question is which 4 MiB chunks of the backing file the driver will have to fetch, and getting from one to the other means reimplementing ext4's block allocation in your head.
+
+So the recording pass in `template-builder`, under `--record-startup-hotset`, asks the kernel instead. Run the workload through a loop mount and then ask the page cache which pages of the backing file are resident. Whatever it says is, by construction, exactly what the read path touched.
 
 ```text
 1. cp -a the source tree into the image through a loop mount
@@ -114,13 +113,13 @@ The recording pass runs in `template-builder` under `--record-startup-hotset`. I
 7. resident pages ──> deduplicated 4 MiB chunk offsets
 ```
 
-Two details make the measurement valid.
+The whole measurement rests on the page cache telling the truth, and two things can make it lie.
 
-The loop device has to be opened with `losetup --direct-io=off`, because direct I/O bypasses the page cache and leaves `mincore` reporting nothing. Buffered I/O is what makes the page cache reflect what the workload actually read.
+The loop device has to be opened with `losetup --direct-io=off`. Direct I/O skips the page cache entirely, so `mincore` sees nothing resident and the recording pass cheerfully produces an empty hot set from a workload that read half the image. Buffered I/O is what makes the page cache a record of anything at all.
 
-The eviction in step 4 has to actually land. `prepareColdBackingFile` retries three times and hard-errors if pages stay resident, since a half-cold file produces a hot set missing whatever was still cached. An empty hot set is a hard error too, rather than a manifest with no offsets in it.
+Step 4's eviction has to actually land, which sounds like a formality and isn't. `prepareColdBackingFile` retries three times and hard-errors if pages stay resident, because a file that's still half warm produces a hot set missing precisely the chunks that were already cached, which are usually the important ones. An empty result is a hard error too. Better to fail the build than to publish a manifest that prefetches nothing and looks like it's working.
 
-`residentPagesToOffsets` maps resident 4 KiB pages to chunk offsets, requires that the chunk size be a multiple of the page size, validates the page count against the mapping length, and deduplicates. The manifest is small: a set of 4 MiB offsets, not a list of pages.
+`residentPagesToOffsets` does the arithmetic from resident 4 KiB pages to 4 MiB chunk offsets, and it's defensive about it: chunk size has to be a multiple of page size, the page count has to match the mapping length, and offsets get deduplicated. The output is small, a set of chunk offsets rather than a list of pages, which is why the manifest stays a few kilobytes on a multi-gigabyte image.
 
 ```go
 type StartupHotset struct {
@@ -132,17 +131,16 @@ type StartupHotset struct {
 	Offsets      []int64
 }
 ```
-[startup_hotset.go:15](https://github.com/Greenbax/sandbox-blockstore/blob/2dc807753ae83288019936ac5740d60586a4778d/pkg/storage/startup_hotset.go#L15)
 
-`ParseStartupHotset` cross-checks the build ID, the header digest, and the image size against the header the driver just read. A manifest recorded against a different build of the same template is rejected rather than used to prefetch offsets that mean something else.
+Three of those six fields exist only to catch a mismatch. `ParseStartupHotset` checks the build ID, the header digest, and the image size against the header the driver just read, and rejects the manifest if any of them disagree. Same reasoning as the shared cache key from Part 3: a manifest recorded against a different build of the same template contains offsets that mean something else now, and prefetching them wastes GETs on chunks nobody wants.
 
 ### Prefetching it
 
-At mount time, `prefetchStartupHotset` runs between building the read device and building the write overlay, so it finishes before the NBD device exists and before anything can read.
+Where the prefetch sits in the mount matters more than how it works. `prefetchStartupHotset` runs as phase 5 of Part 3's eight, between building the read device and building the write overlay, which means it finishes before the NBD device exists. There's no window in which the Pod can read and no window in which a demand read can arrive, because the block device the demand read would come through hasn't been created yet.
 
-`PrefetchStartupOffsets` refuses to run once the chunker has started serving, since prefetching alongside demand reads means competing for the same S3 connections against a reader that's blocking a real process.
+`PrefetchStartupOffsets` enforces that directly, refusing to run at all once the chunker has started serving. Otherwise a prefetch competes for S3 connections against a reader that has a real process blocked on it, and losing that race to your own optimization is a bad way to spend an afternoon.
 
-Ranges get planned before any fetch:
+Planning happens before any fetch goes out:
 
 ```text
 hot set offsets (4 MiB chunks, sorted)
@@ -156,19 +154,21 @@ coalesced into ranges, capped at maxRangeBytes
   one GET          one GET             one GET
 ```
 
-`prefetchRanges` sorts and compacts the offsets, skips chunks already cached (which is the common case on a warm node with a populated shared cache), and coalesces adjacent chunks up to `maxRangeBytes`. Concurrency is a weighted semaphore where each range's weight is its chunk count, so the in-flight byte total is bounded rather than the request count:
+`prefetchRanges` sorts and compacts the offsets, drops anything already cached, and coalesces what's left into contiguous ranges up to `maxRangeBytes`. That skip step is where the two changes meet: on a warm node with a populated shared cache, most of the hot set is already there and the prefetch turns into almost nothing.
+
+Concurrency is a weighted semaphore with each range's weight being its chunk count, which bounds bytes in flight rather than requests in flight:
 
 ```go
 effectiveMaxRangeBytes := min(maxRangeBytes, int64(concurrency)*storage.MemoryChunkSize)
 ```
 
-Production runs 16 permits with a 4 MiB range cap, so 64 MiB in flight. The plan is logged before it executes, which means a slow prefetch is diagnosable from the log rather than by guessing.
+Bounding requests would let 16 permits mean 16 MiB or 16 GiB depending on how well the offsets happened to coalesce. Production runs 16 permits against a 4 MiB range cap, so 64 MiB in flight, and the plan gets logged before it executes so a slow prefetch is a log line rather than a mystery.
 
-Every fetched chunk goes through `commitChunk`, so a prefetch on a shared cache persists into the state file and survives a daemon restart. Prefetch is also single-flighted per device: a second volume mounting the same template while a prefetch is in flight waits for it and reports `Reused` rather than starting its own.
+Two smaller behaviors make it compose with Part 3. Prefetched chunks go through `commitChunk` like any other, so they land in the state file and survive a daemon restart. And prefetch is single-flighted per device, so a second volume mounting the same template mid-prefetch waits on the one already running and reports `Reused` instead of starting a duplicate.
 
-### The request-count effect
+### Where the 512 KiB batch backfires
 
-The 512 KiB read batch from Part 3 unblocks readers early, which is good for latency and bad for request count when the whole chunk is going to be read anyway:
+Part 3 raised the read batch to 512 KiB to unblock waiting readers sooner. That's the right trade when a reader is blocked. It's the wrong trade when nobody is:
 
 ```text
 before  demand-read one 4 MiB chunk
@@ -178,11 +178,9 @@ now     prefetch one 4 MiB chunk
         1 x 4 MiB GetObject
 ```
 
-The prefetch path knows up front that it wants the entire chunk, so it opens one range reader and fills each chunk with `io.ReadFull`. Eight round trips become one, and the bytes land before anything needs them.
+A demand read doesn't know how much of the chunk anyone will want, so batching in 512 KiB pieces is the only way to release readers early. A prefetch knows it wants the whole chunk, because that's what a hot set entry means, so it opens one range reader and fills the chunk with `io.ReadFull`. Eight round trips collapse into one, and this is the case where knowing the future is worth more than reacting quickly to the present.
 
 ### Numbers
-
-From the PR:
 
 | Scenario | Before | After | Improvement |
 |---|---|---|---|
@@ -191,17 +189,17 @@ From the PR:
 | Ordinary demand read | 10.94s | 9.18s | 16.1% |
 | Ready-Pod Claude first turn | 56.8s | 4.9-7.2s | 87-91% |
 
-The last row is what motivated the work. A Pod that Kubernetes called `Ready` took 56.8 seconds to answer its first request and now takes 5 to 7.
+The last row is the one the work was for. 56.8 seconds down to 5 to 7, on a Pod that Kubernetes had already been calling `Ready` the whole time.
 
-The ordinary demand read improving by 16% is a side effect. Those reads aren't in the hot set, and they still benefit from the larger effective range size and from chunks the prefetch happened to cover on its way to something else.
+Row three is a freebie nobody designed for. Ordinary demand reads aren't in the hot set at all, and they still got 16% faster, partly from the larger effective range size and partly from chunks the prefetch swept up on its way to something adjacent.
 
-The PR is explicit about what it didn't measure, which is worth copying as a habit. There are no numbers for a cold node with no shared cache, for the aggregate S3 request-count reduction, or for what the prefetch costs mount latency when the hot set is large.
+What's missing from that table is worth saying out loud. There are no numbers for a cold node with no shared cache, none for the aggregate reduction in S3 requests, and none for what the prefetch costs mount latency once a hot set gets large. The last gap is the uncomfortable one, since it's the failure mode the change most plausibly has.
 
-Rollout was three ordered steps: the driver change, then the environment enabling the manifest, then the node config raising concurrency to 16 permits with a 4 MiB cap and the daemon memory limit to 10 GiB. Shipping all three together would have meant a regression with three candidate causes.
+Rollout went in three ordered steps: the driver change, then the environment enabling the manifest, then the node config raising concurrency to 16 permits with the 4 MiB cap and lifting the daemon memory limit to 10 GiB. Shipping all three at once would have meant any regression had three candidate causes and no way to bisect between them.
 
 ## How the two changes compose
 
-They cover different cases, and neither one subsumes the other.
+Neither change subsumes the other, and the reason is that they answer different questions. The shared cache answers "has anyone on this node already fetched this," which is a question with no useful answer on a fresh node. The hot set answers "what is this template about to need," which has the same answer everywhere and is worth the least when the cache is already full of it.
 
 ```text
                               cold node             warm node
@@ -213,9 +211,9 @@ first Pod on a template       prefetch pays the     prefetch mostly skips,
 later Pods on that template   shared cache hit      shared cache hit
 ```
 
-The shared cache turns "every Pod pays" into "the first Pod pays." The hot set moves what the first Pod pays out of the critical path and into the mount. On a warm node the prefetch finds most chunks already cached and does almost nothing, which is the case where the shared cache has already won.
+Read down the columns and the coverage is clean. The shared cache turns "every Pod pays" into "the first Pod pays," and the hot set takes what the first Pod pays and moves it out of the critical path into the mount, where nobody is waiting on a response yet.
 
-The startup hot set also has a second-order effect on the shared cache: it populates it in a predictable order, so the first Pod on a node warms exactly the chunks the next Pod is going to need rather than whatever its own workload happened to touch.
+There's a second-order effect that only shows up when both are on. The prefetch populates the shared cache in a predictable order, so the first Pod on a node warms exactly the chunks the next Pod will want, rather than whatever its own particular workload wandered into. The shared cache gets better at its job because something else decided what to put in it.
 
 ## Trade-offs
 
@@ -227,8 +225,8 @@ The startup hot set also has a second-order effect on the shared cache: it popul
 | Failure mode | Cache miss, refetch | Prefetch skipped, demand reads as before |
 | Tuning | Watermarks and idle TTL | Concurrency and range cap |
 
-The hot set's real weakness is that it's a recording of one workload. It was recorded from `git status`, so it prefetches what `git status` reads. A Pod whose first action is something else pays for chunks it doesn't need and still misses on the ones it does. Widening the recording to cover more startup paths grows the manifest and the prefetch time, and at some point prefetching the whole image is cheaper than being clever about which part.
+The hot set's weakness is that it's a recording of one workload, and it's honest about being one. It was recorded from `git status`, so it prefetches what `git status` reads. Start a Pod that does something else first and it pays mount latency for chunks it will never touch, then misses on the ones it needs. Widening the recording to cover more startup paths is possible, and every path you add grows the manifest and the prefetch. Push that far enough and you've reinvented downloading the image, at which point Part 1's whole premise was wrong.
 
-The shared cache's weakness is coupling. One mmap'd file behind N Pods means a corrupt cache file, a full disk, or an eviction at the wrong moment affects all of them. The key's header digest rules out the worst case (two volumes reading each other's data through mismatched mappings), and the rest is contained by watermarks and by the state file's whole-chunk-only rule.
+The shared cache's weakness is coupling, which is what you buy when you point twenty Pods at one file. A corrupt cache file, a full disk, or an eviction at an unlucky moment reaches all of them at once. The header digest in the key rules out the genuinely bad case where two volumes read each other's data through mismatched mappings, and the rest is bounded rather than prevented: watermarks keep the disk from filling, and the state file's whole-chunk-only rule keeps a torn write from being trusted.
 
-Both changes rest on one property from Part 1: the read side never changes. That's what makes a chunk fetched for one Pod valid for another, what makes a page-cache recording from build time valid at mount time, and what makes a cache file safe to hand to a process that has no idea another one already filled it.
+Both changes rest on the same property from Part 1, which is that the read side never changes. That's what makes a chunk fetched for one Pod valid for another, what makes a page-cache recording from build time still valid at mount time on a different machine a week later, and what makes it safe to hand a cache file to a process that has no idea some other process already filled it. Everything in this series is downstream of one immutable read path, and the parts that were hard were all on the other side of the overlay.
