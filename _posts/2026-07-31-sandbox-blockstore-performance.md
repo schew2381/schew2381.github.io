@@ -151,10 +151,13 @@ hot set offsets (4 MiB chunks, sorted)
 coalesced into ranges, capped at maxRangeBytes
 
   [0..12)          [20..36)            [48..52)
-  one GET          one GET             one GET
+  one reader       one reader          one reader
+  3 chunks         4 chunks            1 chunk
 ```
 
 `prefetchRanges` sorts and compacts the offsets, drops anything already cached, and coalesces what's left into contiguous ranges up to `maxRangeBytes`. That skip step is where the two changes meet: on a warm node with a populated shared cache, most of the hot set is already there and the prefetch turns into almost nothing.
+
+Each range opens one reader and still walks it a chunk at a time, because completion is recorded per 4 MiB chunk and a range that dies halfway should leave behind the chunks it did finish rather than nothing.
 
 Concurrency is a weighted semaphore with each range's weight being its chunk count, which bounds bytes in flight rather than requests in flight:
 
@@ -168,17 +171,24 @@ Two smaller behaviors make it compose with Part 3. Prefetched chunks go through 
 
 ### Where the 512 KiB batch backfires
 
-Part 3 raised the read batch to 512 KiB to unblock waiting readers sooner. That's the right trade when a reader is blocked. It's the wrong trade when nobody is:
+Part 3's 512 KiB read batch exists to wake a blocked reader sooner. A prefetch has no reader to wake, so every notify cycle it pays for is wasted:
 
 ```text
-before  demand-read one 4 MiB chunk
-        ~8 x 512 KiB GetObject
+ONE 4 MiB CHUNK, ONE OPEN GetObject
 
-now     prefetch one 4 MiB chunk
-        1 x 4 MiB GetObject
+  DEMAND READ                          PREFETCH
+
+  ├─ read 512 KiB → lock, notify       └─ io.ReadFull(4 MiB)
+  ├─ read 512 KiB → lock, notify
+  ├─ ... 8 batches
+  └─ done
+
+  8 notify cycles, readers freed early  1 read, nobody waiting
 ```
 
-A demand read doesn't know how much of the chunk anyone will want, so batching in 512 KiB pieces is the only way to release readers early. A prefetch knows it wants the whole chunk, because that's what a hot set entry means, so it opens one range reader and fills the chunk with `io.ReadFull`. Eight round trips collapse into one, and this is the case where knowing the future is worth more than reacting quickly to the present.
+A demand read has no idea how much of the chunk anyone wants, so cutting the fetch into pieces is the only way to release readers early. A prefetch knows it wants all 4 MiB, because that's what being in the hot set means, so it reads straight through with `io.ReadFull`.
+
+Both paths are one GET. The reader stays open across batches and only reopens at a mapping boundary, so the batching never controlled the request count. What the prefetch skips is the eight rounds of taking the session lock and walking the waiter list to find nobody there.
 
 ### Numbers
 

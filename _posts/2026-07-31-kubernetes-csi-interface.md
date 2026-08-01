@@ -109,7 +109,23 @@ without staging (one volume, one Pod)
 
 The division is about cost. Staging is the expensive half that should happen once per node, formatting the disk and running `fsck` and mounting it. Publishing is a bind mount, which is nearly free, and it happens once per Pod.
 
-Opting out is a matter of leaving `STAGE_UNSTAGE_VOLUME` out of `NodeGetCapabilities`, after which kubelet skips both staging calls entirely. For a volume that belongs to exactly one Pod there's nothing to share, so staging would buy an extra mount layer and two more RPCs that can fail. Part 3's driver takes this path.
+Opting out is a matter of leaving `STAGE_UNSTAGE_VOLUME` out of `NodeGetCapabilities`, after which kubelet skips both staging calls. Part 3's driver leaves it out, and the reason is worth being precise about, because "it shares nothing" would be false there. It shares plenty. Twenty Pods on one template read from one cache file on the node.
+
+Staging can't express that sharing, though, for two separate reasons.
+
+The first is that staging is keyed by volume ID, and those twenty Pods have twenty different volume IDs. `NodeStageVolume` gets called once per volume per node, not once per thing-the-volumes-have-in-common, so kubelet would stage twenty times and dedupe nothing. The sharing is keyed by template build ID and header digest, which is a fact about the contents that Kubernetes has no vocabulary for.
+
+The second is that kubelet doesn't offer the choice at all here. Staging only exists on the PVC path:
+
+```go
+if volumeLifecycleMode == storage.VolumeLifecycleEphemeral {
+	klog.V(5).Info(log("plugin.CanDeviceMount skipped ephemeral mode detected for spec %v", spec.Name()))
+	return false, nil
+}
+```
+[csi_plugin.go:706](https://github.com/kubernetes/kubernetes/blob/v1.33.10/pkg/volume/csi/csi_plugin.go#L706)
+
+For an ephemeral inline volume, `CanDeviceMount` returns false and the staging machinery never engages. The `STAGE_UNSTAGE_VOLUME` check in `csi_mounter.go` sits inside a `pvSrc != nil` branch, so a driver advertising the capability would be advertising it to nobody. Declaring it would be a lie that costs nothing and clarifies nothing, so the driver doesn't.
 
 ## Idempotency is the contract
 
