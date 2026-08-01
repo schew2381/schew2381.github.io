@@ -12,11 +12,11 @@ tags: [csi, kubernetes, nbd, block-storage, s3, e2b, ext4]
 > 4. [Optimizing startup performance](/posts/sandbox-blockstore-performance/)
 {: .prompt-info }
 
-Parts 1 and 2 are the two halves. E2B fetches block storage lazily out of S3, and CSI is how Kubernetes asks for a volume. Bolting them together gives you a driver where a Pod names a template build ID and gets back a writable ext4 mount over a multi-gigabyte image that never gets downloaded.
+Parts 1 and 2 are the two halves of this. Bolt them together and a Pod names a template build ID in its own spec, then gets back a writable ext4 mount over a multi-gigabyte image nobody ever downloads.
 
-One substitution does most of the work. E2B serves its block device to a Firecracker guest kernel, and here it goes to the host kernel instead. Same headers, same chunker, same copy-on-write overlay, all of it unchanged.
+One substitution does most of the work. E2B serves its block device to a Firecracker guest kernel, and we serve the same device to the host kernel instead. Headers, chunker, overlay: all of Part 1 comes over untouched.
 
-That one change is also where the trouble starts. The kernel doing the I/O is now the kernel the driver itself runs on, and the section on which kernel holds the dirty pages works through what that costs.
+That substitution is also where the trouble starts, because the kernel doing the I/O is now the kernel the driver itself runs on. There's a whole section below on what that costs.
 
 ## Overview
 
@@ -54,9 +54,9 @@ ONE NODE, THREE PODS ON THE SAME TEMPLATE
                    └──────────────────┘
 ```
 
-Three write caches, one read cache, one process, and the node is where the S3 traffic happens. Pod A writing a file dirties a page in write cache A and nothing else moves. Pod A reading a block nobody has fetched yet pulls the whole surrounding 4 MiB chunk, and pods B and C get every block in that chunk for free from then on.
+Three write caches and one read cache, all inside one process, and the node is where every S3 request originates. Pod A writing a file dirties a page in write cache A and nothing else on the node moves. Pod A reading a block nobody has fetched yet drags in the whole surrounding 4 MiB chunk, and from then on pods B and C get every block in that chunk for free.
 
-Which is what the split in Part 1 was for. Reads are shareable because the read side never diverges from S3, so the expensive resource lives at node scope while the mutable one stays per pod. Everything from `overlay` down is Part 1 unchanged. Everything above it is new: the CSI driver, an NBD server, and a mount lifecycle that has to survive kubelet retrying it.
+That asymmetry is exactly what Part 1's overlay split was worth. The expensive resource is shareable because the read side never diverges from S3, so it lives at node scope, while the mutable one stays private per pod. Everything from `overlay` down is Part 1 unchanged, and everything above it is new: a CSI driver, an NBD server, and a mount lifecycle that has to survive kubelet retrying it at any point.
 
 ## What the driver actually implements
 
@@ -75,7 +75,7 @@ type Mounter interface {
 
 That's the seam. Kubernetes above it, Part 1 below it, and the driver's job is translating one vocabulary into the other.
 
-The refusals are the interesting half. `NodePublishVolume` rejects Block volume capabilities, any access mode other than `SINGLE_NODE_WRITER`, and read-only requests, and each one is a promise the storage layer underneath can't keep. There's no raw-block path at all. A shared-writer mode would mean two Pods on one private write cache, diverging quietly. Read-only can't be honored either, since the overlay always builds a write cache, so accepting the request would mean handing back a writable mount with a read-only label on it.
+The refusals are the interesting half, since each one is a promise the storage layer underneath can't keep. `NodePublishVolume` turns down raw Block capabilities, because there's no raw-block path to hand anyone. It turns down every access mode except `SINGLE_NODE_WRITER`, because a shared writer would put two Pods on one private write cache and let them diverge without either noticing. And it turns down read-only requests, because the overlay builds a write cache no matter what, so saying yes would mean returning a writable mount wearing a read-only label.
 
 What survives all that is short. `templateBuildID` has to be in the `VolumeContext`, `checkpointInterval` is optional and goes through `time.ParseDuration`, and then `Mount` runs.
 
@@ -135,6 +135,7 @@ E2B                                    THIS DRIVER
         ▼
   Firecracker process
     holds /dev/nbd0 open as a file
+        │  ordinary reads and writes on that fd
 ════════│═══════════════════════       ══════════════════════════════
   host kernel                            host kernel
     /dev/nbd0, nothing mounted             ext4 on /dev/nbd7
@@ -149,7 +150,24 @@ E2B                                    THIS DRIVER
 
 The dirty pages moved from a box that dies on its own into the same kernel the driver depends on, and that's the whole difference.
 
-E2B gets to be careless in a way this driver can't. Kill the VM and the guest's ext4 and its page cache go with it, so there's nothing left holding a reference to `/dev/nbd0` and the storage teardown can happen whenever. Pausing is even better: guest RAM *is* the memfile, so a page that was dirty and unflushed gets snapshotted in that state and comes back that way.
+E2B gets to be careless in a way this driver can't. Kill the VM and the guest's ext4 goes with it, page cache included, so nothing is left holding a reference to `/dev/nbd0` and teardown can happen whenever it likes. Pausing is better still, because guest RAM *is* the memfile:
+
+```text
+  PAUSING AN E2B SANDBOX
+
+  guest page cache        ┐
+    dirty page for        │  all of this is just guest RAM,
+    block 5, unflushed    │  and guest RAM is the memfile
+  guest ext4 metadata     ┘
+        │
+        │  snapshot guest memory to S3
+        ▼
+  memfile in S3           the dirty page is in there, still dirty
+
+  resume ──> guest kernel comes back mid-writeback and finishes the job
+```
+
+Nobody had to flush anything, because the unflushed state was itself the thing that got saved.
 
 Here the dirty pages outlive the thing that would clean them up. A pod's write lands in host ext4's page cache, and its only route to S3 runs through a device the driver is holding open:
 
@@ -177,7 +195,21 @@ Four socket pairs per device, wired up over netlink:
 const connections = 4
 ```
 
-Four and not one, because every cache miss on the other end is an S3 round trip. With one socket the kernel has one request outstanding at a time and a cold `git status` becomes a strictly serial walk through several hundred round trips. Four lets misses overlap.
+Four and not one, because every cache miss on the far end is an S3 round trip and one socket means one request outstanding at a time:
+
+```text
+  ONE SOCKET                             FOUR SOCKETS
+
+  read ──> S3 ──────> done               read ──> S3 ─────> done
+           read ──> S3 ──────> done      read ──> S3 ────> done
+                    read ──> S3 ──> ...  read ──> S3 ──────> done
+                                         read ──> S3 ───> done
+
+  a cold git status walks several         the same misses overlap
+  hundred round trips in series
+```
+
+Four is a guess that held up rather than a tuned number, and it's the kernel's own default for `nbd`.
 
 Each pair gets a dispatch goroutine reading a 28-byte request header off the wire and writing a 16-byte reply, both of which start with a magic number that exists so a desynchronized stream fails loudly rather than reading garbage as an offset:
 
@@ -349,9 +381,41 @@ Everything up to here is machinery. `MountManager.Mount` is the thing that runs 
 8. mount and bind         ext4 at /mnt/sandboxes/<id>, bind to target
 ```
 
-Note what's missing. Nothing in that list transfers the image. Phase 2 fetches a header measured in kilobytes and phases 4 through 8 are all local, which is Part 1's entire argument showing up as a sub-second mount on a multi-gigabyte volume.
+Note what's missing from those eight. Nothing transfers the image:
 
-Phase 8 does two mounts, which looks like one too many. The driver mounts ext4 at its own path under `/mnt/sandboxes/<volume-id>`, then bind-mounts that path onto kubelet's target. The second mount buys independence at teardown: kubelet can call `NodeUnpublishVolume`, get its bind mount removed, retry the call, and none of that forces the driver to disconnect NBD or throw away a write cache holding data that hasn't been exported yet. One mount would tie kubelet's retry loop directly to the lifetime of the block device.
+```text
+  WHERE A MOUNT SPENDS ITS TIME
+
+  phase 1  resolve build     one small S3 GET
+  phase 2  read header       one S3 GET, kilobytes
+  phase 3  decode header     local, microseconds
+  phase 4  read device       local, opens a sparse file
+  phase 5  prefetch          optional, the only phase that moves bulk data
+  phase 6  write overlay     local, truncate + mmap
+  phase 7  open NBD          local, netlink + 4 socket pairs
+  phase 8  mount and bind    local, two mount(2) calls
+
+  total on a warm node: under a second, on an 8 GiB volume
+```
+
+Two small GETs and six local operations, which is Part 1's argument showing up as a sub-second mount on a multi-gigabyte volume.
+
+Phase 8 does two mounts, which looks like one too many until you tear one down. The driver mounts ext4 at its own path under `/mnt/sandboxes/<volume-id>` and then bind-mounts that onto kubelet's target, and the second mount is what lets kubelet's retry loop touch nothing that matters:
+
+```text
+  ONE MOUNT                              TWO MOUNTS
+
+  ext4 ──> kubelet's target path         ext4 ──> /mnt/sandboxes/<id>
+                                                       │  bind
+                                                       ▼
+                                                  kubelet's target path
+
+  unpublish tears down the only          unpublish removes the bind mount.
+  mount there is, so the block           ext4, NBD, and the unexported
+  device has to go with it                write cache all stay put
+```
+
+Kubelet can call `NodeUnpublishVolume`, get its bind mount removed, and retry the call as often as it likes without any of that forcing the driver to disconnect NBD or throw away a write cache holding data that hasn't reached S3 yet.
 
 All eight phases land in one log line as `resolveBuildIDMs`, `headerReadMs`, `headerDecodeMs`, `readDeviceMs`, `startupPrefetchMs`, `writeOverlayMs`, `nbdOpenMs`, `ext4MountMs`, `bindMountMs`, and `totalMs`. That's a small thing that pays for itself the first time a mount takes nine seconds, because the answer is in the log instead of in a profiler you have to attach to a DaemonSet.
 
@@ -388,7 +452,28 @@ phase 3  cleanup      release the read cache lease, delete the write
                       cache, remove mount directories
 ```
 
-The ordering isn't stylistic. Phase 1 has to fully stop the I/O before phase 2 reads the write cache, or the export races the kernel still flushing pages into it. Phase 1 also cancels any periodic checkpoint before it waits, because a checkpoint and a teardown both want the overlay, and an unmount that politely waits its turn blocks for up to a full checkpoint interval.
+The ordering isn't stylistic, and getting it backwards is the failure from the dirty-pages section arriving in code:
+
+```text
+  RIGHT ORDER                            WRONG ORDER
+
+  unmount ext4                           close NBD
+    │  kernel flushes every                │  the far end is gone
+    │  dirty page through NBD              ▼
+    ▼                                    unmount ext4
+  close NBD                                │  writeback gets EIO
+    │  far end is idle now                 ▼
+    ▼                                    ext4 remounts read-only
+  read the write cache                     │
+    │  nothing is still writing            ▼
+    ▼                                    read the write cache
+  export a complete diff                   │  missing every page that
+                                           ▼  hadn't flushed yet
+                                         export uploads it anyway,
+                                         reports success
+```
+
+Phase 1 also cancels any periodic checkpoint before it starts waiting, since a checkpoint and a teardown both want the overlay and an unmount that politely waits its turn can block for a full checkpoint interval.
 
 Phase 2 runs on `context.WithoutCancel`. A snapshot cancelled halfway has done all the work and produced nothing.
 
@@ -509,7 +594,21 @@ Two syscall swaps round it out, and neither is deep. [`sendfile(2)`](https://man
 
 Now the sharing that `DiffStore` used to do comes back, in a form that fits Kubernetes better.
 
-The waste is easy to see once you look at a real node. Twenty Pods on one template, all reading the same `rootfs.ext4`, each with its own private cache file. That's twenty copies of the same bytes on local disk and twenty times the S3 requests to put them there, and every one of those requests is a chunk that some other Pod on the same machine already has.
+The waste is easy to see once you look at a real node running twenty Pods off one template:
+
+```text
+  PRIVATE CACHES                         SHARED CACHE
+
+  Pod A ──> cache A ──> S3                Pod A ──┐
+  Pod B ──> cache B ──> S3                Pod B ──┼──> one cache ──> S3
+  ...                                     ...     │
+  Pod T ──> cache T ──> S3                Pod T ──┘
+
+  20 copies of the same bytes            1 copy
+  20x the GETs to fetch them             only the first Pod pays
+```
+
+Every one of those redundant requests is a chunk some other Pod on the same machine already has on local disk.
 
 Nothing about that is inherent. It's just that E2B's read cache is scoped to a sandbox, and here the read side is byte-identical to S3 for the volume's whole life, which is the property from Part 1 that makes one cache file legal to share. `SharedReadCache` refcounts one file across every volume on the node that resolves to the same build.
 
@@ -574,7 +673,25 @@ shared-<uuid>-<sha256hex>.readcache        sparse, mmap'd, image-sized
 shared-<uuid>-<sha256hex>.readcache.state  96-byte header + 1 byte/chunk
 ```
 
-`commitChunk` writes the completion byte before marking the chunk cached in memory, so the durable record is never behind the in-memory one. On reopen, the header gets validated field by field against what the driver expects, and every completed chunk is replayed into the fresh bitmap:
+`commitChunk` writes the completion byte to disk before marking the chunk cached in memory, which keeps the durable record from ever trailing the in-memory one:
+
+```text
+  DISK FIRST                             MEMORY FIRST
+
+  write completion byte                  set bit in memory
+    │                                      │
+    ▼  crash here                          ▼  crash here
+  set bit in memory                      write completion byte
+
+  on restart: chunk reads as             on restart: chunk reads as
+  present, and it is                     absent, refetched. harmless.
+
+  the bad case is impossible:            ...but during the window, a
+  a byte on disk with no data            reader trusts a bit whose
+  behind it never happens                durable record doesn't exist
+```
+
+On reopen the header gets validated field by field against what the driver expects, and every completed chunk is replayed into a fresh bitmap:
 
 ```go
 if completionState != nil {
@@ -612,7 +729,20 @@ unmount  final export, generation N
 
 The interval resolves through three levels: `checkpointInterval` in the Pod's `volumeAttributes` if it's there, otherwise the daemon's `--checkpoint-interval` (default `1h`), and a negative value turns it off for workloads that genuinely don't care. `beginCheckpoint` bails out if a checkpoint is already running or the volume is tearing down, which is the other half of the interlock from the unmount section.
 
-Every checkpoint mints a build ID and writes a header pointing back through all previous generations, so this is Part 1's diff chain, built one hour at a time instead of one pause at a time. And it accumulates faster than anyone expects. Hourly checkpoints for a week is 168 generations, each one an object a read might have to reach into, which is the point where something has to flatten the chain or reads get slow in a way no amount of caching fixes.
+Every checkpoint mints a build ID and writes a header pointing back through every previous generation, so this is Part 1's diff chain built one hour at a time instead of one pause at a time. It accumulates faster than anyone expects:
+
+```text
+  A WEEK OF HOURLY CHECKPOINTS
+
+  gen 0    base template
+  gen 1    diff ──> 1 object a read might reach into
+  gen 2    diff
+  ...
+  gen 168  diff ──> a cold read now resolves through a mapping
+                    stitched from up to 169 different objects
+```
+
+That's the point where something has to flatten the chain, because no amount of caching fixes a read that has to consult 169 places to find out where a block lives.
 
 ## What a node pays per Pod
 

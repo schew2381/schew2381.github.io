@@ -12,58 +12,68 @@ tags: [e2b, firecracker, nbd, block-storage, s3, copy-on-write]
 > 4. [Optimizing startup performance](/posts/sandbox-blockstore-performance/)
 {: .prompt-info }
 
-A sandbox is supposed to boot in about a second. Its root filesystem is a few gigabytes of ext4 sitting in S3, and there's a guest memory snapshot of similar size behind it. Downloading both before the guest starts costs tens of seconds, and at the end of that the user's code still hasn't run.
+A sandbox is a throwaway Linux box you hand to somebody else's code. An agent clones a repo into it, runs `pip install`, executes whatever it just wrote, and none of that is allowed to reach anything you care about. It also has to be ready more or less now, because there's a user at the other end watching a spinner.
 
-[E2B](https://github.com/e2b-dev/infra) never downloads it. It hands the guest kernel a block device that claims to be the whole image, then fetches 4 MiB pieces the first time something actually reads them. That works because sandboxes barely touch their own disk. A process starts, reads its own binary, pulls in a few libraries, opens some config files, and then mostly idles.
+[E2B](https://github.com/e2b-dev/infra) runs each sandbox as a Firecracker microVM, which covers both of those. Every sandbox gets its own kernel, so the isolation is a hardware boundary rather than a namespace, and Firecracker's [spec](https://github.com/firecracker-microvm/firecracker/blob/main/SPECIFICATION.md) puts at most 125 ms between the start API call and the guest reaching `/sbin/init`. The VM isn't what anyone waits on.
 
-Five pieces make that work: a header that says where bytes live, a data file that holds them, a chunker that fetches in useful sizes, a sparse cache that remembers what arrived, and an overlay that keeps writes away from S3.
+The disk is. A microVM needs a root filesystem to boot from, and E2B's is a few gigabytes of ext4 with a guest memory snapshot of similar size behind it, both sitting in S3. Download them first and that 125 ms boot turns into thirty seconds of network. So E2B doesn't download them. It hands the guest kernel a block device that claims to be the whole image and fetches 4 MiB pieces the first time something reads them, which works because a sandbox barely touches its own disk: a process starts, reads its own binary, pulls in a few libraries, opens some config files, and idles. This post is the storage layer that makes that hold up.
 
 ## Overview
 
+Here's everything one running sandbox touches, from the guest kernel down to object storage. The double lines are address space boundaries, and they're where most of the difficulty in this series lives.
+
 ```text
-Firecracker microVM
-│   guest kernel: runs ext4, owns the dirty page cache
-│   both of them die with the VM
-│
-├─ guest memory ──> UFFD handler ──┐
-│                                  │
-└─ /dev/vda ──────> NBD dispatch ──┤   /dev/vda is the host's /dev/nbd0,
-   virtio-blk                      │   which the host kernel never mounts
-                                   ▼
-                             block.Overlay
-                  ┌────────────────┴────────────────┐
-                  ▼                                 ▼
-        ┌───────────────────┐           ┌───────────────────────┐
-        │ write cache       │           │ read cache            │
-        │ mmap'd sparse     │           │ mmap'd sparse         │
-        │ + dirty bitmap    │           │ + cached bitmap       │
-        └───────────────────┘           └───────────┬───────────┘
-                                                    │  miss
-                                                    ▼
-                                        ┌───────────────────────┐
-                                        │ chunker               │
-                                        │ fetches 4 MiB at once │
-                                        └───────────┬───────────┘
-                                                    │
-                                                    ▼
-                                        ┌───────────────────────┐
-                                        │ header mapping        │
-                                        │ offset -> build UUID  │
-                                        └───────────┬───────────┘
-                                                    │
-                                                    ▼
-                                        ┌───────────────────────┐
-                                        │ object storage        │
-                                        └───────────────────────┘
+ONE RUNNING SANDBOX
+
+  Firecracker microVM
+    the guest kernel runs ext4, owns every dirty page, and dies with the VM
+
+    guest memory                    /dev/vda, virtio-blk
+        │                               │
+        │  page fault                   │  block request
+════════│═══════════════════════════════│════════════  guest above, host below
+        ▼                               ▼
+    UFFD handler                    NBD dispatch
+        │                               │  /dev/vda is really the host's
+        │                               │  /dev/nbd0, which the host
+        │                               │  kernel never mounts
+        └───────────────┬───────────────┘
+                        ▼
+                  block.Overlay
+        ┌───────────────┴───────────────┐
+        ▼                               ▼
+┌───────────────┐           ┌───────────────────────┐
+│ write cache   │           │ read cache            │
+│ mmap'd sparse │           │ mmap'd sparse         │
+│ dirty bitmap  │           │ cached bitmap         │
+└───────────────┘           └───────────┬───────────┘
+                                        │  miss
+                                        ▼
+                            ┌───────────────────────┐
+                            │ chunker               │
+                            │ fetches 4 MiB at once │
+                            └───────────┬───────────┘
+                                        │
+                                        ▼
+                            ┌───────────────────────┐
+                            │ header mapping        │
+                            │ offset -> build UUID  │
+                            └───────────┬───────────┘
+                                        │
+════════════════════════════════════════│════════════  host above, S3 below
+                                        ▼
+                            ┌───────────────────────┐
+                            │ object storage        │
+                            └───────────────────────┘
 ```
 
-The split down the middle is the part to hold onto. Writes stop at the write cache and never travel any further, so everything on the right stays byte-identical to what's in S3 for as long as the sandbox lives. Two of the later posts are built on that one property.
+The split under `block.Overlay` is the part to hold onto. Writes stop at the left branch and never travel any further, so the right branch stays byte-identical to what's in S3 for as long as the sandbox lives, which is the one property the last two posts spend their time exploiting.
 
-Both sides are also the same data structure. The read cache isn't a passthrough to S3, it's a sparse mmap'd file with a bitmap over it, and the bitmap just means something different depending on which branch you're standing in. A set bit on the left means the sandbox wrote this block. On the right it means S3 already gave it to us.
+Both branches are the same structure, a sparse mmap'd file with a bitmap over it, and the bitmap flips meaning depending on which one you're standing in. A set bit on the left says the sandbox wrote this block. On the right it says S3 already gave it to us. That's the whole vocabulary, and the five pieces below are the header that says where bytes live, the data file that holds them, the chunker that fetches in useful sizes, those two caches, and the overlay keeping them apart.
 
 ## A build in object storage
 
-Everything below refers to a build, which is a UUID with a prefix in the bucket and five objects under it:
+Everything below is written in terms of a build, so start there. A build is a UUID, and what you get for it is a prefix in the bucket with five objects under it:
 
 ```text
 s3://templates/<build-id>/
@@ -97,7 +107,7 @@ rootfs.ext4.header
 └──────────────────────────────────────────┘
 ```
 
-Every entry makes one claim: this run of the virtual image lives in that build's data file, at that offset.
+Each of those entries makes one claim, which is that some run of the virtual image lives in some build's data file at some offset:
 
 ```go
 type BuildMap struct {
@@ -110,7 +120,23 @@ type BuildMap struct {
 ```
 [mapping.go:14](https://github.com/e2b-dev/infra/blob/da099cf305df080abd16b964ff8b664736ee6d34/packages/shared/pkg/storage/header/mapping.go#L14)
 
-Two offsets in there, and mixing them up is the classic way to corrupt an image. `Offset` is virtual, an address in the 8 GiB filesystem the guest thinks it has. `BuildStorageOffset` is physical, a position inside one build's packed data file.
+Read an entry and you're standing in two different address spaces at once, which is why mixing up its two offsets is the classic way to corrupt an image. `Offset` is where the guest thinks the bytes are. `BuildStorageOffset` is where they actually are, inside whichever data file `BuildId` names:
+
+```text
+ONE ENTRY, TWO ADDRESS SPACES
+
+  virtual, what the guest sees
+  ┌──────────────────────────────────────────────────────┐
+  │                       │  this run  │                 │
+  └──────────────────────────────────────────────────────┘
+                          └── Offset   └── Offset + Length
+
+  physical, inside BuildId's rootfs.ext4
+  ┌──────────────────────┐
+  │        │  same run   │
+  └──────────────────────┘
+           └── BuildStorageOffset
+```
 
 That's the entire format. Whether it makes sense is another question, so let's build one by hand.
 
@@ -173,15 +199,22 @@ That covers two blocks out of eight. Ask this mapping about block 2 and it has n
 
 `MergeMappings` walks the base mapping and the diff mapping in lockstep and produces one mapping that covers all eight blocks with no gaps. Six overlap cases show up in the code and five of them are bookkeeping. The one worth looking at is a diff entry landing strictly inside a base entry, because it splits the base in two.
 
-That happens twice here, once per dirty block, so the single base entry comes out in three pieces:
+It happens twice here, once per dirty block. Take them one at a time, starting with `D'` at block 3:
 
 ```text
-before
+step 1, one base entry covering everything
 
-  base     └──────────────────── base, blocks 0..8 ────────────────────────┘
-  diff-a                           └─────┘         └─────┘
+  entry:   └──────────────────── base, blocks 0..8 ────────────────────────┘
 
-after
+step 2, diff-a's block 3 lands inside it and splits it
+
+  entry:   └───────base 0..3───────┴─diff──┴──────── base 4..8 ────────────┘
+                                                     ▲
+                                                     │  physical offset
+                                                     │  advanced to 4, not
+                                                     │  left at 0
+
+step 3, diff-a's block 5 splits the right piece again
 
   block:       0       1       2       3       4       5       6       7
            ┌───────┬───────┬───────┬───────┬───────┬───────┬───────┬───────┐
@@ -317,9 +350,20 @@ Each pause bumps `Generation`, mints a new `BuildID`, and leaves `BaseBuildID` p
 
 ## The chunker
 
-`build.File` can now resolve any virtual offset to a build and a physical offset. Ask it for one block and it fetches exactly one block, which sounds efficient right up until you count the round trips. An ext4 mount walking a directory tree issues thousands of small reads, and one HTTP request per 4 KiB block is unusable.
+`build.File` can resolve any virtual offset to a build and a physical offset, which is enough to serve a read and nowhere near enough to serve a filesystem. Ask it for one block and it fetches exactly one block, so a `git status` walking a source tree turns into thousands of independent HTTPS round trips, each one paying full S3 latency to move 4 KiB:
 
-So the chunker sits on top and refuses to think in blocks at all. It works in 4 MiB units:
+```text
+  per block                              per 4 MiB chunk
+
+  read block 12 ──> GET ──> 4 KiB        read block 12 ──> GET ──> 4 MiB
+  read block 13 ──> GET ──> 4 KiB        read block 13 ──> cache hit
+  read block 14 ──> GET ──> 4 KiB        read block 14 ──> cache hit
+  ... 1024 times                         ... 1021 more hits
+
+  1024 round trips                       1 round trip
+```
+
+The bet is that filesystem reads cluster, so the chunker refuses to think in blocks at all and works in 4 MiB units:
 
 ```go
 // MemoryChunkSize must always be bigger or equal to the block size.
@@ -353,7 +397,7 @@ Two details in there are the kind that only show up under load:
 
 ## The cache
 
-Everything above keeps saying "writes into the cache's mmap." Here's what that actually is. `block.Cache` is one sparse file per device, truncated to the full image size and mmap'd:
+Everything above keeps saying "writes into the cache's mmap," so it's worth pinning down. `block.Cache` is one sparse file per device, truncated to the full image size and mmap'd:
 
 ```go
 cache, err := NewCache(size, blockSize, cachePath, false)
@@ -362,7 +406,7 @@ cache, err := NewCache(size, blockSize, cachePath, false)
 
 Sparse is doing real work there. The file claims to be 8 GiB while occupying only what the filesystem has actually allocated, which for a fresh cache is nothing. That gap between claimed and real size is why `FileSize` reports `stat.Blocks * fsStat.Bsize` instead of trusting the stat size, and it comes back as a problem worth its own section in Part 3.
 
-Next to the mapping is a bitmap, one bit per block. `setIsCached` sets a range, `isCached` tests it, and `Slice` returns `BytesNotAvailableError` when the range isn't fully set. One structure, two meanings, depending on which side of the overlay it's on: a set bit on a read cache means "already fetched from S3," and on a write cache it means "modified relative to the parent build." The snapshot path leans entirely on the second reading.
+Alongside the mapping sits a bitmap with one bit per block, and asking it for a range that isn't fully set gets you a `BytesNotAvailableError` rather than zeros, which is how a caller finds out it has to go fetch something. Which side of the overlay you're on decides what a set bit means: on the read cache it's "S3 already gave me this," and on the write cache it's "the sandbox changed this." Snapshotting is built entirely on the second reading.
 
 `addressBytes` hands out a slice of the mmap plus a closure that drops a read lock. The chunker fetches directly into that slice, so bytes go from the S3 socket into a page that already is the cache, with no intermediate buffer. Filling the cache and serving a read are the same operation.
 
@@ -380,7 +424,7 @@ type Overlay struct {
 ```
 [overlay.go:14](https://github.com/e2b-dev/infra/blob/da099cf305df080abd16b964ff8b664736ee6d34/packages/orchestrator/pkg/sandbox/block/overlay.go#L14)
 
-`ReadAt` splits a request into blocks and tries the private write cache for each one, falling through to the read device on `BytesNotAvailableError`. `WriteAt` never goes past the cache at all.
+A read walks its request one block at a time and asks the private write cache first, taking `BytesNotAvailableError` as permission to fall through to the read device. A write doesn't walk anywhere, since `WriteAt` puts the bytes in the cache and stops.
 
 ```text
 read  block 3 ──> write cache dirty?  ──yes──> serve from write cache

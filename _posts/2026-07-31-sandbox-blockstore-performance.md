@@ -14,15 +14,26 @@ tags: [csi, performance, caching, prefetch, s3, mincore]
 
 A Pod in the warm pool passed its readiness probe, sat there reporting `Ready`, and then took 59.3 seconds to answer its first `git status`.
 
-Nothing was broken. That's the part worth sitting with. Lazy block fetch works exactly as designed, and what it does is move the cost out of the mount and into the first read, which is great right up until the first read is the one a user is waiting on.
+Nothing was broken, which is the part worth sitting with. Lazy block fetch was doing exactly what Part 1 promised: it moves the cost out of the mount and into the first read. That's a great trade until the first read is the one a user is watching a spinner for.
 
-Two changes went after that cost from opposite ends. One shares fetched bytes between Pods on a node, so the second Pod doesn't repay what the first one already paid. The other fetches the right bytes before anybody asks for them. Neither one subsumes the other, and the reason is more interesting than either change.
+Two changes went after that from opposite ends. One shares fetched bytes between Pods on a node so the second Pod doesn't repay what the first already paid, and the other fetches the right bytes before anybody asks. Neither subsumes the other, and why not turns out to be more interesting than either change.
 
 ## Where the time actually went
 
-Readiness is the trap. A warm-pool Pod passes its probe once the volume is mounted and the container is up, and Part 3's mount is a header read plus some local setup, so that happens in well under a second. Nothing in that signal has any opinion about whether a single byte of file content is on the node, because from kubelet's point of view the volume is mounted and the filesystem is there.
+Readiness is the trap. A warm-pool Pod passes its probe as soon as the volume is mounted and the container is up, and Part 3's mount is one header read plus local setup, so that lands in well under a second:
 
-Then a real request arrives:
+```text
+  WHAT READY MEANS                       WHAT'S ACTUALLY ON THE NODE
+
+  volume mounted          ✓              header, a few KiB      ✓
+  filesystem present      ✓              write cache, empty     ✓
+  container running       ✓              read cache, empty      ✓
+  probe passing           ✓              file contents          ✗ none of it
+
+  kubelet: Ready                         the next read is an S3 round trip
+```
+
+Nothing in the readiness signal has an opinion about file content, because from kubelet's side the volume is mounted and the filesystem is there. Then a real request arrives:
 
 ```text
 git status over 62,115 index entries
@@ -34,13 +45,13 @@ git status over 62,115 index entries
                                                  S3 range GET
 ```
 
-62,115 index entries, each one a `stat` and often a read, scattered across an 8 GiB image with no locality worth speaking of. Every read landing in an unfetched chunk blocks on a round trip to object storage. So `Ready` was true, the health checks were green, and the Pod was useless for a minute.
+Each of those entries is a `stat` and usually a read, scattered across an 8 GiB image with no locality worth speaking of, and any read that lands in an unfetched chunk blocks on a round trip to object storage. So `Ready` was true, every health check was green, and the Pod was useless for a minute.
 
 ## Change one: share the cache across Pods
 
-The first change is the node-shared read cache. Part 3 covers its mechanics, so what's left is what it bought.
+Part 3 already built the node-shared read cache, so what's left here is what it bought.
 
-The premise is that the read side stays byte-identical to S3 for a volume's whole life, so N Pods on one template can point at one cache file:
+It works because the read side stays byte-identical to S3 for a volume's whole life, which is what lets N Pods on one template point at a single cache file:
 
 ```text
   before                                after
@@ -99,9 +110,23 @@ phase 2  at mount time on a warm node
 
 ### Recording it
 
-The obvious way to record a read set is to trace the workload: `strace`, or an eBPF probe on `read`, or instrumenting the chunker itself. All of those tell you which file offsets the application asked for, which is not the question. The question is which 4 MiB chunks of the backing file the driver will have to fetch, and getting from one to the other means reimplementing ext4's block allocation in your head.
+The obvious way to record a read set is to trace the workload, with `strace` or an eBPF probe on `read` or instrumentation inside the chunker. They all answer a different question than the one we have:
 
-So the recording pass in `template-builder`, under `--record-startup-hotset`, asks the kernel instead. Run the workload through a loop mount and then ask the page cache which pages of the backing file are resident. Whatever it says is, by construction, exactly what the read path touched.
+```text
+  WHAT A TRACE GIVES YOU                 WHAT THE DRIVER HAS TO FETCH
+
+  read(.git/index, 4096) at              chunk at 25165824   ■
+  file offset 811008                     chunk at 29360128   ■
+  read(src/main.go, 4096) at             chunk at 96468992   ■
+  file offset 0
+
+  offsets inside files                   4 MiB offsets into rootfs.ext4
+
+  translating left to right means reimplementing ext4's
+  block allocator in your head
+```
+
+So the recording pass in `template-builder`, under `--record-startup-hotset`, asks the kernel instead. Run the workload through a loop mount, then ask the page cache which pages of the backing file are resident, and whatever it says is by construction exactly what the read path touched.
 
 ```text
 1. cp -a the source tree into the image through a loop mount
@@ -115,11 +140,48 @@ So the recording pass in `template-builder`, under `--record-startup-hotset`, as
 
 The whole measurement rests on the page cache telling the truth, and two things can make it lie.
 
-The loop device has to be opened with `losetup --direct-io=off`. Direct I/O skips the page cache entirely, so `mincore` sees nothing resident and the recording pass cheerfully produces an empty hot set from a workload that read half the image. Buffered I/O is what makes the page cache a record of anything at all.
+The loop device has to be opened with `losetup --direct-io=off`, because direct I/O is exactly the wrong thing here:
+
+```text
+  --direct-io=on                         --direct-io=off
+
+  git status reads                       git status reads
+    │                                      │
+    ▼  bypasses the page cache             ▼
+  backing file                           page cache ──> backing file
+    │                                      │
+    ▼                                      ▼
+  mincore: nothing resident              mincore: every page it touched
+    │                                      │
+    ▼                                      ▼
+  empty hot set from a workload          the hot set we wanted
+  that read half the image
+```
+
+The page cache being a side effect is the entire measurement, so anything that skips it produces a manifest that's confidently empty.
 
 Step 4's eviction has to actually land, which sounds like a formality and isn't. `prepareColdBackingFile` retries three times and hard-errors if pages stay resident, because a file that's still half warm produces a hot set missing precisely the chunks that were already cached, which are usually the important ones. An empty result is a hard error too. Better to fail the build than to publish a manifest that prefetches nothing and looks like it's working.
 
-`residentPagesToOffsets` does the arithmetic from resident 4 KiB pages to 4 MiB chunk offsets, and it's defensive about it: chunk size has to be a multiple of page size, the page count has to match the mapping length, and offsets get deduplicated. The output is small, a set of chunk offsets rather than a list of pages, which is why the manifest stays a few kilobytes on a multi-gigabyte image.
+Going from resident pages to chunk offsets is also where the manifest gets small enough to ship:
+
+```text
+  mincore(2) returns one byte per 4 KiB page of the backing file
+
+  page      0     1     2     3    ...   1024   1025   ...   2048
+            ·     ■     ■     ·          ■      ·            ■
+
+  1024 pages fill one 4 MiB chunk, so one resident page marks the chunk
+
+  chunk     0                          1              2
+            ■ pages 1 and 2            ■ page 1024    ■ page 2048
+
+  manifest  [0, 4194304, 8388608]
+
+  an 8 GiB image is 2,097,152 pages but only 2048 chunks, so the
+  manifest can't exceed 2048 offsets no matter what the workload did
+```
+
+`residentPagesToOffsets` is picky about that arithmetic, refusing to run unless the chunk size divides cleanly by the page size and the page count matches the mapping length, because an off-by-one here publishes offsets that point somewhere else in the image entirely.
 
 ```go
 type StartupHotset struct {
@@ -132,13 +194,27 @@ type StartupHotset struct {
 }
 ```
 
-Three of those six fields exist only to catch a mismatch. `ParseStartupHotset` checks the build ID, the header digest, and the image size against the header the driver just read, and rejects the manifest if any of them disagree. Same reasoning as the shared cache key from Part 3: a manifest recorded against a different build of the same template contains offsets that mean something else now, and prefetching them wastes GETs on chunks nobody wants.
+`Offsets` is the answer, and the other five fields are there so the driver can decide not to trust it. `ParseStartupHotset` checks the build ID, the header digest, and the image size against the header it just read, and throws the manifest away if any of them disagree. Same reasoning as the shared cache key from Part 3, because a manifest recorded against a different build of the same template holds offsets that mean something else now, and prefetching them spends GETs on chunks nobody wants.
 
 ### Prefetching it
 
-Where the prefetch sits in the mount matters more than how it works. `prefetchStartupHotset` runs as phase 5 of Part 3's eight, between building the read device and building the write overlay, which means it finishes before the NBD device exists. There's no window in which the Pod can read and no window in which a demand read can arrive, because the block device the demand read would come through hasn't been created yet.
+Where the prefetch sits in the mount matters more than how it works. `prefetchStartupHotset` runs as phase 5 of Part 3's eight, between building the read device and building the write overlay, so it finishes before the NBD device exists:
 
-`PrefetchStartupOffsets` enforces that directly, refusing to run at all once the chunker has started serving. Otherwise a prefetch competes for S3 connections against a reader that has a real process blocked on it, and losing that race to your own optimization is a bad way to spend an afternoon.
+```text
+  PREFETCH AT PHASE 5                    PREFETCH AFTER PHASE 8
+
+  phase 4  read device                   phase 8  mount
+  phase 5  prefetch  ◄── all of it          │
+  phase 6  write overlay                    ▼
+  phase 7  open NBD                      a read can arrive here, so the
+  phase 8  mount                         prefetch and a demand read race
+     │                                   for the same S3 sockets
+     ▼
+  no block device existed yet, so        whoever loses has a real process
+  nothing could have read anything       blocked behind it
+```
+
+`PrefetchStartupOffsets` enforces that directly and refuses to run once the chunker has started serving. Losing a race to your own optimization is a bad way to spend an afternoon.
 
 Planning happens before any fetch goes out:
 
@@ -159,13 +235,24 @@ coalesced into ranges, capped at maxRangeBytes
 
 Each range opens one reader and still walks it a chunk at a time, because completion is recorded per 4 MiB chunk and a range that dies halfway should leave behind the chunks it did finish rather than nothing.
 
-Concurrency is a weighted semaphore with each range's weight being its chunk count, which bounds bytes in flight rather than requests in flight:
+Concurrency is a weighted semaphore where each range's weight is its chunk count, so the permits bound bytes in flight rather than requests in flight:
+
+```text
+  16 PERMITS, ONE PER REQUEST            16 PERMITS, ONE PER CHUNK
+
+  16 ranges x 1 chunk    64 MiB          16 chunks    64 MiB
+  16 ranges x 256 chunks 16 GiB          always
+
+  the same permit count means            the permit count is a byte
+  whatever the offsets happened          budget the coalescing can't
+  to coalesce into                       move
+```
 
 ```go
 effectiveMaxRangeBytes := min(maxRangeBytes, int64(concurrency)*storage.MemoryChunkSize)
 ```
 
-Bounding requests would let 16 permits mean 16 MiB or 16 GiB depending on how well the offsets happened to coalesce. Production runs 16 permits against a 4 MiB range cap, so 64 MiB in flight, and the plan gets logged before it executes so a slow prefetch is a log line rather than a mystery.
+Production runs 16 permits against a 4 MiB range cap, so 64 MiB, and the plan gets logged before it executes so a slow prefetch shows up as a log line rather than a mystery.
 
 Two smaller behaviors make it compose with Part 3. Prefetched chunks go through `commitChunk` like any other, so they land in the state file and survive a daemon restart. And prefetch is single-flighted per device, so a second volume mounting the same template mid-prefetch waits on the one already running and reports `Reused` instead of starting a duplicate.
 
@@ -203,9 +290,19 @@ The last row is the one the work was for. 56.8 seconds down to 5 to 7, on a Pod 
 
 Row three is a freebie nobody designed for. Ordinary demand reads aren't in the hot set at all, and they still got 16% faster, partly from the larger effective range size and partly from chunks the prefetch swept up on its way to something adjacent.
 
-What's missing from that table is worth saying out loud. There are no numbers for a cold node with no shared cache, none for the aggregate reduction in S3 requests, and none for what the prefetch costs mount latency once a hot set gets large. The last gap is the uncomfortable one, since it's the failure mode the change most plausibly has.
+Three things that table doesn't measure, in increasing order of how much they bother me: a cold node with no shared cache underneath the prefetch, the aggregate drop in S3 requests, and what the prefetch adds to mount latency once a hot set gets large. That last one is the failure mode this change most plausibly has, and it's the one with no number next to it.
 
-Rollout went in three ordered steps: the driver change, then the environment enabling the manifest, then the node config raising concurrency to 16 permits with the 4 MiB cap and lifting the daemon memory limit to 10 GiB. Shipping all three at once would have meant any regression had three candidate causes and no way to bisect between them.
+So it rolled out in three separate steps rather than one:
+
+```text
+  step 1   driver change, prefetch code present but nothing publishes a manifest
+  step 2   environment starts publishing rootfs.ext4.startup-hotset.v1.json
+  step 3   node config: 16 permits, 4 MiB range cap, daemon memory limit to 10 GiB
+
+  a regression after any step has exactly one candidate cause
+```
+
+Shipping all three together would have left any regression with three suspects and no way to bisect between them.
 
 ## How the two changes compose
 
@@ -223,7 +320,23 @@ later Pods on that template   shared cache hit      shared cache hit
 
 Read down the columns and the coverage is clean. The shared cache turns "every Pod pays" into "the first Pod pays," and the hot set takes what the first Pod pays and moves it out of the critical path into the mount, where nobody is waiting on a response yet.
 
-There's a second-order effect that only shows up when both are on. The prefetch populates the shared cache in a predictable order, so the first Pod on a node warms exactly the chunks the next Pod will want, rather than whatever its own particular workload wandered into. The shared cache gets better at its job because something else decided what to put in it.
+Turn both on and a third thing happens that neither one does alone. Without the prefetch, what ends up in the shared cache is whatever the first Pod's workload happened to wander into, and the next Pod inherits that arbitrary set:
+
+```text
+  SHARED CACHE ALONE                     BOTH TOGETHER
+
+  Pod A does something odd               prefetch fills the hot set
+    │                                      │
+    ▼                                      ▼
+  cache holds Pod A's                    cache holds what every Pod
+  particular read set                    on this template needs first
+    │                                      │
+    ▼                                      ▼
+  Pod B hits some of it,                 Pod B hits nearly all of it
+  misses the rest
+```
+
+The shared cache gets better at its job because something else decided what to put in it.
 
 ## Trade-offs
 
@@ -239,4 +352,4 @@ The hot set's weakness is that it's a recording of one workload, and it's honest
 
 The shared cache's weakness is coupling, which is what you buy when you point twenty Pods at one file. A corrupt cache file, a full disk, or an eviction at an unlucky moment reaches all of them at once. The header digest in the key rules out the genuinely bad case where two volumes read each other's data through mismatched mappings, and the rest is bounded rather than prevented: watermarks keep the disk from filling, and the state file's whole-chunk-only rule keeps a torn write from being trusted.
 
-Both changes rest on the same property from Part 1, which is that the read side never changes. That's what makes a chunk fetched for one Pod valid for another, what makes a page-cache recording from build time still valid at mount time on a different machine a week later, and what makes it safe to hand a cache file to a process that has no idea some other process already filled it. Everything in this series is downstream of one immutable read path, and the parts that were hard were all on the other side of the overlay.
+Both changes rest on the same property from Part 1, which is that the read side never changes. A chunk fetched for one Pod is therefore valid for another, a page-cache recording made at build time is still valid at mount time on a different machine a week later, and a cache file can be handed to a process that has no idea some other process already filled it. None of those three needed a protocol to coordinate, because immutable bytes don't need one. Everything hard in this series turned out to live on the other side of the overlay, where the writes are.

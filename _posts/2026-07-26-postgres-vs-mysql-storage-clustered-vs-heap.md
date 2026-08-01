@@ -13,22 +13,18 @@ tags: [postgres, mysql, innodb, index, storage]
 > 5. [Connections: processes vs threads](/posts/postgres-vs-mysql-connection-models/)
 {: .prompt-info }
 
-Give MySQL and Postgres identical schemas and identical rows, then run these two queries:
+Whoever told you one of these engines is faster benchmarked one of these two queries and not the other:
 
 ```sql
 SELECT * FROM users WHERE email = 'a@a.com';
 SELECT * FROM users WHERE id = 1;
 ```
 
-MySQL walks two B+Trees for the first one. Postgres walks one index and makes a single trip to the table. On the second query it inverts: MySQL reads the row straight out of the index leaf, and now Postgres is the one taking two steps.
+Same schema and same rows, and the winner flips between them. MySQL walks two B+Trees to answer the first one and reads the row straight out of an index leaf for the second, while Postgres does one index hop plus a trip to the table either way, which is a bargain on `email` and a tax on `id`.
 
-Whichever engine you've been told is faster, somebody benchmarked one of those and not the other. Both results fall out of a single decision about where row data physically lives.
+Both results come out of a single decision about where row data physically lives. InnoDB keeps the table *inside* the primary key index, an arrangement called a [clustered index](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/include/dict0mem.h#L95), so the index and the table are one B+Tree with the rows sitting in its leaves. Postgres keeps rows in a [heap](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/heap/heapam.c), an unordered pile of pages, and every index is a separate structure pointing back into that pile, primary key included.
 
-MySQL's InnoDB engine stores the table *inside* the primary key index, an arrangement called a [clustered index](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/include/dict0mem.h#L95). The index and the table are the same B+Tree, with the row data sitting in its leaf nodes.
-
-Postgres stores rows in a [heap](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/heap/heapam.c), an unordered pile of pages, and keeps every index in a separate structure pointing back into that pile. The primary key gets no special treatment at all.
-
-One split, and it decides how fast each kind of read is, what an update costs, and how the two engines age over months in production. Here's a table small enough to trace by hand.
+That one split decides how fast each kind of read is, what an update costs, and how both engines age over months in production. Two rows are enough to see all of it:
 
 ```sql
 CREATE TABLE users (
@@ -36,13 +32,15 @@ CREATE TABLE users (
     name  VARCHAR(50),
     email VARCHAR(100) UNIQUE
 );
-```
 
-Insert two rows: Alice (`id=1`, `email=a@a.com`) and Bob (`id=2`, `email=b@b.com`).
+INSERT INTO users VALUES
+    (1, 'Alice', 'a@a.com'),
+    (2, 'Bob',   'b@b.com');
+```
 
 ## MySQL: the index is the table
 
-InnoDB builds a B+Tree keyed on the primary key. Upper nodes only route the search, and the leaf nodes at the bottom hold the full row. Look up `id=1` and the row is right there when the search lands, no second hop.
+InnoDB keys one B+Tree on the primary key and puts the rows themselves in its leaves, which leaves the upper nodes with nothing to do but route you downward. So a lookup on `id=1` descends to a leaf and finds the row sitting there waiting, with no second hop to pay for.
 
 ```text
 InnoDB clustered index (keyed on id)
@@ -77,52 +75,66 @@ InnoDB secondary index (keyed on email)
      no row data, just the PK to look up next
 ```
 
-Looking up by `email` therefore walks two trees:
+Looking up by `email` therefore walks two trees, one to turn the email into an `id` and another to turn the `id` into a row:
 
 ```text
-► PK lookup:   SELECT * FROM users WHERE id = 1;
-  1. descend the clustered index on id
-  2. land on the leaf ──> full row is right there
-  cost: 1 B+Tree traversal
+SELECT * FROM users WHERE email = 'a@a.com';
 
-► email lookup: SELECT * FROM users WHERE email = 'a@a.com';
-  1. descend the secondary index on email
-  2. land on the leaf ──> returns id = 1
-  3. descend the clustered index on id = 1
-  4. land on the leaf ──> full row
-  cost: 2 B+Tree traversals (the "double lookup")
+  email index                       clustered index
+  ┌───────────────────┐             ┌───────────────────┐
+  │ a@a.com ──> id=1  │────────────►│ id=1              │
+  └───────────────────┘   traverse  │ name=Alice        │
+      traversal 1          again    │ email=a@a.com     │
+                                    └───────────────────┘
+                                       traversal 2
 ```
 
-Notice what the secondary index stores: a primary key value, not a physical address. So when a row shifts to a different page inside the clustered index, every secondary index still points at it correctly, because `id=1` is `id=1` no matter which page it lives on. That one property is why InnoDB can rewrite rows in place, and it's the seed of everything in [Part 2](/posts/postgres-vs-mysql-mvcc-vacuum-vs-undo/).
+The primary key query skips the first tree entirely:
+
+```text
+SELECT * FROM users WHERE id = 1;
+
+  clustered index
+  ┌───────────────────┐
+  │ id=1              │   one traversal, row is already here
+  │ name=Alice        │
+  │ email=a@a.com     │
+  └───────────────────┘
+```
+
+So InnoDB answers a primary key lookup in one traversal and an `email` lookup in two, and the second one is what people mean by the double lookup.
+
+Notice that each secondary index stores a primary key value instead of a physical address. So when a row shifts to a different page inside the clustered index, every secondary index still points at it correctly, because `id=1` is `id=1` no matter which page it lives on. That one property is why InnoDB can rewrite rows in place, and it's the seed of everything in [Part 2](/posts/postgres-vs-mysql-mvcc-vacuum-vs-undo/).
 
 ## PostgreSQL: heap plus pointers
 
 Postgres drops each row wherever there's free space, in no particular order. To find it again, every version gets tagged with a Tuple ID, or [TID](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/include/storage/itemptr.h#L36), a physical address written as `(block number, offset)`. Read that as a page and a slot on that page.
 
-Every index stores the indexed value plus a TID, the primary key index included. Nothing is clustered, so in Postgres terms every index is a secondary index and every one of them points straight at the heap.
+Every index stores the indexed value plus a TID, the primary key index included. Nothing is clustered so in Postgres terms, every index is a secondary index and every one of them points straight at the heap.
+
+Both indexes therefore hold a TID and neither holds a row, so both queries take the identical two-step route:
 
 ```text
-The heap (unordered data pages)
+SELECT * FROM users WHERE email = 'a@a.com';
 
-[block 0, offset 1] ──> (id=1, name=Alice, email=a@a.com)
-[block 0, offset 2] ──> (id=2, name=Bob,   email=b@b.com)
-
-► PK lookup:    SELECT * FROM users WHERE id = 1;
-  1. descend the id index
-  2. leaf ──> TID (0, 1)
-  3. fetch the row from the heap at (0, 1)
-  cost: 1 index traversal + 1 heap fetch
-
-► email lookup: SELECT * FROM users WHERE email = 'a@a.com';
-  1. descend the email index
-  2. leaf ──> TID (0, 1)
-  3. fetch the row from the heap at (0, 1)
-  cost: 1 index traversal + 1 heap fetch
+  email index                       the heap (unordered pages)
+  ┌───────────────────┐             ┌─────────────────────────────┐
+  │ a@a.com ──> (0,1) │────────────►│ (0,1) id=1  Alice  a@a.com  │
+  └───────────────────┘             │ (0,2) id=2  Bob    b@b.com  │
+    index traversal      heap fetch └─────────────────────────────┘
 ```
 
-Both reads have the same shape, because both indexes point at the same physical row. That's the email query from the top of the post: one traversal and a heap fetch, against InnoDB's two full traversals.
+```text
+SELECT * FROM users WHERE id = 1;
 
-The bill arrives on the other query. A primary key lookup pays that same heap fetch, the one InnoDB skips by keeping the row in the leaf, so Postgres has no fast path where MySQL has its fastest one. And because nothing in the heap is ordered, a scan across a range of ids gets no help from physical layout either.
+  id index                          the heap (same pages)
+  ┌───────────────────┐             ┌─────────────────────────────┐
+  │ id=1    ──> (0,1) │────────────►│ (0,1) id=1  Alice  a@a.com  │
+  └───────────────────┘             │ (0,2) id=2  Bob    b@b.com  │
+    index traversal      heap fetch └─────────────────────────────┘
+```
+
+The `email` query is where that pays off, since one traversal plus a heap fetch beats InnoDB's two full traversals. The bill arrives on the primary key query, where Postgres pays the same heap fetch that InnoDB skips by keeping the row in the leaf, so it has no fast path exactly where MySQL has its fastest one. Nothing in the heap is ordered either, so a scan across a range of ids gets no help from physical layout.
 
 ## The trade-offs
 

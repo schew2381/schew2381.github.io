@@ -13,7 +13,9 @@ tags: [postgres, mysql, connections, processes, threads]
 > 5. Connections: processes vs threads (this post)
 {: .prompt-info }
 
-`FATAL: sorry, too many clients already`.
+```text
+FATAL: sorry, too many clients already
+```
 
 You deployed the same code to Lambda that ran fine on three app servers, traffic scaled it to 150 concurrent invocations, and Postgres started refusing connections at 100. The same deployment against MySQL would have kept going, since MySQL's default is 151.
 
@@ -23,7 +25,7 @@ Everything else in this post is downstream of that one sentence: what a connecti
 
 ## Postgres: a process per connection
 
-A Postgres server is a family of processes. A supervisor called the [postmaster](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/postmaster/postmaster.c) owns the listening socket and the shared memory region. When a client connects, the postmaster [launches a child process](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/postmaster/postmaster.c#L3627) that handles that one connection for its entire life, bottoming out in a real [`fork_process()`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/postmaster/launch_backend.c#L222).
+A Postgres server is a family of processes, supervised by a [postmaster](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/postmaster/postmaster.c) that owns the listening socket and the shared memory region. When a client connects, the postmaster [launches a child process](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/postmaster/postmaster.c#L3627) that handles that one connection for its entire life, bottoming out in a real [`fork_process()`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/postmaster/launch_backend.c#L222).
 
 ```text
         postmaster (supervisor)
@@ -37,11 +39,30 @@ A Postgres server is a family of processes. A supervisor called the [postmaster]
         attach the shared buffer pool
 ```
 
-Each backend is a full process with its own address space and process-local memory, holding catalog and plan caches plus `work_mem` for sorts and hashes. They cooperate through a single shared memory segment holding the buffer pool, the lock table, and WAL buffers.
+Each backend is a full process with its own address space and process-local memory, holding catalog and plan caches plus `work_mem` for sorts and hashes. They cooperate through a single shared memory segment holding the buffer pool, the lock table, and WAL buffers:
 
-Isolation is what you get for the trouble. A backend that segfaults kills its own connection, and the postmaster resets shared memory and carries on rather than taking every other session down with it. For a database that's a genuinely good trade.
+```text
+  PER BACKEND, private                  SHARED, one segment
+  ┌──────────────────────────┐          ┌──────────────────────────┐
+  │ catalog cache            │          │ buffer pool              │
+  │ plan cache               │  ═════   │ lock table               │
+  │ work_mem, per sort node  │  attach  │ WAL buffers              │
+  └──────────────────────────┘          └──────────────────────────┘
+   grows with connection count           sized once, at startup
+```
 
-The weight is what you pay. `fork()` plus a fresh address space is expensive per connection, and an idle backend still holds its process-local memory and counts against `max_connections`.
+Isolation is what you get for the trouble, since a backend that segfaults kills its own connection and the postmaster resets shared memory and carries on rather than taking every other session down with it. For a database that's a genuinely good trade:
+
+```text
+  backend 2 segfaults
+
+  postmaster   ┌── backend 1  alive
+       │       ├── backend 2  ✗ died, client gets a dropped connection
+       │       └── backend 3  alive
+       └──> reset shared memory, keep listening
+```
+
+The weight is what you pay, because `fork()` plus a fresh address space is expensive per connection, and an idle backend still holds its process-local memory and counts against `max_connections`.
 
 `work_mem` is where this gets people, because it's per sort node and not per connection. A query with three sorts and a hash join can allocate several multiples of `work_mem` on its own, so 200 backends running that query against a 4 MB default aren't using 800 MB. They're using some larger number nobody computed, and the machine finds out before you do.
 
@@ -49,7 +70,7 @@ Which is why serious Postgres deployments put PgBouncer in front and keep the ba
 
 ## MySQL: a thread per connection
 
-MySQL runs a single server process, `mysqld`. Its default [per-thread connection handler](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/sql/conn_handler/connection_handler_per_thread.cc#L404) calls [`mysql_thread_create`](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/sql/conn_handler/connection_handler_per_thread.cc#L421) to spin up a thread per connection, all inside that process.
+MySQL runs one server process, `mysqld`, whose default [per-thread connection handler](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/sql/conn_handler/connection_handler_per_thread.cc#L404) calls [`mysql_thread_create`](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/sql/conn_handler/connection_handler_per_thread.cc#L421) to spin up a thread per connection, all inside that process.
 
 ```text
         mysqld (single process)
@@ -62,17 +83,42 @@ MySQL runs a single server process, `mysqld`. Its default [per-thread connection
       buffer pool is just shared heap
 ```
 
-Threads share the process address space, so the buffer pool and the caches are just memory every thread can already reach. Nothing to attach, no segment to size. Spawning a thread is cheaper than forking, and MySQL goes further by keeping a [thread cache](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/sql/conn_handler/connection_handler_per_thread.cc#L147) so a disconnecting client's thread gets parked and handed to the next connection instead of destroyed.
+Threads share the process address space, so the buffer pool and the caches are just memory every thread can already reach, with nothing to attach and no segment to size. Spawning a thread is cheaper than forking, and MySQL goes further by keeping a [thread cache](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/sql/conn_handler/connection_handler_per_thread.cc#L147) so a disconnecting client's thread gets parked and handed to the next connection instead of destroyed:
 
-That cache is smaller than you'd guess. `thread_cache_size` defaults to [`8 + max_connections / 100`](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/sql/mysqld.cc#L6936), which at the default 151 connections is nine parked threads. Nine. A workload that opens and closes connections faster than that creates real threads for the overflow, so if `Threads_created` keeps climbing long after startup, that's the number to raise.
+```text
+  client disconnects            next client connects
+  ┌──────────────────┐          ┌──────────────────┐
+  │ thread 2         │          │ thread cache     │
+  │ done with client │          │ 9 parked threads │
+  └────────┬─────────┘          └────────┬─────────┘
+           │ cache has room?             │ hand one over
+           ▼                             ▼
+  ┌──────────────────┐          ┌──────────────────┐
+  │ park it, no exit │          │ thread 2 again,  │
+  │ (else destroy)   │          │ serving client D │
+  └──────────────────┘          └──────────────────┘
+```
 
-Cheaper connections mean MySQL gets further before it needs help. The downside is exactly Postgres's upside inverted: one address space means a memory bug in one thread can corrupt state every other thread is reading, with no supervisor able to isolate it. Postgres loses a connection where MySQL loses the server.
+That cache is smaller than you'd guess, since `thread_cache_size` defaults to [`8 + max_connections / 100`](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/sql/mysqld.cc#L6936), which at the default 151 connections is nine parked threads. Nine. A workload that opens and closes connections faster than that creates real threads for the overflow, so if `Threads_created` keeps climbing long after startup, that's the number to raise.
 
-Threads aren't free at scale either. Thousands of them contending on shared structures spend measurable time in context switches and lock waits, which is the problem MySQL's [thread pool](https://dev.mysql.com/doc/refman/8.4/en/thread-pool.html) addresses by multiplexing connections onto a bounded set of threads. It's an Enterprise feature, so on community MySQL the answer is the same as on Postgres: a pooler, in front, doing the bounding for you.
+Cheaper connections mean MySQL gets further before it needs help, and the downside is exactly Postgres's upside inverted, because one address space means a memory bug in one thread can corrupt state every other thread is reading, with no supervisor able to isolate it:
+
+```text
+  thread 2 corrupts memory
+
+  mysqld   ┌── thread 1  reading the same heap
+     │     ├── thread 2  ✗ wrote past a buffer
+     │     └── thread 3  reading the same heap
+     └──> nothing to reset, nothing isolated
+```
+
+Postgres loses a connection where MySQL loses the server.
+
+Threads aren't free at scale either, because thousands of them contending on shared structures spend measurable time in context switches and lock waits, which is the problem MySQL's [thread pool](https://dev.mysql.com/doc/refman/8.4/en/thread-pool.html) addresses by multiplexing connections onto a bounded set of threads. It's an Enterprise feature, so on community MySQL the answer is the same as on Postgres: a pooler, in front, doing the bounding for you.
 
 ## The trade-off
 
-This is the one part of the series where InnoDB never comes up. Connection handling lives in the MySQL server layer above the storage engine, so everything here holds with a different engine underneath.
+This is the one part of the series where InnoDB never comes up, because connection handling lives in the MySQL server layer above the storage engine, so everything here holds with a different engine underneath.
 
 | | PostgreSQL | MySQL |
 |---|---|---|
@@ -86,7 +132,24 @@ This is the one part of the series where InnoDB never comes up. Connection handl
 
 Neither model gets you out of bounding concurrency, which is the practical takeaway if you keep only one. Postgres hits the wall earlier on raw count because processes are heavy, so a pooler is close to mandatory. MySQL's threads are cheap enough that you can get complacent, then hit a different wall made of context switches and contention. Both engines want the number of things actively executing to be close to your core count, and neither will enforce that for you.
 
-Back to the Lambda from the top. Raising `max_connections` to 500 on the Postgres side is the obvious move and the wrong one, because you'd be asking the machine to hold 500 processes and their `work_mem` so 500 mostly-idle Lambdas can each hold a connection they're not using. PgBouncer in transaction mode gives those 500 clients 20 real backends and the problem stops existing. Same fix works on MySQL, and the only reason it feels less urgent there is that the wall is further out, not that it isn't there.
+Which brings back the Lambda from the top, where raising `max_connections` to 500 is the obvious move and the wrong one, because you'd be asking the machine to hold 500 processes and their `work_mem` so 500 mostly-idle Lambdas can each hold a connection they're not using:
+
+```text
+  raise max_connections               put PgBouncer in front
+  ┌──────────────────────┐            ┌──────────────────────┐
+  │ 500 Lambdas          │            │ 500 Lambdas          │
+  └──────────┬───────────┘            └──────────┬───────────┘
+             │ 1:1                               │ 500 client conns
+             ▼                        ┌──────────▼───────────┐
+  ┌──────────────────────┐            │ PgBouncer, txn mode  │
+  │ 500 backends         │            └──────────┬───────────┘
+  │ 500x work_mem        │                       │ 20 server conns
+  │ mostly idle          │            ┌──────────▼───────────┐
+  └──────────────────────┘            │ 20 backends, busy    │
+   the machine finds out              └──────────────────────┘
+```
+
+Transaction mode gives those 500 clients 20 real backends and the problem stops existing. The same fix works on MySQL, and the only reason it feels less urgent there is that the wall is further out, not that it isn't there.
 
 ## The two roots
 

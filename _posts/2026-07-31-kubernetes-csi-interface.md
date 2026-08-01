@@ -12,15 +12,13 @@ tags: [csi, kubernetes, kubelet, grpc, volumes, storage]
 > 4. [Optimizing startup performance](/posts/sandbox-blockstore-performance/)
 {: .prompt-info }
 
-Part 1 ended with a storage layer that serves a block device out of S3. To hand that to a Pod, something has to convince Kubernetes it's a volume, and the [Container Storage Interface](https://github.com/container-storage-interface/spec/blob/master/spec.md) is how that happens.
+Part 1 left off with a storage layer that serves a block device out of S3. Handing that to a Pod means convincing Kubernetes it's a volume, and the [Container Storage Interface](https://github.com/container-storage-interface/spec/blob/master/spec.md) is the contract for doing that: implement some gRPC methods, register a Unix socket with kubelet, and Kubernetes calls your code whenever a Pod needs a volume.
 
-CSI is a gRPC contract, and a small one. Implement the right subset, register a Unix socket with kubelet, and Kubernetes calls your code every time a Pod needs a volume.
-
-The RPCs aren't the hard part. What takes time is working out which ones you actually have to implement, and how much of Kubernetes' default machinery you're allowed to switch off. A driver for a lazily-fetched, node-local, per-Pod volume gets to skip most of it, and knowing that in advance saves writing several services that do nothing.
+Writing the RPCs turned out to be the quick part. The time went into working out which ones we actually had to implement and how much of Kubernetes' default machinery we were allowed to switch off, because a lazily-fetched, node-local, per-Pod volume gets to skip most of it. Knowing that up front saves you from writing two services that do nothing.
 
 ## Overview
 
-Three gRPC services. A driver implements Identity plus whichever of the other two it needs.
+Three gRPC services, and a driver implements Identity plus whichever of the other two it needs.
 
 ```text
 ┌────────────────────────────────────────────────────────────┐
@@ -113,7 +111,20 @@ Opting out is a matter of leaving `STAGE_UNSTAGE_VOLUME` out of `NodeGetCapabili
 
 Staging can't express that sharing, though, for two separate reasons.
 
-The first is that staging is keyed by volume ID, and those twenty Pods have twenty different volume IDs. `NodeStageVolume` gets called once per volume per node, not once per thing-the-volumes-have-in-common, so kubelet would stage twenty times and dedupe nothing. The sharing is keyed by template build ID and header digest, which is a fact about the contents that Kubernetes has no vocabulary for.
+The first is that staging is keyed by volume ID, and those twenty Pods have twenty different volume IDs. Kubelet would call `NodeStageVolume` twenty times and dedupe nothing, because the thing the volumes have in common isn't the thing staging keys on:
+
+```text
+  what kubelet keys staging on     what the sharing actually keys on
+
+  vol-a1b2 ──> stage once          vol-a1b2 ──┐
+  vol-c3d4 ──> stage once          vol-c3d4 ──┼──> build X + header digest
+  vol-e5f6 ──> stage once          vol-e5f6 ──┘     one cache file
+  ... 20 distinct IDs
+                                   the volume IDs are unrelated to
+  20 stages, 0 deduped             what makes these three shareable
+```
+
+The build ID and the header digest are facts about the volume's *contents*, and Kubernetes has no vocabulary for those.
 
 The second is that kubelet doesn't offer the choice at all here. Staging only exists on the PVC path:
 
@@ -129,9 +140,20 @@ For an ephemeral inline volume, `CanDeviceMount` returns false and the staging m
 
 ## Idempotency is the contract
 
-Every CSI RPC has to be safely retryable, and this is the requirement that turns a working driver into a broken one. Kubelet retries with backoff on any error, and it genuinely cannot tell "the mount failed" apart from "the mount succeeded and the reply got lost."
+Every CSI RPC has to be safely retryable, and this is the requirement that quietly turns a working driver into a broken one. Kubelet retries with backoff on any error, and from where it sits those two cases are the same event:
 
-Three rules matter in practice:
+```text
+  THE MOUNT FAILED                  THE REPLY GOT LOST
+
+  kubelet ──publish──> driver       kubelet ──publish──> driver
+                          │                                 │  mounted
+          ◄───error───────┘                     ✗ ◄─────────┘
+  kubelet retries                   kubelet retries
+
+  right answer: mount it            right answer: succeed anyway
+```
+
+Kubelet can't tell those apart, so the driver has to make the retry correct in both. Three rules cover it in practice:
 
 - `NodePublishVolume` called twice with the same `volume_id` and `target_path` must return success the second time, not "already mounted."
 - `NodeUnpublishVolume` on a path that isn't mounted must return success. Returning `NotFound` makes kubelet retry forever and the Pod never finishes terminating.
@@ -141,9 +163,9 @@ The unpublish rule is the one that bites, and it bites specifically because the 
 
 ## Volume parameters
 
-Configuration reaches a driver through two separate channels that arrive at different RPCs, which is worth getting straight before writing either one.
+Configuration reaches a driver through two channels that show up at different RPCs, and getting them straight before writing either one saves an afternoon of wondering why a parameter is empty.
 
-StorageClass `parameters` land in `CreateVolume`'s request, and they're set by whoever administers the cluster:
+The first channel is StorageClass `parameters`, set by whoever administers the cluster, and they arrive in `CreateVolume`'s request:
 
 ```yaml
 apiVersion: storage.k8s.io/v1
@@ -157,7 +179,24 @@ volumeBindingMode: WaitForFirstConsumer
 reclaimPolicy: Delete
 ```
 
-`volumeBindingMode: WaitForFirstConsumer` is doing more than it looks like. It delays provisioning until a Pod has been scheduled, which is the only way the driver finds out which node it's provisioning for. Any driver backed by node-local storage needs that, because provisioning early means provisioning on the wrong machine.
+`volumeBindingMode: WaitForFirstConsumer` is doing more than it looks like, since it holds provisioning back until a Pod has been scheduled and that's the only way the driver ever learns which node it's provisioning for:
+
+```text
+  Immediate                              WaitForFirstConsumer
+
+  PVC created                            PVC created
+    │                                      │  nothing happens yet
+    ▼                                      ▼
+  CreateVolume, node unknown             Pod scheduled to node-7
+    │                                      │
+    ▼                                      ▼
+  Pod scheduled to node-7                CreateVolume, node-7 in the request
+  volume is on node-3                      │
+                                           ▼
+                                         volume is on node-7
+```
+
+Anything backed by node-local storage needs the right-hand column, because provisioning early means provisioning on a machine the Pod won't land on.
 
 Whatever reaches `CreateVolume` gets echoed into the `PersistentVolume` and handed to `NodePublishVolume` as `VolumeContext`, so the Node service reads it without a second API lookup.
 
@@ -174,7 +213,21 @@ volumes:
         templateBuildID: "9f3c1a20-..."
 ```
 
-That's the whole thing. No PVC, no PV, no `CreateVolume` call, no provisioner Deployment to keep leader-elected. Kubelet invents a volume ID, calls `NodePublishVolume`, and passes `volumeAttributes` straight through as the `VolumeContext`. The volume lives exactly as long as the Pod does.
+That's the whole thing. Kubelet invents a volume ID, calls `NodePublishVolume`, and passes `volumeAttributes` straight through as the `VolumeContext`, and the volume lives exactly as long as the Pod does. No PVC, no PV, no `CreateVolume`, and no provisioner Deployment to keep leader-elected:
+
+```text
+  PVC path                               ephemeral inline
+
+  PVC ──> external-provisioner           Pod spec
+            │                              │
+            ▼                              │
+          CreateVolume                     │  kubelet mints an ID
+            │                              │
+            ▼                              ▼
+          PV ──> kubelet ──> publish      kubelet ──> publish
+
+  4 objects, 1 sidecar, 2 RPCs           1 object, 0 sidecars, 1 RPC
+```
 
 Turning it on is a few fields on the `CSIDriver` object:
 
@@ -196,7 +249,7 @@ Each one switches off a specific piece of machinery:
 - `podInfoOnMount: true` adds `csi.storage.k8s.io/pod.name`, `pod.namespace`, `pod.uid`, and `serviceAccount.name` to the `VolumeContext`, which is how a driver learns which Pod it's mounting for.
 - `volumeLifecycleModes` lists the allowed paths. List both `Persistent` and `Ephemeral` to support each.
 
-Ephemeral mode does cost something, and it's not nothing. Without `CreateVolume` there's no moment where the driver can reject a bad request before scheduling, so a typo in `templateBuildID` doesn't fail fast. It shows up as a Pod wedged in `ContainerCreating` with the real error buried somewhere in kubelet's events, which is a worse debugging experience than a `Pending` PVC with a clear message on it.
+What you give up is the one place a driver could have rejected a bad request early. Without `CreateVolume` there's no moment before scheduling where anyone validates anything, so a typo in `templateBuildID` doesn't fail fast. It shows up as a Pod wedged in `ContainerCreating` with the real error buried in kubelet's events, which is a worse afternoon than a `Pending` PVC carrying a clear message.
 
 ## Mount propagation
 
@@ -214,7 +267,26 @@ volumeMounts:
     mountPropagation: Bidirectional
 ```
 
-`Bidirectional` becomes a shared mount in the kernel, so mounts the driver creates propagate out to the host and mounts the host creates propagate in. Leave it off and the driver mounts into its own private namespace, reports success, and the Pod gets an empty directory. Nothing errors. That's the failure mode: the mount worked, in a namespace nobody else can see. It also needs `privileged: true`, because shared propagation is privileged.
+`Bidirectional` makes it a shared mount in the kernel, so mounts the driver creates propagate out to the host and mounts the host creates propagate in. Leave it off and every layer reports success while the Pod gets an empty directory:
+
+```text
+  without Bidirectional                  with Bidirectional
+
+  driver mounts ext4                     driver mounts ext4
+    │  in its own namespace                │  shared mount
+    ▼                                      ▼
+  host sees nothing                      host sees the mount
+    │                                      │
+    ▼                                      ▼
+  kubelet's bind mount finds             bind mount carries the
+  an empty directory                     filesystem into the Pod
+    │                                      │
+    ▼                                      ▼
+  Pod starts, sees nothing,              Pod sees its files
+  nothing errors anywhere
+```
+
+That's the whole failure: the mount worked, in a namespace nobody else can see. It needs `privileged: true` too, since shared propagation is privileged.
 
 One more detail that catches people. The `/var/lib/kubelet` mount has to cover the whole directory, not just the pod path, because kubelet passes an absolute target path and that exact path has to resolve inside the driver's namespace.
 
@@ -253,7 +325,7 @@ func (n *NodeServer) NodeGetCapabilities(
 }
 ```
 
-Spend the effort on the validation at the top. `GetMount() == nil` means the Pod asked for a raw block device instead of a filesystem, and a filesystem-only driver has to say no rather than mount something and hope. Access modes, read-only flags, and `VolumeContext` keys you don't recognise all deserve the same treatment, because each one is a request you can't actually honor. Failing loudly at publish beats a Pod that starts and then behaves strangely.
+The validation at the top is where the effort belongs. `GetMount() == nil` means the Pod asked for a raw block device rather than a filesystem, and a filesystem-only driver has to say so instead of mounting something and hoping. Access modes, read-only flags, and unrecognised `VolumeContext` keys all deserve the same treatment, since each one is a request you can't honor, and a loud failure at publish beats a Pod that starts and then behaves strangely for reasons nobody can trace.
 
 ## Testing
 

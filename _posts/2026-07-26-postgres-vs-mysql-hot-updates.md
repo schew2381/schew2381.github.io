@@ -80,7 +80,7 @@ Which makes the failure mode sneaky in production. Add one index on a column you
 
 "Doesn't change an indexed column" sounds unambiguous until you write a covering index. `CREATE INDEX ... ON users (email) INCLUDE (last_login)` stores `last_login` in the index leaf without making it part of the key, so the natural reading is that non-key columns are cargo the B-Tree carries but doesn't care about.
 
-Postgres disagrees. The relcache builds a bitmap of every column that blocks HOT, and [the loop that fills it](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/utils/cache/relcache.c#L5449) runs over `indnatts`, the total column count, rather than `indnkeyatts`. Key or not, a column in the index goes in the bitmap, and `heap_update` decides the whole question by [testing the modified set against it](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/heap/heapam.c#L4070).
+Postgres disagrees, and the disagreement is one word in one loop. The relcache builds a bitmap of every column that blocks HOT, and [the loop that fills it](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/utils/cache/relcache.c#L5449) runs over `indnatts`, the total column count, rather than `indnkeyatts`. Key or not, a column in the index goes in the bitmap, and `heap_update` decides the whole question by [testing the modified set against it](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/heap/heapam.c#L4070).
 
 So adding `INCLUDE (last_login)` to make one read query index-only quietly costs you the HOT path on every `last_login` write. Same damage as indexing the column outright, reached by a route that doesn't look like indexing it.
 
@@ -88,9 +88,24 @@ BRIN is the one exception, and it's deliberate. BRIN sets [`amsummarizing = true
 
 ## When the page has no room
 
-The second condition fails on you silently. A HOT chain lives entirely inside one page by construction, and the code enforces it with an [`Assert`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/heap/heapam_indexscan.c#L217) that a chain's forwarding pointer stays on the same block, so Postgres can't put the new version on a different page and still call it HOT. Page full means normal update: new tuple wherever there's room, every index re-pointed, back to N+1 writes.
+The second condition fails on you silently. A HOT chain lives entirely inside one page by construction, and the code enforces it with an [`Assert`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/heap/heapam_indexscan.c#L217) that a chain's forwarding pointer stays on the same block, so Postgres can't put the new version on a different page and still call it HOT:
 
-Here's the part I had wrong for years. I assumed Postgres reserves free space on every heap page by default, precisely so HOT has somewhere to put things. It doesn't. `fillfactor` controls that reservation and [`HEAP_DEFAULT_FILLFACTOR`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/include/utils/rel.h#L362) is `100`, so heap pages pack completely full out of the box. B-Tree indexes default to `90` and get slack. Your table gets none.
+```text
+same update, same columns, only the free space differs
+
+  page 10 has room                page 10 is full
+  ┌───────────────────────┐       ┌───────────────────────┐
+  │ slot 1: old ──> 2     │       │ slot 1: old           │  stays dead
+  │ slot 2: new           │       │ no room for a slot 2  │
+  └───────────────────────┘       └───────────────────────┘
+                                  ┌───────────────────────┐
+  indexes untouched               │ page 14, slot 6: new  │
+  1 write                         └───────────────────────┘
+                                  every index re-pointed
+                                  N+1 writes
+```
+
+For years I assumed Postgres reserves free space on every heap page by default, precisely so HOT has somewhere to put things, and it doesn't. `fillfactor` controls that reservation and [`HEAP_DEFAULT_FILLFACTOR`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/include/utils/rel.h#L362) is `100`, so heap pages pack completely full out of the box. B-Tree indexes default to `90` and get slack, while your table gets none.
 
 So on a table with a heavy HOT-update path, lowering `fillfactor` is one of the few genuine free wins available. `ALTER TABLE ... SET (fillfactor = 85)` trades space per page for in-page update room on every page written afterward. Existing pages keep their old packing until they're rewritten, which is the detail that makes people think the setting did nothing.
 
@@ -110,7 +125,7 @@ name index                            heap
 
 A search for "Smith" gets both TIDs back and, per [Part 2](/posts/postgres-vs-mysql-mvcc-vacuum-vs-undo/), nothing to choose between them with, so it fetches both and lets the heap headers decide. Two heap tuples on two different pages to return one row.
 
-Nothing warns you. A plain `EXPLAIN` reports rows returned rather than tuples examined, so the extra fetch hides inside a plan that looks correct. `EXPLAIN (ANALYZE, BUFFERS)` shows it as block reads you can't account for, and across a whole table the tell is `pg_stat_user_tables.idx_tup_fetch` running well ahead of `idx_scan` times the rows a scan should return.
+Nothing warns you about it, since a plain `EXPLAIN` reports rows returned rather than tuples examined, so the extra fetch hides inside a plan that looks correct. `EXPLAIN (ANALYZE, BUFFERS)` shows it as block reads you can't account for, and across a whole table the tell is `pg_stat_user_tables.idx_tup_fetch` running well ahead of `idx_scan` times the rows a scan should return.
 
 So why can't the old entry forward to the new page, the way HOT forwards inside one? The old tuple's `t_ctid` does still physically point at the new tuple. The non-HOT branch of `heap_update` [clears `HEAP_HOT_UPDATED`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/heap/heapam.c#L4195) on it, though, so no scan will ever follow that pointer, which is exactly what the `Assert` above is protecting. Those same-key duplicates are what [Part 2](/posts/postgres-vs-mysql-mvcc-vacuum-vs-undo/)'s bottom-up deletion pass hunts for, so the pile stays bounded as long as no old snapshot is pinning it.
 
@@ -132,19 +147,45 @@ Slot 1 shrinks from a full dead row to a tiny redirect stub, reclaiming nearly a
 
 ## Two rejected designs
 
-All-or-nothing feels needlessly blunt. Surely you could touch just the one index that needs it and leave the other eleven alone. Two schemes do exactly that, and the reasons both were rejected are what gives HOT its shape.
+All-or-nothing feels needlessly blunt, since surely you could touch the one index that needs it and leave the other eleven alone. Two schemes do exactly that, and the reasons both were rejected are what gives HOT its shape.
 
-The first is a trampoline. Add the "Smyth" entry, but point it at old slot 1 and let slot 1 forward to the new tuple, so the other indexes never move. That creates immortal dead rows. MVCC cleanup rests on old versions eventually becoming garbage somebody can reclaim, and a live "Smyth" entry that needs slot 1 as a bridge means slot 1 can never be freed. Update that row again and you've built a second permanent bridge. Structural bloat, not the kind you vacuum away.
+The first is a trampoline, where you add the "Smyth" entry but point it at old slot 1 and let slot 1 forward to the new tuple, so the other indexes never move:
 
-It costs on the read side too. A HOT chain currently guarantees every tuple in it matches the index key that led you there, which is why following a chain needs no re-checking. Break that and a search for "Smith" can land on a "Smyth" tuple, so every hop has to re-evaluate the `WHERE` clause. CPU on every fetch of every chain forever, to save index writes on some updates.
+```text
+name index                       heap page 10
+┌──────────────────────┐         ┌───────────────────────────┐
+│ key=Smith ──> (10,1) │────────►│ slot 1: Smith, dead       │
+│ key=Smyth ──> (10,1) │────────►│         t_ctid ──> slot 2 │
+└──────────────────────┘         │ slot 2: Smyth, live       │
+                                 └───────────────────────────┘
+slot 1 is dead but can never be freed, because the "Smyth"
+entry needs it as a bridge to reach slot 2
+```
 
-The second scheme is mixed state: the `name` index points at the new tuple directly while the `id` index keeps pointing at the old slot and follows the chain. That takes out the cheap pruning from the last section, which is fast precisely because Postgres knows that for a HOT chain, *all* indexes point at the chain head, so it can convert the head into a redirect without consulting a single index. Allow mixed pointers and pruning safely means inspecting every index on the table, taking locks and doing I/O, the exact cost HOT was built to avoid. Saved writes on the update path, same work moved into the read path.
+Which builds immortal dead rows, since MVCC cleanup rests on old versions eventually becoming garbage somebody can reclaim, and a live "Smyth" entry needing slot 1 as a bridge means slot 1 can never be freed. Update the row again and you've built a second permanent bridge, which is structural bloat rather than the kind you vacuum away.
 
-Both rejections point the same direction. Either no index changes or all of them do, and in exchange Postgres always knows exactly how indexes relate to the heap, which keeps the update and cleanup paths fast.
+It costs on the read side too, because a HOT chain currently guarantees every tuple in it matches the index key that led you there, which is why following a chain needs no re-checking. Break that and a search for "Smith" can land on a "Smyth" tuple, so every hop has to re-evaluate the `WHERE` clause. CPU on every fetch of every chain forever, to save index writes on some updates.
+
+The second scheme is mixed state, where the `name` index points at the new tuple directly while the `id` index keeps pointing at the old slot and follows the chain:
+
+```text
+name index                       heap page 10
+┌──────────────────────┐         ┌───────────────────────────┐
+│ key=Smyth ──> (10,2) │────────►│ slot 2: Smyth, live       │
+└──────────────────────┘    ┌───►│ slot 1: Smith, dead       │
+id index                    │    └───────────────────────────┘
+┌──────────────────────┐    │
+│ id=1      ──> (10,1) │────┘    pruning slot 1 into a redirect
+└──────────────────────┘         now needs every index checked
+```
+
+That takes out the cheap pruning from the last section, which is fast precisely because Postgres knows that for a HOT chain, *all* indexes point at the chain head, so it can convert the head into a redirect without consulting a single index. Allow mixed pointers and pruning safely means inspecting every index on the table, taking locks and doing I/O, the exact cost HOT was built to avoid. Saved writes on the update path, same work moved into the read path.
+
+Both rejections point the same direction, so either no index changes or all of them do, and in exchange Postgres always knows exactly how indexes relate to the heap, which keeps the update and cleanup paths fast.
 
 ## Checking whether it's working
 
-None of this is guesswork. Postgres counts both HOT updates and the ways they fail:
+None of this has to be guesswork, because Postgres counts both HOT updates and the ways they fail:
 
 ```sql
 SELECT relname, n_tup_upd, n_tup_hot_upd, n_tup_newpage_upd
@@ -169,4 +210,4 @@ Every mechanism in this post exists to work around one fact: a Postgres row vers
 
 No new-TID problem, so no HOT to invent, no `fillfactor` to tune on the table, no chains to prune. InnoDB gets for free what Postgres builds two subsystems to approximate.
 
-It pays under a different name. Keeping the clustered index in primary key order is fine while rows arrive in order and expensive the moment they don't, which turns an ordinary schema decision into a production incident. That's [Part 4](/posts/postgres-vs-mysql-page-splits-toast-uuids/).
+It pays under a different name, since keeping the clustered index in primary key order is fine while rows arrive in order and expensive the moment they don't, which turns an ordinary schema decision into a production incident. That's [Part 4](/posts/postgres-vs-mysql-page-splits-toast-uuids/).

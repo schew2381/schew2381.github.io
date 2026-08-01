@@ -76,9 +76,43 @@ Use specific examples and names instead of vague claims, and trust the
 reader to recognise what matters without labelling it "significant" or
 "important."
 
-Vary the rhythm deliberately. A short punchy line lands only when the
-sentences around it are longer. Uniform paragraphs of uniform length
-are the strongest tell that a machine wrote something.
+Vary the rhythm deliberately. Uniform paragraphs of uniform length are
+the strongest tell that a machine wrote something.
+
+A short punchy line lands mid-paragraph or at the end, where it closes
+something off. It usually fails at the *start* of a paragraph, where it
+reads as throat-clearing before the real sentence arrives:
+
+```
+BAD:  The bill arrives on the second call. Every read has to check the
+      bitmap first, which the fast path skips entirely.
+
+GOOD: The bill arrives on the second call, where every read has to
+      check the bitmap first, which the fast path skips entirely.
+```
+
+Before keeping a short opener, check that it carries a fact the
+paragraph needs instead of announcing that a fact is coming. A short
+line that states the paragraph's whole claim stays. "Not free, though."
+and "Nothing warns you." only announce, so they fold into the sentence
+after them.
+
+Describing a structure is where prose goes stiff, because a run of flat
+subject-verb-object statements about what a thing contains reads like a
+spec sheet even when every fact in it is right:
+
+```
+BAD:  The header stores a metadata block and a build map. The metadata
+      is 64 bytes. The build map has one 40-byte entry per range.
+
+GOOD: The header opens with 64 bytes of metadata and then just repeats
+      a 40-byte entry per range, so reading it is a matter of skipping
+      the first block and treating the rest as an array.
+```
+
+The fix isn't shorter sentences. Write the structure through what
+happens to somebody using it, and let each sentence earn the next one
+with a "so" or a "which" instead of stacking facts side by side.
 
 End sections with a practical takeaway when there is one. Don't
 manufacture one when there isn't.
@@ -111,6 +145,17 @@ then an overview with a visual summary if the process has many steps.
 The detailed walkthrough follows the overview, and the post ends on
 trade-offs or practical implications rather than a "conclusion."
 
+Keep the opening to three beats at most before the first heading: the
+concrete moment, why it happens, and the setup the reader needs to
+follow along. Openings go awkward by stacking beats instead of adding
+them up. A draft that shows a symptom, names the cause, defines every
+component, states the stakes, and then announces that an example is
+coming has spent five beats saying "here is a post about X."
+
+Cut the announcement lines first. "Here's an example small enough to
+trace by hand" and "Two mechanisms have to come first" are stage
+directions, not content. Just show the example.
+
 - Vary paragraph and sentence length. Don't write uniform blocks.
 - Never use the "Bold term: explanation sentence" list format. It's the
   single most recognisable AI pattern.
@@ -133,11 +178,63 @@ tags: [tag1, tag2, tag3]
 ```
 
 - Use code blocks with the correct language identifier (`sql`, `c`, `python`).
-- Use ASCII diagrams where they clarify a process or architecture.
-  Space-align every column, including the `|` characters.
 - Use tables for comparisons.
 - Keep each section focused on one concept.
 - Section names should be short and descriptive, not clever.
+
+## ASCII diagrams
+
+Default to more of them than feels necessary. A reader gets the shape of
+a system from a diagram in one glance and from a paragraph in thirty
+seconds, so any paragraph describing a layout, a path through
+components, or a before-and-after should probably have one beside it.
+
+Space-align every column, including the `|` characters.
+
+The rule most drafts break: **one diagram per step, not one per
+section.** When a section walks through a sequence, every step that
+changes the state gets its own picture. A single diagram of the final
+state makes the reader infer the intermediate ones, which is the work
+the diagram was supposed to do for them.
+
+```text
+BAD, one diagram for a three-step process:
+
+  final state, after all three steps
+  ┌──────────────────────────┐
+  │ slot 1: free             │
+  └──────────────────────────┘
+
+GOOD, the state after each step:
+
+  step 1: mark              step 2: unlink           step 3: release
+  ┌────────────────┐        drop every pointer       ┌────────────────┐
+  │ slot 1: dead   │        aimed at slot 1          │ slot 1: free   │
+  └────────────────┘        ──> nothing references   └────────────────┘
+                                it anymore
+```
+
+Pick whatever shape carries the idea with the least ceremony. Shapes
+that tend to work:
+
+- Before and after, side by side, when something mutates in place.
+- A numbered trace of one request, one line per hop.
+- Two labelled columns comparing the same operation across two systems.
+- A pointer or box-and-arrow diagram when the point is what references
+  what.
+- A layered stack with horizontal rules for a boundary that matters
+  (process, kernel, network), so crossing it is visible.
+- An indented tree for a directory, a key layout, or a config
+  hierarchy.
+- A byte or block layout when offsets and sizes are the content.
+
+Uppercase headers inside a diagram are fine for labelling regions
+(`PER POD, private`), and so are trailing right-margin annotations that
+say what a row costs or where it lives. Both beat a paragraph
+underneath explaining the same thing.
+
+Don't describe the diagram again in the prose below it. Say what it
+costs or what it implies, and move on.
 
 ## Banned words
 
@@ -170,6 +267,9 @@ These mimic insight without providing any.
 - Use contractions. "It's," "don't," "won't."
 - Maximum one em dash per response. Use commas or parentheses instead.
 - No semicolons in prose.
+- Pluralize a backticked identifier with an apostrophe outside the
+  backticks: `UPDATE`'s, `SELECT`'s, `Overlay`'s. A bare trailing `s`
+  reads as part of the identifier.
 - Don't over-format. Plain prose is often clearer than headers and bullet points.
 - Drop preamble ("Great question!"), performative enthusiasm ("exciting,"
   "incredible," "powerful"), and unsolicited caveats.
@@ -181,9 +281,32 @@ These mimic insight without providing any.
 - Ask clarifying questions when the topic or scope is unclear.
 - Flag anything that reads as generic so it can be fixed rather than shipped.
 
+## Section length
+
+A section that runs past roughly 400 words is usually two sections or
+one section with a paragraph of setup it doesn't need. Split it or cut
+it, and prefer cutting.
+
+Detail is not the thing to cut. The cuts that don't cost anything:
+
+- A sentence that restates the diagram above it.
+- A transition explaining what the section is about to do.
+- The second example, when the first one already landed.
+- A caveat nobody asked for.
+
+Trim the connective tissue and keep every fact. If the word count won't
+come down without losing a mechanism, the section wanted splitting.
+
 ## Before finishing, check:
 
 1. Read it out loud. Does any sentence sound like a press release? Rewrite it.
 2. Are you repeating the same point in different words? Say it once.
 3. Does your opening sentence set the scene with a grand statement about the
    state of the world? Delete it, start with the second sentence.
+4. Does any paragraph open on a sentence under nine words that only
+   announces what's coming? Fold it into the sentence after it.
+5. Does any step-by-step explanation have one diagram where it should
+   have one per step?
+6. Read every paragraph that describes a structure. If it's a run of
+   flat "X contains Y" statements, rewrite it around what a reader does
+   with the structure.
