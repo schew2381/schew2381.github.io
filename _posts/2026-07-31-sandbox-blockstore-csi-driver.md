@@ -1,15 +1,15 @@
 ---
-title: "(Part 3) Adapting E2B Block Storage into a CSI Driver"
+title: "(sandbox-blockstore Pt. 3) Adapting E2B Block Storage -> CSI"
 date: 2026-07-31 11:00:00 -0700
 categories: [kubernetes, storage, internals]
 tags: [csi, kubernetes, nbd, block-storage, s3, e2b, ext4]
 ---
 
 > A four-part series on lazy block storage and how it becomes a Kubernetes CSI driver:
-> 1. [How E2B's block storage works](/posts/e2b-block-storage-layer/)
-> 2. [The Kubernetes CSI interface](/posts/kubernetes-csi-interface/)
+> 1. [How E2B block storage works](/posts/e2b-block-storage-layer/)
+> 2. [K8s CSI interface](/posts/kubernetes-csi-interface/)
 > 3. Adapting E2B block storage into a CSI driver (this post)
-> 4. [Node caches and startup hot sets](/posts/sandbox-blockstore-performance/)
+> 4. [Optimizing startup performance](/posts/sandbox-blockstore-performance/)
 {: .prompt-info }
 
 Parts 1 and 2 are the two halves. E2B fetches block storage lazily out of S3, and CSI is how Kubernetes asks for a volume. Bolting them together gives you a driver where a Pod names a template build ID and gets back a writable ext4 mount over a multi-gigabyte image that never gets downloaded.

@@ -1,15 +1,15 @@
 ---
-title: "(Part 4) Node Caches and Startup Hot Sets"
+title: "(sandbox-blockstore Pt. 4) Optimizing startup performance"
 date: 2026-07-31 12:00:00 -0700
 categories: [kubernetes, storage, performance]
 tags: [csi, performance, caching, prefetch, s3, mincore]
 ---
 
 > A four-part series on lazy block storage and how it becomes a Kubernetes CSI driver:
-> 1. [How E2B's block storage works](/posts/e2b-block-storage-layer/)
-> 2. [The Kubernetes CSI interface](/posts/kubernetes-csi-interface/)
+> 1. [How E2B block storage works](/posts/e2b-block-storage-layer/)
+> 2. [K8s CSI interface](/posts/kubernetes-csi-interface/)
 > 3. [Adapting E2B block storage into a CSI driver](/posts/sandbox-blockstore-csi-driver/)
-> 4. Node caches and startup hot sets (this post)
+> 4. Optimizing startup performance (this post)
 {: .prompt-info }
 
 A Pod in the warm pool passed its readiness probe, sat there reporting `Ready`, and then took 59.3 seconds to answer its first `git status`.

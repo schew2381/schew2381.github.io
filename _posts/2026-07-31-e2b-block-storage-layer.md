@@ -1,15 +1,15 @@
 ---
-title: "(Part 1) How E2B's Block Storage Layer Works"
+title: "(sandbox-blockstore Pt. 1) How E2B Block Storage Works"
 date: 2026-07-31 09:00:00 -0700
 categories: [storage, internals]
 tags: [e2b, firecracker, nbd, block-storage, s3, copy-on-write]
 ---
 
 > A four-part series on lazy block storage and how it becomes a Kubernetes CSI driver:
-> 1. How E2B's block storage layer works (this post)
-> 2. [The Kubernetes CSI interface](/posts/kubernetes-csi-interface/)
+> 1. How E2B block storage works (this post)
+> 2. [K8s CSI interface](/posts/kubernetes-csi-interface/)
 > 3. [Adapting E2B block storage into a CSI driver](/posts/sandbox-blockstore-csi-driver/)
-> 4. [Node caches and startup hot sets](/posts/sandbox-blockstore-performance/)
+> 4. [Optimizing startup performance](/posts/sandbox-blockstore-performance/)
 {: .prompt-info }
 
 A sandbox is supposed to be ready in about a second. The root filesystem it boots from is a few gigabytes of ext4 sitting in S3, with a few gigabytes more of guest memory snapshot behind it, so the honest version of "start a sandbox" is "download eight gigabytes first." That's tens of seconds on a good day, and it happens before the user's code runs at all.

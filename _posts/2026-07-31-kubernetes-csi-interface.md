@@ -1,15 +1,15 @@
 ---
-title: "(Part 2) The Kubernetes CSI Interface"
+title: "(sandbox-blockstore Pt. 2) K8s CSI Interface"
 date: 2026-07-31 10:00:00 -0700
 categories: [kubernetes, storage]
 tags: [csi, kubernetes, kubelet, grpc, volumes, storage]
 ---
 
 > A four-part series on lazy block storage and how it becomes a Kubernetes CSI driver:
-> 1. [How E2B's block storage works](/posts/e2b-block-storage-layer/)
-> 2. The Kubernetes CSI interface (this post)
+> 1. [How E2B block storage works](/posts/e2b-block-storage-layer/)
+> 2. K8s CSI interface (this post)
 > 3. [Adapting E2B block storage into a CSI driver](/posts/sandbox-blockstore-csi-driver/)
-> 4. [Node caches and startup hot sets](/posts/sandbox-blockstore-performance/)
+> 4. [Optimizing startup performance](/posts/sandbox-blockstore-performance/)
 {: .prompt-info }
 
 Part 1 ended with a storage layer that serves a block device out of S3. To hand that to a Pod, something has to convince Kubernetes it's a volume, and the [Container Storage Interface](https://github.com/container-storage-interface/spec/blob/master/spec.md) is how that happens.
