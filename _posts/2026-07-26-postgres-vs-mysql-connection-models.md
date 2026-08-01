@@ -1,5 +1,5 @@
 ---
-title: "Postgres vs MySQL, Part 5: Connections, Processes vs Threads"
+title: "(Part 5) Postgres vs MySQL: Connections, Processes vs Threads"
 date: 2026-07-26 10:00:00 -0700
 categories: [databases, internals]
 tags: [postgres, mysql, connections, processes, threads]
@@ -19,7 +19,7 @@ Postgres runs one OS process per connection. MySQL runs one OS thread per connec
 
 ## Postgres: a process per connection
 
-A Postgres server is a family of processes. A supervisor called the [postmaster](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/postmaster/postmaster.c) owns the listening socket and the shared memory region. When a client connects, the postmaster [`fork()`s a new backend process](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/postmaster/postmaster.c#L3627) to handle that one connection for its entire life.
+A Postgres server is a family of processes. A supervisor called the [postmaster](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/postmaster/postmaster.c) owns the listening socket and the shared memory region. When a client connects, the postmaster [launches a child process](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/postmaster/postmaster.c#L3627) that handles that one connection for its entire life, and the launch bottoms out in a real [`fork_process()`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/postmaster/launch_backend.c#L222).
 
 ```text
         postmaster (supervisor)
@@ -64,7 +64,7 @@ The upside is that connections are lighter, so MySQL tolerates a higher raw conn
 | Server shape | Postmaster + many backends | One `mysqld`, many threads |
 | Shared state | Explicit shared memory segment | Shared process address space |
 | Cost per connection | Higher (process + local memory) | Lower (thread, cached and reused) |
-| One connection crashes | Isolated; server survives | Can take down the whole server |
+| One connection crashes | Isolated, server survives | Can take down the whole server |
 | Reuse | New backend each time | Thread cache parks and reuses threads |
 
 Neither model removes the need to bound concurrency. Postgres hits its wall sooner on raw connection count because processes are heavy, so a pooler is close to mandatory at scale. MySQL's threads are cheaper per connection but share fate, so its wall is context-switch and contention overhead that a thread pool addresses. The right mental model is the same for both: a database connection is expensive, and something, a pooler or a thread pool, has to keep the active count sane.

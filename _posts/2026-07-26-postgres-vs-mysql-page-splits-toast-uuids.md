@@ -1,5 +1,5 @@
 ---
-title: "Postgres vs MySQL, Part 4: Page Splits, TOAST, and UUIDs"
+title: "(Part 4) Postgres vs MySQL: Page Splits, TOAST, and UUIDs"
 date: 2026-07-26 09:45:00 -0700
 categories: [databases, internals]
 tags: [postgres, mysql, innodb, toast, uuid]
@@ -24,15 +24,15 @@ Postgres calls this TOAST, The Oversized-Attribute Storage Technique. When a hea
 The TOAST table is an ordinary heap under the hood. It chops the big value into chunks that each fit a page and stores them as its own rows, keyed by an OID the main-table pointer references. This keeps the main heap slim, so a scan that doesn't `SELECT` the big column never reads the chunks. See [`toast_internals.c`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/common/toast_internals.c).
 
 ```text
-main heap tuple                    TOAST table (hidden heap)
-┌────────────────────────┐         ┌──────────────────────┐
-│ id=1  status=active     │         │ oid=5001 chunk 0      │
-│ payload ─▶ TOAST oid 5001│───────▶│ oid=5001 chunk 1      │
-└────────────────────────┘         │ oid=5001 chunk 2      │
-                                    └──────────────────────┘
+main heap tuple                     TOAST table (hidden heap)
+┌──────────────────────────┐        ┌───────────────────────┐
+│ id=1   status=active     │        │ oid=5001  chunk 0     │
+│ payload ──> TOAST 5001 ──┼───────►│ oid=5001  chunk 1     │
+└──────────────────────────┘        │ oid=5001  chunk 2     │
+                                    └───────────────────────┘
 ```
 
-InnoDB does nearly the same thing under a different name: off-page storage. When a row won't fit a 16 KB page, InnoDB moves large `BLOB`/`TEXT` columns to separate overflow pages and stores a [20-byte pointer](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/include/page0size.h#L39) in the clustered-index leaf. The exact behavior depends on the row format (`DYNAMIC` stores just the pointer in the leaf; older `COMPACT` kept a 768-byte prefix inline), but the goal is identical: keep the clustered index compact so it stays fast to traverse.
+InnoDB does nearly the same thing under a different name: off-page storage. When a row won't fit a 16 KB page, InnoDB moves large `BLOB`/`TEXT` columns to separate overflow pages and stores a [20-byte pointer](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/include/page0size.h#L39) in the clustered-index leaf. The exact behavior depends on the row format, where `DYNAMIC` stores just the pointer in the leaf and older `COMPACT` kept a 768-byte prefix inline, but the goal is identical: keep the clustered index compact so it stays fast to traverse.
 
 TOAST interacts nicely with the MVCC model from [Part 2](/posts/postgres-vs-mysql-mvcc-vacuum-vs-undo/). Update a small column and Postgres writes a new main-table tuple that simply copies the TOAST pointer, so the multi-megabyte value isn't rewritten. Update the big column and it writes new chunks, leaving the old chunks for older transactions until `VACUUM` reclaims them.
 
@@ -69,7 +69,7 @@ Postgres pays for the same problem in a different currency. Dead tuples from [Pa
 
 ## Why random UUIDs wreck MySQL
 
-This is where clustering bites hardest, and it's a real decision people get wrong. A random UUID (v4) as a primary key is fine in Postgres and pathological in MySQL.
+Clustering bites hardest here, and it's a decision people get wrong in production. A random UUID (v4) as a primary key is fine in Postgres and pathological in MySQL.
 
 Recall from [Part 1](/posts/postgres-vs-mysql-storage-clustered-vs-heap/) that in InnoDB the primary key *is* the table, and it stays in key order. An auto-incrementing integer inserts in perfect order: every new row appends to the rightmost leaf, the page fills, InnoDB seals it and starts a fresh one. The active tail stays in the buffer pool, and writes are sequential and cheap.
 

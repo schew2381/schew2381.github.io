@@ -1,5 +1,5 @@
 ---
-title: "Postgres vs MySQL, Part 3: HOT Updates"
+title: "(Part 3) Postgres vs MySQL: HOT Updates"
 date: 2026-07-26 09:30:00 -0700
 categories: [databases, internals]
 tags: [postgres, mysql, mvcc, hot, index]
@@ -33,12 +33,14 @@ The indexes never learn the new tuple exists. They still point at the old TID, w
 Take a row at TID `(10, 1)`, page 10 slot 1, with two indexes: one on `id`, one on `name`.
 
 ```text
-indexes                    heap page 10
-┌──────────────┐           ┌──────────────────────┐
-│ id index      │──(10,1)──▶│ slot 1: id=1          │
-│ name index    │──(10,1)──▶│         name=Smith    │
-└──────────────┘           └──────────────────────┘
-both indexes point at slot 1
+indexes                       heap page 10
+┌────────────────┐            ┌───────────────────────┐
+│ id index       │            │ slot 1:  id=1         │
+│ name index     │            │          name=Smith   │
+└────────────────┘            └───────────────────────┘
+        │                                 ▲
+        └────────── both point ───────────┘
+                     at (10,1)
 ```
 
 ### Non-indexed update: HOT applies
@@ -46,14 +48,18 @@ both indexes point at slot 1
 Set `status = 'inactive'`, a column with no index. Postgres writes the new version at slot 2 and forwards slot 1 to it:
 
 ```text
-indexes                    heap page 10
-┌──────────────┐           ┌──────────────────────┐
-│ id index      │──(10,1)──▶│ slot 1: Smith  ──┐    │  HEAP_HOT_UPDATED
-│ name index    │──(10,1)──▶│                  │    │  t_ctid ─▶ slot 2
-└──────────────┘           │ slot 2: ◀────────┘    │  HEAP_ONLY_TUPLE
-                           │   status=inactive     │
-                           └──────────────────────┘
-indexes unchanged; slot 1 forwards to slot 2
+indexes                       heap page 10
+┌────────────────┐            ┌───────────────────────┐
+│ id index       │            │ slot 1:  name=Smith   │  HEAP_HOT_UPDATED
+│ name index     │            │          t_ctid = ────┼──┐
+└────────────────┘            │                       │  │
+        │                     │ slot 2:  name=Smith   │  │
+        │                     │          status=      │◄─┘
+        │                     │            inactive   │  HEAP_ONLY_TUPLE
+        │                     └───────────────────────┘
+        │                                 ▲
+        └───── both still point at ───────┘
+                     (10,1)
 ```
 
 A lookup by `id` or `name` lands on slot 1 as before, sees the forwarding pointer, and follows it to slot 2. Neither index was written.
@@ -64,9 +70,9 @@ Now set `name = 'Smyth'`. The `name` index is sorted, and "Smyth" belongs in a d
 
 Once one index needs a direct entry, the whole update leaves the HOT path. Postgres writes the new tuple and updates every index to point at its TID, the exact penalty HOT existed to avoid. HOT is all-or-nothing: either no index is touched, or all of them are.
 
-## What if the page is full?
+## When the page has no room
 
-Condition 2 fails when the old tuple's page has no room for the new one. Postgres can't put the new version on a different page and still call it a HOT chain, because a HOT chain lives entirely within one page. So it falls back to a normal update: new tuple on a page that has space, every index re-pointed.
+The second condition is the one that fails silently. Postgres can't put the new version on a different page and still call it a HOT chain, because a HOT chain lives entirely within one page. So a full page means falling back to a normal update: new tuple wherever there's space, every index re-pointed.
 
 A common myth, and one I believed until I checked the source, is that Postgres reserves free space on every heap page by default to leave room for HOT updates. It doesn't. The `fillfactor` storage parameter controls that reservation, and [`HEAP_DEFAULT_FILLFACTOR`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/include/utils/rel.h#L362) is `100`: heap pages pack full by default. (B-Tree indexes are the ones that default to `90`.) If a table is HOT-update heavy, you lower `fillfactor` yourself so pages keep slack for in-page updates.
 
@@ -75,21 +81,22 @@ A common myth, and one I believed until I checked the source, is that Postgres r
 HOT chains would grow without bound if only `VACUUM` cleaned them. Postgres also prunes them opportunistically during ordinary reads, in [`heap_page_prune_opt`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/heap/pruneheap.c#L272). When a `SELECT` touches a page, Postgres checks its HOT chains, and if the head tuple is dead to everyone, it prunes:
 
 ```text
-before prune                    after prune
-┌──────────────────┐            ┌──────────────────┐
-│ slot 1: Smith dead│            │ slot 1: ─▶ slot 2 │  redirect stub
-│   t_ctid ─▶ slot 2│            │ slot 2: live      │
-│ slot 2: live      │            └──────────────────┘
-└──────────────────┘            indexes still point at slot 1
+before prune                     after prune
+┌───────────────────────┐        ┌───────────────────────┐
+│ slot 1: Smith (dead)  │        │ slot 1: LP_REDIRECT   │
+│         t_ctid = 2    │        │         to slot 2     │
+│ slot 2: live          │        │ slot 2: live          │
+└───────────────────────┘        └───────────────────────┘
+                                 indexes still point at slot 1
 ```
 
 Slot 1 becomes a tiny redirect stub instead of a full dead row, reclaiming most of its space, and, crucially, the indexes still point at slot 1 and need no update. Cleanup happens without touching a single index entry.
 
-## Why not a "trampoline" or mixed indexes?
+## Two rejected designs
 
-Two cleverer designs seem like they'd avoid updating every index, and both were considered and rejected. Seeing why is seeing why HOT is shaped the way it is.
+Two cleverer schemes look like they'd dodge the all-or-nothing rule, and both were considered and rejected. Seeing why they fail is seeing why HOT is shaped the way it is.
 
-The first is a trampoline: add the "Smyth" entry but point it at old slot 1, and let slot 1 forward to the new tuple, so the other indexes stay put. It fails for two reasons. One is the immortal-dead-row problem. MVCC cleanup depends on old versions eventually becoming garbage that gets reclaimed, but if a live "Smyth" entry needs slot 1 as a bridge, slot 1 can never be freed, and every update adds another undeletable bridge tuple until the table is permanent bloat. The other is verification cost. A HOT chain guarantees that every tuple in it matches the index key that led there; break that and a search for "Smith" following the chain to a "Smyth" tuple would have to re-check the `WHERE` clause on every hop, burning CPU on every fetch.
+The first is a trampoline: add the "Smyth" entry but point it at old slot 1, and let slot 1 forward to the new tuple, so the other indexes stay put. It fails for two reasons. One is the immortal-dead-row problem. MVCC cleanup depends on old versions eventually becoming garbage that gets reclaimed, but if a live "Smyth" entry needs slot 1 as a bridge, slot 1 can never be freed, and every update adds another undeletable bridge tuple until the table is permanent bloat. The other is verification cost. A HOT chain guarantees that every tuple in it matches the index key that led there. Break that guarantee and a search for "Smith" that follows the chain to a "Smyth" tuple would have to re-check the `WHERE` clause on every hop, burning CPU on every fetch.
 
 The second is mixed state: let the `name` index point at the new tuple while the `id` index keeps pointing at the old slot and follows the chain. This one breaks the cheap pruning above. Pruning is fast precisely because Postgres knows that for a HOT chain *all* indexes point at the chain head, so it can turn the head into a redirect without consulting any index. Allow mixed pointers and pruning no longer knows which index references which slot, so to prune safely it would have to inspect every index on the table, taking locks and doing I/O, exactly the cost HOT was built to avoid.
 

@@ -1,5 +1,5 @@
 ---
-title: "Postgres vs MySQL, Part 1: Clustered Index vs Heap"
+title: "(Part 1) Postgres vs MySQL: Clustered Index vs Heap"
 date: 2026-07-26 09:00:00 -0700
 categories: [databases, internals]
 tags: [postgres, mysql, innodb, index, storage]
@@ -33,25 +33,40 @@ Insert two rows: Alice (`id=1`, `email=a@a.com`) and Bob (`id=2`, `email=b@b.com
 
 ## MySQL: the index is the table
 
-InnoDB builds a B+Tree keyed on the primary key. Upper nodes only route the search; the leaf nodes at the bottom hold the full row. Look up `id=1` and the row is right there when the search lands, with no second hop.
+InnoDB builds a B+Tree keyed on the primary key. Upper nodes only route the search, and the leaf nodes at the bottom hold the full row. Look up `id=1` and the row is right there when the search lands, with no second hop.
 
 ```text
 InnoDB clustered index (keyed on id)
 
-           ┌───────────────┐
-           │  root: [1 | 2] │
-           └───────┬───────┘
-        ┌──────────┴──────────┐
-        ▼                     ▼
-┌──────────────────┐  ┌──────────────────┐
-│ leaf: id=1        │  │ leaf: id=2        │
-│ name=Alice        │  │ name=Bob          │
-│ email=a@a.com     │  │ email=b@b.com     │
-└──────────────────┘  └──────────────────┘
-      the row lives in the leaf
+           ┌─────────────────┐
+           │ root: [1 | 2]   │
+           └────────┬────────┘
+         ┌──────────┴──────────┐
+         ▼                     ▼
+┌─────────────────┐   ┌─────────────────┐
+│ leaf: id=1      │   │ leaf: id=2      │
+│ name=Alice      │   │ name=Bob        │
+│ email=a@a.com   │   │ email=b@b.com   │
+└─────────────────┘   └─────────────────┘
+        the row lives in the leaf
 ```
 
-The row already occupies the leaf, so a secondary index can't also store a full copy without duplicating the whole table. Instead, a secondary index leaf holds the indexed value plus the primary key, and that primary key is the pointer back to the row.
+A secondary index can't store the row too, since that would mean keeping a second copy of the whole table. So it stores the primary key instead. The `email` index maps each email to an `id`, and you use that `id` to go get the row from the clustered index.
+
+```text
+InnoDB secondary index (keyed on email)
+
+          ┌───────────────────────┐
+          │ root: [a@a.com | ...] │
+          └───────────┬───────────┘
+          ┌───────────┴───────────┐
+          ▼                       ▼
+┌───────────────────┐   ┌───────────────────┐
+│ email=a@a.com     │   │ email=b@b.com     │
+│ id=1              │   │ id=2              │
+└───────────────────┘   └───────────────────┘
+     no row data, just the PK to look up next
+```
 
 Looking up by `email` therefore walks two trees:
 
