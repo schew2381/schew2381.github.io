@@ -1,5 +1,5 @@
 ---
-title: "(Pt. 1 sandbox-blockstore) How E2B Block Storage Works"
+title: "(Pt. 1) sandbox-blockstore: How E2B Block Storage Works"
 date: 2026-07-31 09:00:00 -0700
 categories: [storage, internals]
 tags: [e2b, firecracker, nbd, block-storage, s3, copy-on-write]

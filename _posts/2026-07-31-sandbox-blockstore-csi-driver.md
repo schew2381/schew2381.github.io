@@ -1,5 +1,5 @@
 ---
-title: "(Pt. 3 sandbox-blockstore) Adapting E2B Block Storage -> CSI"
+title: "(Pt. 3) sandbox-blockstore: Adapting E2B Block Storage -> CSI"
 date: 2026-07-31 11:00:00 -0700
 categories: [kubernetes, storage, internals]
 tags: [csi, kubernetes, nbd, block-storage, s3, e2b, ext4]

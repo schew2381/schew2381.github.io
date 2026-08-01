@@ -1,5 +1,5 @@
 ---
-title: "(Pt. 4 sandbox-blockstore) Optimizing startup performance"
+title: "(Pt. 4) sandbox-blockstore: Optimizing startup performance"
 date: 2026-07-31 12:00:00 -0700
 categories: [kubernetes, storage, performance]
 tags: [csi, performance, caching, prefetch, s3, mincore]
