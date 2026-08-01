@@ -1,5 +1,5 @@
 ---
-title: "(sandbox-blockstore Pt. 2) K8s CSI Interface"
+title: "(Pt. 2 sandbox-blockstore) K8s CSI Interface"
 date: 2026-07-31 10:00:00 -0700
 categories: [kubernetes, storage]
 tags: [csi, kubernetes, kubelet, grpc, volumes, storage]
