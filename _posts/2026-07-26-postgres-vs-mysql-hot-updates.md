@@ -88,11 +88,31 @@ BRIN is the one exception, and it's deliberate. BRIN sets [`amsummarizing = true
 
 ## When the page has no room
 
-The second condition fails on you silently. A HOT chain lives entirely inside one page by construction, so Postgres can't put the new version on a different page and still call it HOT. Page full means normal update: new tuple wherever there's room, every index re-pointed, back to N+1 writes.
+The second condition fails on you silently. A HOT chain lives entirely inside one page by construction, and the code enforces it with an [`Assert`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/heap/heapam_indexscan.c#L217) that a chain's forwarding pointer stays on the same block, so Postgres can't put the new version on a different page and still call it HOT. Page full means normal update: new tuple wherever there's room, every index re-pointed, back to N+1 writes.
 
 Here's the part I had wrong for years. I assumed Postgres reserves free space on every heap page by default, precisely so HOT has somewhere to put things. It doesn't. `fillfactor` controls that reservation and [`HEAP_DEFAULT_FILLFACTOR`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/include/utils/rel.h#L362) is `100`, so heap pages pack completely full out of the box. B-Tree indexes default to `90` and get slack. Your table gets none.
 
 So on a table with a heavy HOT-update path, lowering `fillfactor` is one of the few genuine free wins available. `ALTER TABLE ... SET (fillfactor = 85)` trades space per page for in-page update room on every page written afterward. Existing pages keep their old packing until they're rewritten, which is the detail that makes people think the setting did nothing.
+
+### The reads get worse too
+
+N+1 writes is the cost everybody quotes, and it isn't the whole bill. Condition one held here, remember, so `name` never changed, which means the new index entry has the *same key* as the old one:
+
+```text
+name index                            heap
+┌──────────────────────┐              ┌────────────────────────┐
+│ key=Smith ──> (10,1) │─────────────►│ (10,1) name=Smith      │  dead
+│ key=Smith ──> (14,6) │──────┐       └────────────────────────┘
+└──────────────────────┘      │       ┌────────────────────────┐
+                              └──────►│ (14,6) name=Smith      │  live
+                                      └────────────────────────┘
+```
+
+A search for "Smith" gets both TIDs back and, per [Part 2](/posts/postgres-vs-mysql-mvcc-vacuum-vs-undo/), nothing to choose between them with, so it fetches both and lets the heap headers decide. Two heap tuples on two different pages to return one row.
+
+Nothing warns you. A plain `EXPLAIN` reports rows returned rather than tuples examined, so the extra fetch hides inside a plan that looks correct. `EXPLAIN (ANALYZE, BUFFERS)` shows it as block reads you can't account for, and across a whole table the tell is `pg_stat_user_tables.idx_tup_fetch` running well ahead of `idx_scan` times the rows a scan should return.
+
+So why can't the old entry forward to the new page, the way HOT forwards inside one? The old tuple's `t_ctid` does still physically point at the new tuple. The non-HOT branch of `heap_update` [clears `HEAP_HOT_UPDATED`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/heap/heapam.c#L4195) on it, though, so no scan will ever follow that pointer, which is exactly what the `Assert` above is protecting. Those same-key duplicates are what [Part 2](/posts/postgres-vs-mysql-mvcc-vacuum-vs-undo/)'s bottom-up deletion pass hunts for, so the pile stays bounded as long as no old snapshot is pinning it.
 
 ## Pruning: cleaning HOT chains cheaply
 
