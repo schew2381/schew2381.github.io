@@ -25,7 +25,7 @@ The easy version of not fitting is a single value larger than any page. A 100 KB
 
 Postgres calls this TOAST, The Oversized-Attribute Storage Technique, and the threshold is lower than most people expect. It kicks in when a tuple would exceed roughly 2 KB, not 8 KB, because [`TOAST_TUPLE_THRESHOLD`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/include/access/heaptoast.h#L48) is a quarter of a page. Postgres wants four tuples per page minimum, so a 3 KB row gets TOASTed even though it would fit fine on its own.
 
-Getting there takes two steps, with compression first:
+Compression comes first, though, which is the half people forget:
 
 ```text
 step 1: compress in place
