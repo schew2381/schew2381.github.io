@@ -598,3 +598,44 @@ come down without losing a mechanism, the section wanted splitting.
 13. Read every paragraph that describes a structure. If it's a run of
     flat "X contains Y" statements, rewrite it around what a reader does
     with the structure.
+
+## The prose report
+
+`tools/prose-report.py` prints statistics for a post and flags lines
+worth a second look. Run it after the checklist above rather than
+instead of it. It doesn't run in CI and it isn't a gate on anything.
+
+```console
+$ python3 tools/prose-report.py                     # every post
+$ python3 tools/prose-report.py _posts/a-post.md    # named posts
+$ python3 tools/prose-report.py --quiet             # findings only
+$ python3 tools/prose-report.py --labels            # what each label means
+```
+
+Findings come in two kinds, and the report separates them.
+
+The mechanical ones are wrong against this guide no matter the context:
+a banned word, a semicolon in prose, an em dash, a code fence with no
+language id, a link to a moving branch instead of a pinned SHA. Fix
+those.
+
+The judgment ones are candidates and nothing more. A 43-word sentence,
+a paragraph opening on a five-word fragment, a run of flat "X contains
+Y" statements, three shared words between a diagram and the prose under
+it. Every one of them is a place to go read the line in context and
+decide, and plenty will be right as they stand. Some of this guide's own
+GOOD examples trip these checks, because a rule that holds nine times
+in ten still has the tenth.
+
+So a flag is not a verdict, and a clean run is not evidence the writing
+is any good. The report can't tell you whether the opening makes the
+reader want the mechanism, whether a section earns its place, or whether
+two consecutive paragraphs have any reason to be consecutive. Those are
+what this guide is mostly about, and reading the post is the only way to
+check them.
+
+Tuning the script is expected. When a check fires on a line that's
+actually fine, fix the pattern rather than the post, then add that
+sentence to `tools/prose-report-test.py` so a later tightening doesn't
+bring the false positive back. `python3 tools/prose-report-test.py`
+runs every pattern against every post.

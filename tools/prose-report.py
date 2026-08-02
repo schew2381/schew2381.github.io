@@ -8,6 +8,7 @@ finding on its own.
     python3 tools/prose-report.py                  # every post
     python3 tools/prose-report.py _posts/foo.md    # named posts
     python3 tools/prose-report.py --quiet          # findings only
+    python3 tools/prose-report.py --labels         # what each label means
 """
 
 from __future__ import annotations
@@ -82,7 +83,11 @@ HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)")
 LIST_RE = re.compile(r"^\s*(\d+\.|[-*+])\s+")
 NUMBERED_RE = re.compile(r"^\s*\d+\.\s+")
 ATTR_RE = re.compile(r"^\s*\{:")
-ABBREV_RE = re.compile(r"\b(?:e\.g|i\.e|vs|etc|approx|Dr|Mr|Ms|Mrs|Pt|Fig|No|Inc|Ltd|Jr|Sr|St|[A-Z])\.$")
+# The bare `[A-Z]` branch is a middle initial, so it wants a space in front of
+# it. Without one it swallows the period ending `random I/O.` or `4 KB.`
+ABBREV_RE = re.compile(
+    r"(?:\b(?:e\.g|i\.e|vs|etc|approx|Dr|Mr|Ms|Mrs|Pt|Fig|No|Inc|Ltd|Jr|Sr|St)|(?:^|\s)[A-Z])\.$"
+)
 CODE_SPAN_RE = re.compile(r"`[^`]+`")
 LINK_RE = re.compile(r"\[([^\]]*)\]\(([^)]*)\)")
 CONTRACTION_RE = re.compile(r"\b\w+['\u2019](?:s|t|re|ve|ll|d|m)\b", re.I)
@@ -205,8 +210,8 @@ def parse(path: Path) -> Post:
         if stripped.startswith("|"):
             flush_para()
             flush_run()
-            if not re.fullmatch(r"\|[\s:|-]+\|", stripped):
-                tables += 1 if stripped.count("|") and lines[number - 2].strip().startswith("|") is False else 0
+            if not lines[number - 2].strip().startswith("|"):
+                tables += 1
             continue
 
         if LIST_RE.match(text):
@@ -307,13 +312,68 @@ SIGNPOSTS = [
 
 READING_INSTRUCTIONS = [
     r"worth going slowly", r"bear with me", r"stay with me",
-    r"it's worth noting", r"as we'll see", r"read on",
+    r"it's worth noting", r"as we'll see", r"\bread on\b",
+    r"more on (this|that) (later|below)", r"we'll come back to",
 ]
 
 FILLER_OPENERS = {"simple.", "surprisingly.", "interestingly.", "obviously.", "naturally.", "unsurprisingly."}
 
 SUBORDINATORS = re.compile(r"\b(since|because|which|while|although|so that|whereas|unless)\b", re.I)
 STRUCTURE_VERBS = re.compile(r"^\W*\S+(\s+\S+){0,3}\s+(is|has|holds|stores|contains|carries|keeps)\s", re.I)
+
+
+def is_spec_sheet(sentence: str) -> bool:
+    """A short `X contains Y` statement with a measurement and no consequence.
+
+    The guide's target is a run of these side by side, which reads like a spec
+    sheet. A subordinate clause means the sentence is doing something with the
+    fact rather than just listing it.
+    """
+    if len(sentence.split()) > 16 or not STRUCTURE_VERBS.match(sentence):
+        return False
+    if SUBORDINATORS.search(sentence) or "," in sentence:
+        return False
+    # A measurement is the tell. Without one the sentence is making a claim,
+    # not reciting a field, so `is exactly what Part 1 was worth` stays.
+    return re.search(r"\b\d+([.,]\d+)?\s*(?:[KMGT]i?B|bytes?|bits?|entries|entry|%|\w+-byte)", sentence) is not None
+
+# A short opener earns its place by carrying a fact. These carry none: they
+# say a fact is coming, or grade the one above without adding to it.
+ANNOUNCING_OPENER = re.compile(
+    r"^(?:"
+    r"(?:it|that|this|there)'?s?\s+(?:not|no|worth|where|when|how|why|the\s+\w+\s+part)"
+    r"|(?:so|but|and|then)?\s*here'?s\b"
+    r"|(?:the\s+)?(?:answer|reason|question|point|catch|problem|trick|rest|bill|cost)"
+    r"\s+(?:is|comes|arrives|lands|matters)\b"
+    r"|\w+\s+(?:comes?|goes?)\s+first\b"
+    r"|(?:let'?s|consider)\b"
+    r")",
+    re.I,
+)
+
+# "Nothing warns you." and "Not free, though." carry no fact, but
+# "Nothing in those eight transfers the image." does, so the bare negation
+# only counts when there's almost nothing else in the sentence.
+BARE_NEGATION = re.compile(r"^(?:not|nothing|nobody|none|never)\b", re.I)
+
+# Promises a complication without naming it: "Which raises its own problem."
+VAGUE_NOUN = re.compile(
+    r"\b(?:problem|problems|issue|issues|question|questions|catch|wrinkle|twist|"
+    r"complication|subtlety|thing|things|story|shape)\b\.?$",
+    re.I,
+)
+
+
+def announces_only(sentence: str) -> bool:
+    words = len(sentence.split())
+    if words >= 9:
+        return False
+    stripped = sentence.rstrip(":")
+    if BARE_NEGATION.match(stripped) and words <= 4:
+        return True
+    if VAGUE_NOUN.search(stripped) and not re.search(r"\d|`", stripped):
+        return True
+    return ANNOUNCING_OPENER.match(stripped) is not None
 
 
 # ---------------------------------------------------------------- checks
@@ -468,14 +528,17 @@ def check_judgment(post: Post) -> list[Finding]:
             if len(b.split()) <= 3 and re.match(r"^(Not|Just|Zero|None|Never)\b", b) and len(a.split()) > 4:
                 found.append(Finding(para.start, "judgment", "escalating-fragment", f"{short(a, 50)} / {b}"))
 
-        flat = sum(1 for s in parts if STRUCTURE_VERBS.match(s) and re.search(r"\d", s))
-        if flat >= 3:
-            found.append(Finding(para.start, "judgment", "flat-structure", f"{flat} of {len(parts)} sentences"))
+        flat = [s for s in parts if is_spec_sheet(s)]
+        if len(flat) >= 3 and len(flat) >= len(parts) - 1:
+            found.append(
+                Finding(para.start, "judgment", "flat-structure",
+                        f"{len(flat)} of {len(parts)} sentences  {short(flat[0], 60)}")
+            )
 
         above = preceding_fence(post, para)
         if above is not None and parts:
             shared, share = diagram_echo(above, parts[0])
-            if share >= 0.5:
+            if share >= 0.5 and len(shared) >= 3:
                 found.append(
                     Finding(para.start, "judgment", "diagram-echo",
                             f"{share:.0%} of the sentence is diagram vocabulary: {', '.join(sorted(shared))}")
@@ -491,8 +554,13 @@ def check_judgment(post: Post) -> list[Finding]:
         para = following_paragraph(post, fence)
         if para is None:
             continue
-        if re.search(r"\b(here'?s?\s+(is\s+)?(the|what|an?)\b|what follows is)", para.text.lower()[:80]):
+        opening = para.text.lower()[:90]
+        announces = re.search(r"\bhere'?s\s+(is\s+)?(the|what|an?|how)\b|\bwhat follows is\b", opening)
+        if announces and not re.search(r"\bhere'?s\s+\w+ing\b", opening):
             found.append(Finding(para.start, "judgment", "announce-example", short(para.text, 70)))
+
+    found.extend(check_colons(post))
+    found.extend(check_paragraph_seams(post))
 
     if len(para_words) >= 8:
         spread = statistics.pstdev(para_words) / statistics.fmean(para_words)
@@ -502,6 +570,86 @@ def check_judgment(post: Post) -> list[Finding]:
                         f"spread {spread:.2f} across {len(para_words)} paragraphs")
             )
     return found
+
+
+# `Statement: X, Y, and Z`. Three or more items, since the guide keeps the
+# two-item colon and the single restatement that lands harder attached.
+COLON_LIST_RE = re.compile(r"[^.:!?]{12,}:\s+[^.:!?]*,[^.:!?]*,[^.:!?]*[.!?]?$")
+
+# A paragraph opening this way is finishing the previous paragraph's sentence
+# rather than starting its own: "The VM isn't what anyone waits on." / "The disk is."
+COMPLETION_OPENER = re.compile(
+    r"^(?:"
+    r"(?:the|this|that|these|those|it|they|there)\s+\w+\s+(?:is|are|was|were|does|do|did|isn'?t|doesn'?t)\.?$"
+    r"|(?:which|and|but|so|then|except|unless|because|since)\b"
+    r"|\w+\s+(?:is|are|was|were|does|do|did)\.$"
+    r")",
+    re.I,
+)
+
+
+def is_caption(para: Paragraph) -> bool:
+    """A bare source link under a code block, not prose."""
+    return LINK_RE.fullmatch(para.raw.strip()) is not None
+
+
+def strands_the_opener(head: str) -> bool:
+    """Whether this first sentence needs the paragraph above it to make sense."""
+    if len(head.split()) > 8:
+        return False
+    # A colon makes the line a lead-in to the block below it, which is the
+    # handoff the guide asks for rather than a fragment left stranded.
+    if head.rstrip().endswith(":"):
+        return False
+    return COMPLETION_OPENER.match(head) is not None or announces_only(head)
+
+
+def check_paragraph_seams(post: Post) -> list[Finding]:
+    """Flag a paragraph break that lands mid-thought.
+
+    The guide keeps a short punchy line at the end of a paragraph and rejects
+    it at the start, so the seam worth reading twice is a long closing sentence
+    followed by a fragment that only makes sense attached to it.
+    """
+    found: list[Finding] = []
+    for previous, para in zip(post.paragraphs, post.paragraphs[1:]):
+        if para.start - previous.end > 2:
+            continue
+        if is_caption(previous):
+            continue
+        closing = sentences(previous.text)
+        opening = sentences(para.text)
+        if not closing or not opening:
+            continue
+        head = opening[0]
+        if not strands_the_opener(head):
+            continue
+        found.append(
+            Finding(para.start, "judgment", "paragraph-seam",
+                    f"{len(head.split())}w opener after {len(closing[-1].split())}w close: "
+                    f"...{short(closing[-1], 44)} // {head}")
+        )
+    return found
+
+
+def check_colons(post: Post) -> list[Finding]:
+    """Flag `statement: X, Y, and Z` only once the post is over the guide's budget.
+
+    Three or fewer is the shape working as intended, so the finding is the
+    excess and the count that makes it excess.
+    """
+    hits = [
+        (para.start, sentence)
+        for para in post.paragraphs
+        for sentence in sentences(para.text)
+        if COLON_LIST_RE.search(sentence)
+    ]
+    if len(hits) <= 3:
+        return []
+    return [
+        Finding(line, "judgment", "colon-statement", f"{len(hits)} in this post  {short(sentence)}")
+        for line, sentence in hits
+    ]
 
 
 def preceding_fence(post: Post, para: Paragraph) -> Fence | None:
@@ -585,6 +733,9 @@ def stats(post: Post) -> list[str]:
     second_person = len(re.findall(r"\b(you|you'?re|you'?ve|your)\b", prose))
     longest = max(post.sections, key=lambda s: s.words) if post.sections else None
     para_words = [len(p.text.split()) for p in post.paragraphs] or [0]
+    openers = [sentences(p.text)[0] for p in post.paragraphs if sentences(p.text)]
+    short_openers = sum(1 for s in openers if len(s.split()) < 9)
+    colon_lists = sum(1 for p in post.paragraphs for s in sentences(p.text) if COLON_LIST_RE.search(s))
 
     out = [
         f"words {words}   sentences {len(parts)}   paragraphs {len(post.paragraphs)}"
@@ -596,10 +747,13 @@ def stats(post: Post) -> list[str]:
         f"   spread {statistics.pstdev(para_words) / max(statistics.fmean(para_words), 1):.2f}"
         f"   max {max(para_words)}",
         f"opening {len(opening)} paragraphs, {len(opening_code)} code blocks before the first heading",
-        f"lists {len(numbered)} numbered / {len(bullets)} bullet"
+        f"lists {len(numbered)} numbered / {len(bullets)} bullet   tables {post.tables}"
         f"   diagrams {len(diagrams)}   code blocks {len(post.fences) - len(diagrams)}",
         f"voice {first_person} first person / {second_person} second person"
         f"   contractions {len(CONTRACTION_RE.findall(prose))}",
+        f"short openers {short_openers} of {len(openers)} paragraphs"
+        f"   colon lists {colon_lists}   sections over 400w"
+        f" {sum(1 for s in post.sections if s.words > 400)}",
     ]
     if longest:
         out.append(f"longest section {longest.words}w  {longest.title}")
@@ -607,11 +761,26 @@ def stats(post: Post) -> list[str]:
 
 
 GUIDE = {
+    "frontmatter": "title, date, categories, tags (Formatting)",
+    "unbalanced-fence": "opened and never closed",
+    "fence-language": "use a language id (Formatting)",
+    "trailing-space": "whitespace at end of line",
+    "banned-word": "banned outright (Banned words)",
+    "banned-phrase": "banned outright (Banned words)",
+    "banned-structure": "mimics insight without providing any (Banned words)",
+    "em-dash": "max one per response, commas or parens instead (Style)",
+    "semicolon": "none in prose (Style)",
+    "identifier-plural": "put the s outside the backticks (Style)",
+    "dead-internal-link": "no post with that slug",
+    "unpinned-link": "a branch ref moves, pin the SHA (Linking to source)",
+    "nav-block": "series nav is inconsistent",
+    "box-column": "space-align every column including the bars (ASCII diagrams)",
     "long-sentence": "past 35 words needs a reason (Sentence length)",
     "clause-chain": "three subordinate clauses is the ceiling (Sentence length)",
     "comma-pileup": "a comma you don't pause at (Commas)",
     "choppy-run": "three short sentences in a row (Voice and tone)",
     "short-opener": "keep it only if it carries a fact (Voice and tone)",
+    "paragraph-seam": "a short line lands at the end of a paragraph, not the start (Voice and tone)",
     "colon-statement": "more than two or three per post wants a list (The colon habit)",
     "signpost": "don't announce that a section started (Structure)",
     "reading-instruction": "asks for patience instead of earning it (Handing off to an example)",
