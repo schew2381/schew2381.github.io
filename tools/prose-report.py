@@ -89,6 +89,9 @@ ATTR_RE = re.compile(r"^\s*\{:")
 ABBREV_RE = re.compile(
     r"(?:\b(?:e\.g|i\.e|vs|etc|approx|Dr|Mr|Ms|Mrs|Pt|Fig|No|Inc|Ltd|Jr|Sr|St)|(?:^|\s)[A-Z])\.$"
 )
+# A capital normally marks the next sentence, so a lowercase identifier that
+# starts one has to be listed: `XFS supports that. ext4 doesn't` is two.
+LOWER_START = r"(?:ext[234]|nbd|mysqld|postgres|kubelet|systemd|iostat|fsync)\b"
 CODE_SPAN_RE = re.compile(r"`[^`]+`")
 LINK_RE = re.compile(r"\[([^\]]*)\]\(([^)]*)\)")
 CONTRACTION_RE = re.compile(r"\b\w+['\u2019](?:s|t|re|ve|ll|d|m)\b", re.I)
@@ -268,7 +271,7 @@ def sentences(text: str) -> list[str]:
         if ABBREV_RE.search(head.rstrip()):
             continue
         tail = text[match.end() :]
-        if tail and not re.match(r"[\"')\]]*\s+[A-Z\"'(\u201c]", tail):
+        if tail and not re.match(r"[\"')\]]*\s+(?:[A-Z\"'(\u201c]|" + LOWER_START + ")", tail):
             continue
         if head.strip():
             out.append(head.strip())
@@ -313,7 +316,9 @@ SIGNPOSTS = [
 
 READING_INSTRUCTIONS = [
     r"worth going slowly", r"bear with me", r"stay with me",
-    r"it's worth noting", r"as we'll see", r"\bread on\b",
+    r"it's worth noting", r"as we'll see",
+    # The imperative only, since `serve a read on its own` is a noun.
+    r"(?:^|[.!?]\s+)read on\b",
     r"more on (this|that) (later|below)", r"we'll come back to",
 ]
 

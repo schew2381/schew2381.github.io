@@ -11,6 +11,7 @@ quietly resurrect a false positive somewhere else.
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 from pathlib import Path
 
@@ -30,6 +31,16 @@ SPLITS: list[tuple[str, bool]] = [
     ("A scan can be doing random I/O. Fixing that means a rebuild.", False),
     ("The limit is 2 KB. Past it the column moves out of line.", False),
     ("Named for its author, Dr. Codd, and never revised since.", True),
+    # A lowercase identifier can open a sentence, so this is two.
+    ("XFS supports that. ext4 doesn't, so the call does a real copy.", False),
+]
+
+READING: list[tuple[str, bool]] = [
+    ("Read on for the rest of the header.", True),
+    ("It's worth going slowly here.", True),
+    # `read on` as a noun, which is what the imperative anchor protects.
+    ("It has nothing to say, so it can't serve a read on its own.", False),
+    ("A spread read on four sockets stays put.", False),
 ]
 
 ANNOUNCES: list[tuple[str, bool]] = [
@@ -100,6 +111,11 @@ def main() -> int:
         if (len(parts) == 1) != expected:
             failures.append(f"sentences({text!r}) split into {len(parts)}, want one={expected}")
 
+    for text, expected in READING:
+        flagged = any(re.search(p, text.lower()) for p in report.READING_INSTRUCTIONS)
+        if flagged != expected:
+            failures.append(f"reading-instruction {text!r} is {flagged}, want {expected}")
+
     for text, expected in ANNOUNCES:
         if report.announces_only(text) != expected:
             failures.append(f"announces_only({text!r}) is {not expected}, want {expected}")
@@ -136,7 +152,7 @@ def main() -> int:
     for failure in failures:
         print(f"FAIL  {failure}")
     checks = (
-        len(SPLITS) + len(ANNOUNCES) + len(SPEC_SHEET) + len(COLON)
+        len(SPLITS) + len(READING) + len(ANNOUNCES) + len(SPEC_SHEET) + len(COLON)
         + len(SEAM_OPENER) + len(ECHO) + len(posts)
     )
     print(f"\n{checks - len(failures)}/{checks} passed over {len(posts)} posts")
