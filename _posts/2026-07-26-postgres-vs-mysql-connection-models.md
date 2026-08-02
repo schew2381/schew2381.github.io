@@ -48,7 +48,7 @@ A Postgres server is a family of processes, supervised by a [postmaster](https:/
         attach the shared buffer pool
 ```
 
-Each backend is a full process with its own address space, so anything it wants fast it keeps a private copy of. The catalog and plan caches get rebuilt per connection and every sort gets its own `work_mem`. Only the state that has to be one thing lives in the shared segment they all attach, which is the buffer pool, the lock table, and the WAL buffers:
+Each backend is a full process with its own address space, so anything it wants fast it keeps a private copy of. The catalog and plan caches get rebuilt per connection and every sort gets its own `work_mem`. Only the state that has to be one thing lives in the shared segment they all attach to, meaning the buffer pool, the lock table, and the WAL buffers:
 
 ```text
   PER BACKEND, private                  SHARED, one segment
@@ -121,7 +121,7 @@ one connection hits a memory bug
 
 Postgres loses a connection where MySQL loses the server.
 
-Threads aren't free at scale either, because thousands of them contending on shared structures spend measurable time in context switches and lock waits. MySQL's [thread pool](https://dev.mysql.com/doc/refman/8.4/en/thread-pool.html) addresses that by multiplexing connections onto a bounded set of threads. It's an Enterprise feature, so on community MySQL the answer is the same as on Postgres: a pooler, in front, doing the bounding for you.
+Threads aren't free at scale either, because thousands of them contending on shared structures spend measurable time in context switches and lock waits. MySQL's [thread pool](https://dev.mysql.com/doc/refman/8.4/en/thread-pool.html) addresses that by multiplexing connections onto a bounded set of threads. It's an Enterprise feature, so on community MySQL the answer is the same as on Postgres: a pooler out front doing the bounding for you.
 
 ## The trade-off
 

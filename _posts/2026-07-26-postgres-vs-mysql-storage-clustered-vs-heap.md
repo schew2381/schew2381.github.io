@@ -136,7 +136,7 @@ SELECT * FROM users WHERE id = 1;
     index traversal      heap fetch └─────────────────────────────┘
 ```
 
-The `email` query is where that pays off, since one traversal plus a heap fetch beats InnoDB's two full traversals. The bill arrives on the primary key query, where Postgres pays the same heap fetch that InnoDB skips by keeping the row in the leaf, so it has no fast path exactly where MySQL has its fastest one. Nothing in the heap is ordered either, so a scan across a range of ids gets no help from physical layout.
+The `email` query is where that pays off, since one traversal plus a heap fetch beats InnoDB's two full traversals. The bill arrives on the primary key query, where Postgres pays the same heap fetch that InnoDB skips by keeping the row in the leaf. No fast path exactly where MySQL has its fastest one. Nothing in the heap is ordered either, so a scan across a range of ids gets no help from physical layout.
 
 ## The trade-offs
 

@@ -219,6 +219,10 @@ GOOD: When an update qualifies, Postgres writes the new version and
 
 Read the line out loud. If you don't pause where the comma is, drop it.
 
+A trailing `, since` or `, because` hung off a sentence that already
+carries two commas is the same habit in a different clause. Drop the
+comma or split the sentence.
+
 Describing a structure is where prose goes stiff, because a run of flat
 subject-verb-object statements about what a thing contains reads like a
 spec sheet even when every fact in it is right:
@@ -586,7 +590,7 @@ come down without losing a mechanism, the section wanted splitting.
 9. Does any sentence run past 35 words or chain three subordinate
    clauses? Split it at the joint carrying the most weight.
 10. Read for commas you don't pause at, especially before a trailing
-    `, which`. Drop them.
+    `, which`, `, since`, or `, because`. Drop them or split the sentence.
 11. Any escalating fragments for emphasis (`Not fewer. Zero.`)? Delete
     them and state the fact once.
 12. Does any step-by-step explanation have one diagram where it should

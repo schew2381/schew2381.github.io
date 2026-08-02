@@ -28,7 +28,7 @@ An update takes the HOT path when both of these hold:
 
 Meet both and Postgres writes the new tuple onto that page, then chains the old version to it with a forwarding pointer. The old tuple's [`t_ctid`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/include/access/htup_details.h#L161) points at the new one, and two header flags mark the chain: [`HEAP_HOT_UPDATED`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/include/access/htup_details.h#L295) on the old version, [`HEAP_ONLY_TUPLE`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/include/access/htup_details.h#L296) on the new.
 
-The indexes are never told any of this happened, so they keep pointing at the old TID, which now quietly forwards to the current version, and a reader following the pointer arrives at the right row anyway.
+The indexes are never told any of this happened, so they keep pointing at the old TID. That TID now quietly forwards to the current version, so a reader following the pointer arrives at the right row anyway.
 
 The two conditions fail for completely different reasons, so both are worth taking seriously. The first is a property of your schema and your query, which you control, and the second is how full that particular page happens to be, which you mostly don't.
 
@@ -125,7 +125,7 @@ So on a table with a heavy HOT-update path, lowering `fillfactor` is one of the 
 
 ### The reads get worse too
 
-N+1 writes is the cost everybody quotes, and it isn't the whole bill. Condition one held here, remember, so `name` never changed and the new index entry carries the *same key* as the old one:
+N+1 writes is the cost everybody quotes, and it isn't the whole bill. Condition one still held here, so `name` never changed and the new index entry carries the *same key* as the old one:
 
 ```text
 name index                            heap
@@ -137,11 +137,11 @@ name index                            heap
                                       └────────────────────────┘
 ```
 
-A search for "Smith" gets both TIDs back and, per [Part 2](/posts/postgres-vs-mysql-mvcc-vacuum-vs-undo/), nothing to choose between them with, so it fetches both and lets the heap headers decide. Two heap tuples on two different pages to return one row.
+A search for "Smith" gets both TIDs back with nothing to choose between them, per [Part 2](/posts/postgres-vs-mysql-mvcc-vacuum-vs-undo/), so it fetches both and lets the heap headers decide. Two heap tuples on two different pages to return one row.
 
 Nothing warns you about it, since a plain `EXPLAIN` reports rows returned rather than tuples examined, so the extra fetch hides inside a plan that looks correct. `EXPLAIN (ANALYZE, BUFFERS)` shows it as block reads you can't account for, and across a whole table the tell is `pg_stat_user_tables.idx_tup_fetch` running well ahead of `idx_scan` times the rows a scan should return.
 
-So why can't the old entry forward to the new page, the way HOT forwards inside one? The old tuple's `t_ctid` does still physically point at the new tuple. The non-HOT branch of `heap_update` [clears `HEAP_HOT_UPDATED`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/heap/heapam.c#L4195) on it, though, so no scan will ever follow that pointer, which is exactly what the `Assert` above is protecting. Those same-key duplicates are what [Part 2](/posts/postgres-vs-mysql-mvcc-vacuum-vs-undo/)'s bottom-up deletion pass hunts for, so the pile stays bounded as long as no old snapshot is pinning it.
+So why can't the old entry forward to the new page, the way HOT forwards inside one? The old tuple's `t_ctid` does still physically point at the new tuple. The non-HOT branch of `heap_update` [clears `HEAP_HOT_UPDATED`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/heap/heapam.c#L4195) on it though, so no scan will ever follow that pointer. That's the invariant the `Assert` above protects. Those same-key duplicates are what [Part 2](/posts/postgres-vs-mysql-mvcc-vacuum-vs-undo/)'s bottom-up deletion pass hunts for, so the pile stays bounded as long as no old snapshot is pinning it.
 
 ## Pruning: cleaning HOT chains cheaply
 
@@ -190,7 +190,7 @@ slot 1 is dead but can never be freed, because the "Smyth"
 entry needs it as a bridge to reach slot 2
 ```
 
-Which builds immortal dead rows, since MVCC cleanup rests on old versions eventually becoming garbage somebody can reclaim, and a live "Smyth" entry needing slot 1 as a bridge means slot 1 can never be freed. Update the row again and you've built a second permanent bridge. That's structural bloat rather than the kind you vacuum away.
+Which builds immortal dead rows. MVCC cleanup rests on old versions eventually becoming garbage somebody can reclaim, and a live "Smyth" entry needing slot 1 as a bridge means slot 1 can never be freed. Update the row again and you've built a second permanent bridge. That's structural bloat rather than the kind you vacuum away.
 
 It costs on the read side too. A HOT chain currently guarantees every tuple in it matches the index key that led you there, so following a chain needs no re-checking. Break that and a search for "Smith" can land on a "Smyth" tuple, so every hop has to re-evaluate the `WHERE` clause. CPU on every fetch of every chain forever, to save index writes on some updates.
 
@@ -209,7 +209,7 @@ id index                    │    └──────────────
 
 That takes out the cheap pruning from the last section, which is fast precisely because Postgres knows that for a HOT chain, *all* indexes point at the chain head. Knowing that, it can convert the head into a redirect without consulting a single index. Allow mixed pointers and pruning safely means inspecting every index on the table, taking locks and doing I/O, the exact cost HOT was built to avoid. Saved writes on the update path, same work moved into the read path.
 
-Both rejections point the same direction, so either no index changes or all of them do, and in exchange Postgres always knows exactly how indexes relate to the heap, which keeps the update and cleanup paths fast.
+Both rejections point the same direction, so either no index changes or all of them do. What Postgres buys with that is knowing exactly how indexes relate to the heap, which is what keeps the update and cleanup paths fast.
 
 ## Checking whether it's working
 

@@ -58,7 +58,7 @@ step 2: move out of line
                                       └───────────────────────┘
 ```
 
-That TOAST table is an ordinary heap, and that's the part worth holding on to. It chops the big value into page-sized chunks stored as its own rows keyed by an OID, so a scan that doesn't `SELECT` the big column never touches them. Being an ordinary heap also means it has its own dead tuples and needs its own vacuuming, which is how a table with a 4 KB `jsonb` column ends up with twice the bloat you were accounting for. See [`toast_internals.c`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/common/toast_internals.c).
+That TOAST table is an ordinary heap, and that's the part worth holding on to. It chops the big value into page-sized chunks stored as its own rows keyed by an OID, so a scan that doesn't `SELECT` the big column never touches them. Being an ordinary heap also means it has its own dead tuples and needs its own vacuuming. Which is how a table with a 4 KB `jsonb` column ends up with twice the bloat you were accounting for. See [`toast_internals.c`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/common/toast_internals.c).
 
 InnoDB does nearly the same thing under a different name, off-page storage. Large `BLOB` and `TEXT` columns move to overflow pages and the clustered-index leaf keeps a [20-byte pointer](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/include/page0size.h#L39). How much stays inline depends on the row format, so a table still on the older `COMPACT` carries a 768-byte prefix of every large column in its leaves where `DYNAMIC` keeps 20 bytes. The motive matches Postgres's either way, since leaf pages are what every lookup traverses, so they need to stay small.
 
@@ -70,7 +70,7 @@ Oversized values are the case where the two engines agree, and they agree becaus
 
 The interesting version is an ordinary value landing on a page that's full. InnoDB's requirement to keep the clustered index in primary key order starts costing real money here, and Postgres's refusal to keep anything in order stops looking lazy.
 
-A full 16 KB leaf page holds ids 10 through 20 and you insert id 15. It belongs on that page, there's no room, and unlike Postgres, InnoDB can't put it elsewhere, because order is the whole contract. So it performs a [page split](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/btr/btr0btr.cc#L2305), allocating a page, moving records across, and updating the parent nodes to point at both halves.
+A full 16 KB leaf page holds ids 10 through 20 and you insert id 15. It belongs on that page and there's no room, and unlike Postgres InnoDB can't put it elsewhere, because order is the whole contract. So it performs a [page split](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/btr/btr0btr.cc#L2305), allocating a page, moving records across, and updating the parent nodes to point at both halves.
 
 ### Where InnoDB splits, and why it matters
 
@@ -114,7 +114,7 @@ page A stays sealed and full        every future insert near
 
 Same table, same rows, roughly double the disk, decided entirely by the order the keys showed up in.
 
-Splits cost more than space, since each one is CPU plus I/O plus a parent-node update, and the new page is allocated wherever the tablespace has room, often nowhere near its logical neighbor:
+Splits cost more than space. Each one is CPU plus I/O plus a parent-node update, and the new page gets allocated wherever the tablespace has room, often nowhere near its logical neighbor:
 
 ```text
 what the tree says            where the pages are
@@ -148,7 +148,7 @@ Which is not the same as Postgres staying compact, and the honest version of the
 | Main degradation mode | Heap bloat from dead tuples | Fragmentation from splits |
 | Heavy fix | `VACUUM FULL` / `pg_repack` | `OPTIMIZE TABLE` |
 
-The third row is the one that costs money and looks like nothing on a comparison table, since insert order is invisible in your schema, absent from your query plans, and for Postgres genuinely irrelevant. For InnoDB it's the difference between a table that packs itself and a table that doubles.
+The third row is the one that costs money and looks like nothing on a comparison table. Insert order is invisible in your schema, absent from your query plans, and for Postgres genuinely irrelevant. For InnoDB it's the difference between a table that packs itself and a table that doubles.
 
 ## Back to that UUID
 
@@ -209,6 +209,6 @@ GROUP BY table_name
 ORDER BY pages_cached DESC;
 ```
 
-`data_size` is a page's live record bytes, so `avg_pct_full` hovering near 50 on a table fed random keys is the 50/50 split path showing up in the only place it's visible. Only cached pages get counted, which is fine, since those are the ones your workload touches. To size the recoverable part, run `OPTIMIZE TABLE` on a copy and compare, and keep it off production, since it rebuilds the table and takes a metadata lock at the end.
+`data_size` is a page's live record bytes, so `avg_pct_full` hovering near 50 on a table fed random keys is the 50/50 split path showing up in the only place it's visible. Only cached pages get counted, which is fine since those are the ones your workload touches. To size the recoverable part, run `OPTIMIZE TABLE` on a copy and compare. Keep it off production, since it rebuilds the table and takes a metadata lock at the end.
 
 Storage is where four posts of differences came from, and it isn't the only root. [Part 5](/posts/postgres-vs-mysql-connection-models/) is about a second decision, entirely independent of clustered-versus-heap, that explains why the two servers fall over in completely different ways.

@@ -62,11 +62,11 @@ before                             after
                                    └─────────────────────────┘
 ```
 
-Keeping the old version is the entire trick, since a transaction that started at `xid=103` still reads `(0,1)` and sees `foo`, because `xmax=105` belongs to a transaction it can't see yet. A transaction that starts after 105 commits reads `(0,2)` and sees `bar`. Same logical row, two physical tuples, and not one lock between them.
+Keeping the old version is the entire trick. A transaction that started at `xid=103` still reads `(0,1)` and sees `foo`, because `xmax=105` belongs to a transaction it can't see yet. A transaction that starts after 105 commits reads `(0,2)` and sees `bar`. Same logical row, two physical tuples, and not one lock between them.
 
 That's the guarantee MVCC actually makes, and it's narrower than people remember. A reader never waits on a writer and a writer never waits on a reader, but two writers still collide, so `UPDATE`'s to the same row serialize on a row lock exactly as you'd expect.
 
-So `(0,1)` has to stick around as long as any transaction might still want it. Correct behavior, and also how a table full of dead weight gets built one update at a time, because when the last interested transaction finishes, nothing about the tuple changes. It sits there taking up space until something reclaims it.
+So `(0,1)` has to stick around as long as any transaction might still want it. Correct behavior, and also how a table full of dead weight gets built one update at a time. When the last interested transaction finishes, nothing about the tuple changes. It sits there taking up space until something reclaims it.
 
 ## What a delete actually does
 
@@ -82,7 +82,7 @@ Nothing in the index stops a later query from finding that surviving entry, eith
 
 So an index entry never points at "the current version" of a row, it points at one specific physical tuple whose header is the only thing deciding whether you're allowed to see it. Hold onto that, because it's about to explain why vacuum can't be a single pass.
 
-It's also why one logical row can have several index entries at once. An update writes a new tuple at a new TID, and unless HOT applies ([Part 3](/posts/postgres-vs-mysql-hot-updates/)), every index gets a second entry pointing at the new TID while the old entry still points at the old one.
+It's also why one logical row can have several index entries at once. An update writes a new tuple at a new TID, and unless HOT applies ([Part 3](/posts/postgres-vs-mysql-hot-updates/)), every index gets a second entry pointing there. The old entry still points at the old tuple.
 
 ```text
 UPDATE users SET name = 'bar' WHERE id = 1;   -- name is indexed
@@ -100,7 +100,7 @@ two index entries, two heap tuples, one logical row
 
 Both entries are real and both get followed. A reader searching for `foo` lands on `(0,1)`, checks the header, and sees it or doesn't depending on its snapshot. Old readers still need that entry, so the index can't drop it at update time.
 
-That's the easy version, though, because the two keys differ, so any one search only ever finds one of the entries. Now change a column nobody indexed, on a row whose heap page has no room left for the new version. Nothing indexed changed, so both entries carry the same key while pointing at different TIDs.
+That's the easy version though, because the two keys differ and any one search only ever finds one of the entries. Now change a column nobody indexed, on a row whose heap page has no room left for the new version. Nothing indexed changed, so both entries carry the same key while pointing at different TIDs.
 
 ```text
 UPDATE users SET status = 'x' WHERE id = 1;   -- name is indexed, unchanged
@@ -188,7 +188,7 @@ Phase 3 waits on phase 2 and phase 2 scans every index in full, so vacuum costs 
 
 Vacuum won't shrink the file, because compacting the heap would mean moving live tuples and invalidating every index entry aimed at their old addresses. Live rows keep their TIDs for life while vacuum recycles the gaps around them, so those ten million deleted rows became free space *inside* the file rather than on the volume. Trailing empty pages are the one exception, handed back to the OS by [`lazy_truncate_heap`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/heap/vacuumlazy.c#L3142).
 
-Freezing rides along on the same scan without being about space at all. Transaction IDs are 32 bits and they wrap, so an old enough tuple's `xmin` would eventually look like it came from the future, and vacuum *freezes* those tuples with [`HEAP_XMIN_FROZEN`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/include/access/htup_details.h#L206) to mark them unconditionally visible and retire `xmin` from comparison. It's why autovacuum suddenly works over a static table nobody has written to in months.
+Freezing rides along on the same scan without being about space at all. Transaction IDs are 32 bits and they wrap, so an old enough tuple's `xmin` would eventually look like it came from the future. Vacuum *freezes* those tuples with [`HEAP_XMIN_FROZEN`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/include/access/htup_details.h#L206), marking them unconditionally visible and retiring `xmin` from comparison. It's why autovacuum suddenly works over a static table nobody has written to in months.
 
 Ordinary queries pitch in on the index side, because an index scan that follows a TID and finds a whole HOT chain dead sets a `kill_prior_tuple` hint in [`index_fetch_heap`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/index/indexam.c#L677). [`_bt_killitems`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/nbtree/nbtutils.c#L191) then marks the entry `LP_DEAD`, so the next scan skips it without a heap fetch. That only helps entries somebody actually read, and the duplicate pile from two sections ago accumulates whether anyone queries it or not.
 
@@ -223,7 +223,7 @@ before pass                        after pass
 
 All of it is speculative, and the [nbtree README](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/nbtree/README#L589) is upfront about that, calling the pass a backstop against unnecessary version-driven page splits and borrowing the generational hypothesis from garbage collectors: most objects die young. A pass that finds nothing costs a few heap page visits and the page splits as it would have anyway, while a pass that succeeds can keep that page from ever splitting.
 
-Which makes it a different kind of mechanism from vacuum, and that difference is the reason it exists. Vacuum is a scheduled sweep over the whole table reclaiming space long after the fact. Bottom-up deletion is targeted and synchronous, running on the page that has a problem at the moment it has one, so a table under steady non-indexed updates keeps its indexes in shape between autovacuum runs rather than waiting on one. It does nothing for heap bloat, so vacuum keeps its job.
+Which makes it a different kind of mechanism from vacuum, and that difference is the reason it exists. Vacuum is a scheduled sweep over the whole table reclaiming space long after the fact. Bottom-up deletion is targeted and synchronous, running on the page that has a problem at the moment it has one. So a table under steady non-indexed updates keeps its indexes in shape between autovacuum runs rather than waiting on one. It does nothing for heap bloat, so vacuum keeps its job.
 
 ## Index-only scans and the visibility map
 
@@ -253,7 +253,7 @@ index-only scan, one index entry
                               xmin/xmax the normal way.
 ```
 
-The bit says nothing about this tuple specifically, because it's a page-level guarantee, and the logic is that if every tuple on the page is visible to everyone, the one the TID points at is visible too. Enough to skip the fetch without reading a single tuple header.
+The bit says nothing about this tuple specifically because it's a page-level guarantee. If every tuple on the page is visible to everyone, the one the TID points at is visible too. Enough to skip the fetch without reading a single tuple header.
 
 Which is what the `Heap Fetches` line in `EXPLAIN (ANALYZE)` is telling you. A freshly-vacuumed static table reports zero and never touches the heap. A table under constant writes has most of its bits cleared, so the identical plan does a heap fetch per row and performs nothing like the plan you thought you had. Postgres labels the node "Index Only Scan" either way, so `Heap Fetches` is your only warning that it stopped being one.
 
@@ -337,11 +337,11 @@ InnoDB delete-marks the old one, inserts a new one, and leaves purge to sort it 
 
 Update ten million rows, then change your mind. `ROLLBACK` comes back instantly on Postgres and makes you wait on MySQL, and the reason is the same place old versions go.
 
-Postgres has nothing to undo. Every new tuple it wrote carries `xmin` set to the aborting transaction's ID, and visibility comes from asking the commit log whether that transaction committed, so marking the transaction aborted makes all ten million tuples invisible to everybody at once. [`RecordTransactionAbort`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/transam/xact.c#L1796) does it through [`TransactionIdAbortTree`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/transam/transam.c#L269), a single [`TransactionIdSetTreeStatus`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/transam/clog.c#L192) call setting one status. One row or ten million, same work.
+Postgres has nothing to undo. Every new tuple it wrote carries `xmin` set to the aborting transaction's ID, and visibility comes from asking the commit log whether that transaction committed. So marking the transaction aborted makes all ten million tuples invisible to everybody at once. [`RecordTransactionAbort`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/transam/xact.c#L1796) does it through [`TransactionIdAbortTree`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/transam/transam.c#L269), a single [`TransactionIdSetTreeStatus`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/transam/clog.c#L192) call setting one status. One row or ten million, same work.
 
-The ten million tuples stay on disk, of course, dead now and indistinguishable from what a committed update leaves behind, so the three-phase vacuum from earlier reclaims them the same way. Nothing got cheaper, it just moved onto a bill Postgres was already going to pay.
+The ten million tuples stay on disk, dead now and indistinguishable from what a committed update leaves behind, so the three-phase vacuum from earlier reclaims them the same way. Nothing got cheaper, it just moved onto a bill Postgres was already going to pay.
 
-InnoDB can't take that route, because the update already overwrote the row. The clustered-index leaf holds the new value and the only surviving copy of the old one is in the undo log, so restoring means reading undo records and applying them, one row at a time, in reverse.
+InnoDB can't take that route, because the update already overwrote the row. The clustered-index leaf holds the new value and the only surviving copy of the old one is in the undo log. Restoring means reading undo records and applying them, one row at a time, in reverse.
 
 ### What that actually looks like
 
@@ -381,7 +381,7 @@ undo log empty       ──> rollback done, 3 records, 3 row operations
 
 Rolling back the insert is the part that surprised me. There's no earlier version to restore, so InnoDB removes the record outright with [`row_undo_ins_remove_clust_rec`](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/row/row0uins.cc#L68), then calls [`row_undo_ins_remove_sec`](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/row/row0uins.cc#L272) for every secondary index entry it created. The comment above [`row_undo_ins`](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/row/row0uins.cc#L464) calls this being "eager in a rollback", since purge would have removed those records eventually and doing it now leaves less garbage behind.
 
-The loop driving all of it is [`row_undo`](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/row/row0undo.cc#L309), which pops one record with [`trx_roll_pop_top_rec_of_trx`](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/trx/trx0roll.cc#L1019), branches on insert versus modification, applies it, and comes back for the next one until the pop returns nothing. No batching and no shortcut for large transactions, so a rollback costs roughly what the transaction cost, sometimes more, since undoing an insert touches every index the insert wrote.
+The loop driving all of it is [`row_undo`](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/row/row0undo.cc#L309), which pops one record with [`trx_roll_pop_top_rec_of_trx`](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/trx/trx0roll.cc#L1019), branches on insert versus modification, applies it, and comes back for the next one until the pop returns nothing. No batching and no shortcut for large transactions, so a rollback costs roughly what the transaction cost and sometimes more, since undoing an insert touches every index the insert wrote.
 
 ### Which one you notice in production
 
@@ -394,7 +394,7 @@ back out of 10000000 total (43% complete).
 
 A percentage-complete message only exists because rollbacks routinely run long enough for somebody to wonder whether the server hung. You can watch the same number climb live in `information_schema.innodb_trx`, where [`trx_rows_modified`](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/trx/trx0i_s.cc#L474) reports the undo count.
 
-Practically, a batch job you kill halfway through bills you a second time for what it already spent, and killing the client doesn't get you out of it, since the rollback runs server-side either way. Postgres in that spot aborts instantly and hands the mess to autovacuum. That's the better deal if you cancel things often and the worse one if you were hoping to stay out of a vacuum problem. Neither engine gives the work back.
+So a batch job you kill halfway through bills you a second time for what it already spent, and killing the client doesn't get you out of it because the rollback runs server-side. Postgres in that spot aborts instantly and hands the mess to autovacuum. That's the better deal if you cancel things often and the worse one if you were hoping to stay out of a vacuum problem. Neither engine gives the work back.
 
 ## Why the difference exists
 
