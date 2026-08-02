@@ -78,7 +78,7 @@ Which brings back the ten million rows from the top. A delete in Postgres doesn'
 
 Hence a table that didn't shrink.
 
-Nothing in the index stops a later query from finding that surviving entry, either. An index tuple is [a key and a TID](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/include/access/itup.h#L35) and nothing else, with no `xmin` or `xmax` of its own, so all it can do is hand over an address. Postgres fetches that heap tuple, checks its header against the snapshot, and throws the row away as invisible, which it will do again on every query that goes looking.
+Nothing in the index stops a later query from finding that surviving entry, either. An index tuple is [a key and a TID](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/include/access/itup.h#L35) and nothing else, with no `xmin` or `xmax` of its own, so all it can do is hand over an address. Postgres fetches that heap tuple, checks its header against the snapshot, and throws the row away as invisible. It does that again on every query that goes looking.
 
 So an index entry never points at "the current version" of a row, it points at one specific physical tuple whose header is the only thing deciding whether you're allowed to see it. Hold onto that, because it's about to explain why vacuum can't be a single pass.
 
@@ -317,7 +317,7 @@ InnoDB's patch for that hole is close enough to the visibility map to be uncanny
 
 [`lock_sec_rec_cons_read_sees`](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/lock/lock0lock.cc#L273) is what runs that check against the reader's view, using [`PAGE_MAX_TRX_ID`](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/include/page0types.h#L77) out of the page header. Two bits per heap page on one side and one transaction ID per index page on the other, both a page-level watermark that lets a reader skip the visibility check.
 
-One asymmetry undercuts the tidy story. An update changing an indexed column does *not* rewrite the secondary entry in place:
+An update changing an indexed column undercuts the tidy story, because it does *not* rewrite the secondary entry in place:
 
 ```text
 UPDATE users SET email = 'new@a.com' WHERE id = 1
