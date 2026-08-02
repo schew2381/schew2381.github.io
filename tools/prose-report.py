@@ -8,6 +8,7 @@ finding on its own.
     python3 tools/prose-report.py                  # every post
     python3 tools/prose-report.py _posts/foo.md    # named posts
     python3 tools/prose-report.py --quiet          # findings only
+    python3 tools/prose-report.py --show           # with the source line
     python3 tools/prose-report.py --labels         # what each label means
 """
 
@@ -796,7 +797,21 @@ GUIDE = {
 }
 
 
-def report(post: Post, findings: list[Finding], quiet: bool) -> None:
+def wrap(text: str, width: int, indent: str) -> list[str]:
+    lines: list[str] = []
+    current = ""
+    for word in text.split():
+        if current and len(current) + 1 + len(word) > width:
+            lines.append(indent + current)
+            current = word
+        else:
+            current = f"{current} {word}".strip()
+    if current:
+        lines.append(indent + current)
+    return lines
+
+
+def report(post: Post, findings: list[Finding], quiet: bool, show: bool) -> None:
     print(f"\n{display(post.path)}")
     if not quiet:
         for line in stats(post):
@@ -808,6 +823,14 @@ def report(post: Post, findings: list[Finding], quiet: bool) -> None:
         print(f"\n    {kind}")
         for finding in sorted(group, key=lambda f: (f.label, f.line)):
             print(f"      L{finding.line:<5} {finding.label:<20} {finding.detail}")
+            if not show:
+                continue
+            # The whole source line, wrapped, so the flag can be judged in
+            # context instead of from the truncated detail above it.
+            raw = post.raw_lines[finding.line - 1] if finding.line <= len(post.raw_lines) else ""
+            for line in wrap(raw, 80, " " * 14):
+                print(line)
+            print()
     if not findings:
         print("\n    nothing flagged")
 
@@ -816,6 +839,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("paths", nargs="*", type=Path)
     parser.add_argument("--quiet", action="store_true", help="findings only, no statistics")
+    parser.add_argument("--show", action="store_true", help="print the source line under each finding")
     parser.add_argument("--labels", action="store_true", help="list every label with its guide section")
     args = parser.parse_args()
 
@@ -836,7 +860,7 @@ def main() -> int:
     for post in posts:
         findings = check_mechanical(post, slugs) + check_judgment(post)
         total += findings
-        report(post, findings, args.quiet)
+        report(post, findings, args.quiet, args.show)
 
     counts: dict[str, int] = {}
     for finding in total:
