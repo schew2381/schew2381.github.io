@@ -282,7 +282,10 @@ Things to avoid, on top of the banned lists below:
 - Rhetorical questions as section openers ("How does X work?"). A
   question in the post's opening hook is fine and often better than an
   assertion. Under a heading, it reads as filler.
-- Tutorial voice ("Let's explore...", "Consider a scenario where...").
+- Tutorial voice ("Let's explore...", "Consider a scenario where..."). A
+  "let's" naming the actual work is fine, because "let's follow one
+  update through both engines" tells the reader what happens next. "Let's
+  explore how updates work" only tells them a section started.
 - Filler openers ("Simple.", "Surprisingly.", "Interestingly.").
 - Overly formal or corporate register.
 - Generic advice with no specific, actionable example attached.
@@ -345,8 +348,7 @@ BAD:  InnoDB keeps the table inside the primary key index, an
 GOOD: The answer comes down to where each engine physically puts the
       row. MySQL stores it inside the primary key index, and Postgres
       stores it in an unordered pile with the indexes pointing at it
-      from outside. That's the whole difference, and it's worth
-      unpacking slowly.
+      from outside.
 ```
 
 The BAD version teaches B+Tree leaf layout, defines two terms, and
@@ -361,9 +363,37 @@ told you one of these is faster benchmarked one of these two queries"
 tells them they've been lied to by somebody, which is a strange way to
 start.
 
-Cut announcement lines. "Here's an example small enough to trace by
-hand" and "Two mechanisms have to come first" are stage directions.
-Just show the example.
+### Handing off to an example
+
+Beat 3 is a handoff, and the way to blow it is to announce the artifact
+instead of the work. "Here's the table for the rest of the post" and
+"Here's what that costs each of them" point at the thing on screen and
+stop there, which leaves the reader to guess what they're supposed to
+do with it.
+
+Say what the post does with the example instead, in one sentence, using
+the verbs the post is actually about:
+
+```
+BAD:  Everything below follows from that, and it's worth going slowly.
+
+      Here's the table for the rest of the post:
+
+GOOD: So let's walk both engines through the table below, storing these
+      two rows and then answering those two queries against them.
+```
+
+The GOOD version names the walkthrough (store, then query), so the
+reader arrives at the schema already knowing what's about to happen to
+it. It also drops "it's worth going slowly", which is a promise about
+the post rather than a fact in it.
+
+Two related lines to cut on sight:
+
+- Stage directions. "Here's an example small enough to trace by hand"
+  and "Two mechanisms have to come first" describe the post's layout.
+- Reading instructions. "It's worth going slowly" and "bear with me"
+  ask for patience instead of earning it.
 
 ### Openings in a series
 
@@ -541,23 +571,26 @@ come down without losing a mechanism, the section wanted splitting.
 3. Count the beats before the first heading. More than four, or any beat
    that teaches a mechanism a later section covers, and the opening is
    doing the post's job for it.
-4. In a series, does the opening name a specific thing the previous post
+4. Does the line above an example say what the post does with it, or just
+   that it's there? "Here's the table" and "here's what it costs" are
+   both the second thing. Name the walkthrough instead.
+5. In a series, does the opening name a specific thing the previous post
    established and then ask what's next? If it opens on a bare assertion
    instead, rewrite it as a callback plus a question.
-5. Count the `statement: X, Y, and Z` sentences. More than two or three
+6. Count the `statement: X, Y, and Z` sentences. More than two or three
    and the extras want to be numbered or bulleted lists.
-6. Count the lists. Fewer than two or three per post means parallel items
+7. Count the lists. Fewer than two or three per post means parallel items
    are hiding inside sentences.
-7. Does any paragraph open on a sentence under nine words that only
+8. Does any paragraph open on a sentence under nine words that only
    announces what's coming? Fold it into the sentence after it.
-8. Does any sentence run past 35 words or chain three subordinate
+9. Does any sentence run past 35 words or chain three subordinate
    clauses? Split it at the joint carrying the most weight.
-9. Read for commas you don't pause at, especially before a trailing
-   `, which`. Drop them.
-10. Any escalating fragments for emphasis (`Not fewer. Zero.`)? Delete
+10. Read for commas you don't pause at, especially before a trailing
+    `, which`. Drop them.
+11. Any escalating fragments for emphasis (`Not fewer. Zero.`)? Delete
     them and state the fact once.
-11. Does any step-by-step explanation have one diagram where it should
+12. Does any step-by-step explanation have one diagram where it should
     have one per step?
-12. Read every paragraph that describes a structure. If it's a run of
+13. Read every paragraph that describes a structure. If it's a run of
     flat "X contains Y" statements, rewrite it around what a reader does
     with the structure.

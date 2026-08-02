@@ -22,9 +22,9 @@ SELECT * FROM users WHERE id = 1;
 
 Neither engine wins both. MySQL does twice the work of Postgres on the first one and half the work on the second.
 
-The answer comes down to where each engine physically puts the row. MySQL keeps it inside the primary key index, and Postgres keeps it in an unordered pile with the indexes pointing at it from outside. Everything below follows from that, and it's worth going slowly.
+The answer comes down to where each engine physically puts the row. MySQL keeps it inside the primary key index, and Postgres keeps it in an unordered pile with the indexes pointing at it from outside.
 
-Here's the table for the rest of the post:
+So let's walk both engines through the table below, storing these two rows and then answering those two queries against them.
 
 ```sql
 CREATE TABLE users (

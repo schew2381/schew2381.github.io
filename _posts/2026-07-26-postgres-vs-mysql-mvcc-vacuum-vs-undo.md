@@ -36,7 +36,7 @@ table you query, so something        │   old version         │
 has to come clean them out           └───────────────────────┘
 ```
 
-Which is why one of these two engines ships a `VACUUM` command and the other one doesn't. Here's what that costs each of them.
+Which is why one of these two engines ships a `VACUUM` command and the other one doesn't, so let's follow one update through both of them and see what it costs.
 
 ## Postgres: an update is a delete plus an insert
 
