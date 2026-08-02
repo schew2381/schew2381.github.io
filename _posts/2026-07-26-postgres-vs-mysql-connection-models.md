@@ -21,7 +21,7 @@ You deployed the same code to Lambda that ran fine on three app servers, traffic
 
 Postgres defaults to [100](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/utils/misc/postgresql.conf.sample#L67) and MySQL to [151](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/sql/sys_vars.h#L110), and neither number is a tuning preference somebody landed on. A Postgres connection is an operating system process, and a MySQL connection is a thread.
 
-Everything else in this post is downstream of that one sentence: what a connection costs to open, how much memory it holds while doing nothing, what happens to the others when one crashes, and which knob is the right one when you hit the wall.
+Everything else in this post is downstream of that one sentence: what a connection costs to open, how much memory it holds while doing nothing, what happens to the others when one crashes and which knob is the right one when you hit the wall.
 
 ## Postgres: a process per connection
 
@@ -93,7 +93,7 @@ Threads share the process address space, so the buffer pool and the caches are j
   └──────────────────┘          └──────────────────┘
 ```
 
-That cache is smaller than you'd guess, since `thread_cache_size` defaults to [`8 + max_connections / 100`](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/sql/mysqld.cc#L6936), which at the default 151 connections is nine parked threads. Nine. A workload that opens and closes connections faster than that creates real threads for the overflow, so if `Threads_created` keeps climbing long after startup, that's the number to raise.
+That cache is smaller than you'd guess, since `thread_cache_size` defaults to [`8 + max_connections / 100`](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/sql/mysqld.cc#L6936) which at the default 151 connections is nine parked threads. Nine. A workload that opens and closes connections faster than that creates real threads for the overflow, so if `Threads_created` keeps climbing long after startup, that's the number to raise.
 
 Cheaper connections mean MySQL gets further before it needs help, and the downside is exactly Postgres's upside inverted. One address space means a memory bug in one thread can corrupt state every other thread is reading, with no supervisor able to isolate it:
 
@@ -130,7 +130,7 @@ This is the one part of the series where InnoDB never comes up, because connecti
 | One connection crashes | Isolated, server survives | Can take down the whole server |
 | Reuse | New backend each time | Thread cache parks and reuses threads |
 
-Neither model gets you out of bounding concurrency, which is the practical takeaway if you keep only one. Postgres hits the wall earlier on raw count because processes are heavy, so a pooler is close to mandatory. MySQL's threads are cheap enough that you can get complacent, then hit a different wall made of context switches and contention. Both engines want the number of things actively executing to be close to your core count, and neither will enforce that for you.
+Neither model gets you out of bounding concurrency which is the practical takeaway if you keep only one. Postgres hits the wall earlier on raw count because processes are heavy, so a pooler is close to mandatory. MySQL's threads are cheap enough that you can get complacent, then hit a different wall made of context switches and contention. Both engines want the number of things actively executing to be close to your core count, and neither will enforce that for you.
 
 Which brings back the Lambda from the top, where raising `max_connections` to 500 is the obvious move and the wrong one. You'd be asking the machine to hold 500 processes and their `work_mem` so 500 mostly-idle Lambdas can each hold a connection they're not using:
 

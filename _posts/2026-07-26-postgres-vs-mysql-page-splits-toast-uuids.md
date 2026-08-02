@@ -13,11 +13,16 @@ tags: [postgres, mysql, innodb, toast, uuid]
 > 5. [Connections: processes vs threads](/posts/postgres-vs-mysql-connection-models/)
 {: .prompt-info }
 
+[Part 3](/posts/postgres-vs-mysql-hot-updates/) ended on InnoDB getting for free what Postgres builds two subsystems to approximate, on the condition that rows arrive in primary key order. Now what happens when they don't?
+
 A UUID primary key is an easy thing to want. Clients generate IDs without a round trip, there's no sequence to coordinate across shards, and your URLs stop advertising how many rows you have. So you write `id UUID PRIMARY KEY` and move on with your day.
 
 On Postgres that decision costs you a little, and on MySQL it can roughly double the table on disk and take your insert throughput with it. None of which is really about UUIDs, it's about what InnoDB is forced to do when a row belongs on a page that's already full.
 
-Both engines store data in fixed-size pages, 8 KB blocks for Postgres and [16 KB](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/include/univ.i#L325) pages for InnoDB, so "doesn't fit" comes in two sizes: a single value bigger than any page, and an ordinary value landing on a page with no room.
+Both engines store data in fixed-size pages, 8 KB blocks for Postgres and [16 KB](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/include/univ.i#L325) pages for InnoDB. "Doesn't fit" comes in two sizes:
+
+1. A single value bigger than any page which both engines handle the same way.
+2. An ordinary value landing on a page with no room, where they part company.
 
 ## Giant rows: TOAST and off-page storage
 
@@ -25,7 +30,7 @@ The easy version of not fitting is a single value larger than any page. A 100 KB
 
 Postgres calls this TOAST, The Oversized-Attribute Storage Technique, and the threshold is lower than most people expect. It kicks in when a tuple would exceed roughly 2 KB, not 8 KB, because [`TOAST_TUPLE_THRESHOLD`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/include/access/heaptoast.h#L48) is a quarter of a page. Postgres wants four tuples per page minimum, so a 3 KB row gets TOASTed even though it would fit fine on its own.
 
-Compression comes first, though, which is the half people forget:
+Compression comes first, though which is the half people forget:
 
 ```text
 step 1: compress in place
@@ -53,13 +58,13 @@ step 2: move out of line
                                       └───────────────────────┘
 ```
 
-That TOAST table is an ordinary heap, which is the part worth holding on to. It chops the big value into page-sized chunks stored as its own rows keyed by an OID, so a scan that doesn't `SELECT` the big column never touches them. Being an ordinary heap also means it has its own dead tuples and needs its own vacuuming, which is how a table with a 4 KB `jsonb` column ends up with twice the bloat you were accounting for. See [`toast_internals.c`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/common/toast_internals.c).
+That TOAST table is an ordinary heap which is the part worth holding on to. It chops the big value into page-sized chunks stored as its own rows keyed by an OID, so a scan that doesn't `SELECT` the big column never touches them. Being an ordinary heap also means it has its own dead tuples and needs its own vacuuming which is how a table with a 4 KB `jsonb` column ends up with twice the bloat you were accounting for. See [`toast_internals.c`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/common/toast_internals.c).
 
 InnoDB does nearly the same thing under a different name, off-page storage. Large `BLOB` and `TEXT` columns move to overflow pages and the clustered-index leaf keeps a [20-byte pointer](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/include/page0size.h#L39). How much stays inline depends on the row format, so a table still on the older `COMPACT` carries a 768-byte prefix of every large column in its leaves where `DYNAMIC` keeps 20 bytes. The motive matches Postgres's either way, since leaf pages are what every lookup traverses, so they need to stay small.
 
 Postgres gets a bonus out of [Part 2](/posts/postgres-vs-mysql-mvcc-vacuum-vs-undo/)'s copy-on-write MVCC. Updating a small column writes a new main-table tuple that copies the TOAST pointer, so a multi-megabyte value doesn't get rewritten because you touched a boolean next to it. Update the big column and you get new chunks, with the old ones sticking around for older transactions until `VACUUM` gets them.
 
-Oversized values are the case where the two engines agree, and they agree because the value is too big for anybody's page, which makes the decision for them. Take the size away and the disagreement starts.
+Oversized values are the case where the two engines agree, and they agree because the value is too big for anybody's page which makes the decision for them. Take the size away and the disagreement starts.
 
 ## Growth: page splits vs the free space map
 
@@ -127,11 +132,11 @@ what the tree says            where the pages are
   ──> "scan ids 10 through 34 in order" seeks four times
 ```
 
-The tree stays perfectly ordered while the pages scatter physically underneath it, so a range scan reading "sequential" leaf pages can be doing random I/O. Fixing that means rebuilding with [`OPTIMIZE TABLE`](https://dev.mysql.com/doc/refman/8.4/en/optimize-table.html), which writes a fresh densely packed B+Tree and drops the old one.
+The tree stays perfectly ordered while the pages scatter physically underneath it, so a range scan reading "sequential" leaf pages can be doing random I/O. Fixing that means rebuilding with [`OPTIMIZE TABLE`](https://dev.mysql.com/doc/refman/8.4/en/optimize-table.html) which writes a fresh densely packed B+Tree and drops the old one.
 
 ### Postgres has no table-data splits at all
 
-The heap has no required order, so an insert goes to any page with room, found via the free space map, or to the end of the file. No table-data page splits exist, which makes insert order genuinely irrelevant to how densely a Postgres table packs. Postgres B-Tree indexes do split much like InnoDB's, but an index entry is a key and a TID rather than an entire row, so the same split moves far fewer bytes.
+The heap has no required order, so an insert goes to any page with room, found via the free space map, or to the end of the file. No table-data page splits exist which makes insert order genuinely irrelevant to how densely a Postgres table packs. Postgres B-Tree indexes do split much like InnoDB's, but an index entry is a key and a TID rather than an entire row, so the same split moves far fewer bytes.
 
 Which is not the same as Postgres staying compact, and the honest version of the comparison is that both engines end up needing a rewrite command, for unrelated reasons. Dead tuples from [Part 2](/posts/postgres-vs-mysql-mvcc-vacuum-vs-undo/) leave Swiss-cheese holes once `VACUUM` frees them, and a heap that doesn't refill its holes efficiently bloats just as badly as a fragmented B+Tree. That's MVCC garbage rather than insert geometry, and it arrives on a table nobody ever inserted into out of order. The heavy fix is [`VACUUM FULL`](https://www.postgresql.org/docs/current/sql-vacuum.html) or `pg_repack`, rewriting the heap into a compact new file.
 
@@ -190,7 +195,7 @@ UUIDv7  ┌──────────────────────┬
 
 Time only moves forward, so v7 values sort roughly in generation order and append to the right edge like an integer while staying globally unique with no coordination.
 
-It isn't quite an auto-increment, since concurrent generators inside the same millisecond interleave. The insert point stays within the rightmost page or two rather than being strictly monotonic, which is enough for the heuristic but not the same thing. And a v7 tells anyone holding it when it was created, which matters if opaque IDs were the point.
+It isn't quite an auto-increment, since concurrent generators inside the same millisecond interleave. The insert point stays within the rightmost page or two rather than being strictly monotonic which is enough for the heuristic but not the same thing. And a v7 tells anyone holding it when it was created which matters if opaque IDs were the point.
 
 If you've already shipped v4, the number you want is how full the leaf pages actually are, and the obvious place to look is the wrong one. `information_schema.tables.data_free` counts whole free extents in the tablespace, so half-empty pages contribute nothing to it, because they're allocated. Ask the buffer pool instead:
 

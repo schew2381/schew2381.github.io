@@ -13,18 +13,18 @@ tags: [postgres, mysql, innodb, index, storage]
 > 5. [Connections: processes vs threads](/posts/postgres-vs-mysql-connection-models/)
 {: .prompt-info }
 
-Whoever told you one of these engines is faster benchmarked one of these two queries and not the other:
+What happens if you run these two queries against Postgres and MySQL, on the same schema with the same rows?
 
 ```sql
 SELECT * FROM users WHERE email = 'a@a.com';
 SELECT * FROM users WHERE id = 1;
 ```
 
-Same schema and same rows, and the winner flips between them. MySQL does twice the work of Postgres on the first query and half the work on the second, and both results come out of one decision about where row data physically lives.
+Neither engine wins both. MySQL does twice the work of Postgres on the first one and half the work on the second.
 
-InnoDB keeps the table *inside* the primary key index, an arrangement called a [clustered index](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/include/dict0mem.h#L95), so the index and the table are the same B+Tree with the rows sitting in its bottom level. Postgres keeps rows in a [heap](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/heap/heapam.c), an unordered pile of pages, and every index is a separate structure pointing back into that pile, primary key included.
+The answer comes down to where each engine physically puts the row. MySQL keeps it inside the primary key index, and Postgres keeps it in an unordered pile with the indexes pointing at it from outside. Everything below follows from that, and it's worth going slowly.
 
-That one split decides how fast each kind of read is, what an update costs, and how both engines age over months in production. Two rows are enough to see all of it:
+Here's the table for the rest of the post:
 
 ```sql
 CREATE TABLE users (
@@ -40,7 +40,7 @@ INSERT INTO users VALUES
 
 ## MySQL: the index is the table
 
-InnoDB keys one B+Tree on the primary key and puts the rows themselves in its leaves, which leaves the upper nodes with nothing to do but route you downward. So a lookup on `id=1` descends to a leaf and finds the row sitting there waiting, with no second hop to pay for.
+InnoDB keys one B+Tree on the primary key and puts the rows themselves in its leaves, an arrangement called a [clustered index](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/include/dict0mem.h#L95). The index and the table are the same tree, so the upper nodes have nothing to do but route you downward. A lookup on `id=1` descends to a leaf and finds the row sitting there waiting, with no second hop to pay for.
 
 ```text
 InnoDB clustered index (keyed on id)
@@ -108,7 +108,9 @@ Notice that each secondary index stores a primary key value instead of a physica
 
 ## PostgreSQL: heap plus pointers
 
-Postgres drops each row wherever there's free space, in no particular order. To find it again, every version gets tagged with a Tuple ID, or [TID](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/include/storage/itemptr.h#L36), a physical address written as `(block number, offset)`. Read that as a page and a slot on that page, where the slot is a real thing: each page opens with an array of pointers into its own body, and the offset picks one out. Rows shuffle around inside a page without their TIDs changing, because the slot number is what the TID names.
+Postgres drops each row into a [heap](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/heap/heapam.c), an unordered pile of pages, wherever there's free space. To find it again, every version gets tagged with a Tuple ID, or [TID](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/include/storage/itemptr.h#L36), a physical address written as `(block number, offset)`.
+
+Read that as a page and a slot on that page, and the slot is a real thing. Each page opens with an array of pointers into its own body, and the offset picks one out. Rows shuffle around inside a page without their TIDs changing, because the slot number is what the TID names.
 
 Every index stores the indexed value plus a TID, the primary key index included. Nothing is clustered, so every index is alike, and every one of them points straight at the heap.
 
@@ -138,7 +140,7 @@ The `email` query is where that pays off, since one traversal plus a heap fetch 
 
 ## The trade-offs
 
-Neither layout wins outright, which is why the benchmark from the top of the post can be made to say either thing.
+Neither layout wins outright which is why the benchmark from the top of the post can be made to say either thing.
 
 | Operation | MySQL (InnoDB) | PostgreSQL |
 |---|---|---|
@@ -149,4 +151,4 @@ Neither layout wins outright, which is why the benchmark from the top of the pos
 
 The range-scan row is where clustering pays off most visibly. `WHERE id BETWEEN 10 AND 50` in InnoDB reads a contiguous run of leaf pages, because those forty-one rows are physically adjacent by definition. Postgres scattered them across the heap in insertion order, so the same query hops from page to page collecting them. There's a [`CLUSTER`](https://www.postgresql.org/docs/current/sql-cluster.html) command that reorders a heap by an index, but it's a one-time rewrite that Postgres won't maintain as new rows arrive, so it decays the moment you resume writing.
 
-If you take one thing into the rest of the series, take the last row of that table. Updating a row is cheap for InnoDB's indexes and potentially brutal for Postgres, and the reason isn't the update path at all. The two engines implement multi-version concurrency in opposite directions, which is [Part 2](/posts/postgres-vs-mysql-mvcc-vacuum-vs-undo/).
+If you take one thing into the rest of the series, take the last row of that table. Updating a row is cheap for InnoDB's indexes and potentially brutal for Postgres, and the reason isn't the update path at all. The two engines implement multi-version concurrency in opposite directions which is [Part 2](/posts/postgres-vs-mysql-mvcc-vacuum-vs-undo/).

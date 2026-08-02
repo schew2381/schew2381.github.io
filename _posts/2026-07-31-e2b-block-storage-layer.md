@@ -20,7 +20,7 @@ The disk is. A microVM needs a root filesystem to boot from, and E2B's is a few 
 
 ## Overview
 
-Here's everything one running sandbox touches, from the guest kernel down to object storage. The double lines are address space boundaries, and they're where most of the difficulty in this series lives.
+Everything one running sandbox touches, from the guest kernel down to object storage. The double lines are address space boundaries, and they're where most of the difficulty in this series lives.
 
 ```text
 ONE RUNNING SANDBOX
@@ -33,7 +33,7 @@ ONE RUNNING SANDBOX
         │  page fault                   │  block request
 ════════│═══════════════════════════════│════════════  guest above, host below
         ▼                               ▼
-    UFFD handler                    NBD dispatch
+    page-fault handler              block-request handler
         │                               │  /dev/vda is really the host's
         │                               │  /dev/nbd0, which the host
         │                               │  kernel never mounts
@@ -67,9 +67,9 @@ ONE RUNNING SANDBOX
                             └───────────────────────┘
 ```
 
-The split under `block.Overlay` is the part to hold onto. Writes stop at the left branch and never travel any further, so the right branch stays byte-identical to what's in S3 for as long as the sandbox lives, which is the one property the last two posts spend their time exploiting.
+Writes stop at the left branch under `block.Overlay` and never travel any further, so the right branch stays byte-identical to what's in S3 for as long as the sandbox lives, which is the one property the last two posts spend their time exploiting.
 
-Both branches are the same structure, a sparse mmap'd file with a bitmap over it, and the bitmap flips meaning depending on which one you're standing in. A set bit on the left says the sandbox wrote this block. On the right it says S3 already gave it to us. That's the whole vocabulary, and the five pieces below are the header that says where bytes live, the data file that holds them, the chunker that fetches in useful sizes, those two caches, and the overlay keeping them apart.
+Both branches are the same structure, a sparse mmap'd file with a bitmap over it, and the bitmap flips meaning depending on which one you're standing in. A set bit on the left says the sandbox wrote this block. On the right it says S3 already gave it to us. That's the whole vocabulary for the rest of the post.
 
 ## A build in object storage
 
@@ -138,11 +138,11 @@ ONE ENTRY, TWO ADDRESS SPACES
            └── BuildStorageOffset
 ```
 
-That's the entire format. Whether it makes sense is another question, so let's build one by hand.
+That's the entire format. Whether it makes sense is another question.
 
 ### Eight blocks
 
-Real images have too many digits to follow, so shrink one down to eight blocks and count in blocks rather than bytes. The struct stores byte offsets, but every one of them is a multiple of the block size, so dividing through loses nothing. Block 3 means the fourth block, and that's the last unit conversion in this post.
+Real images have too many digits to follow, so shrink one down to eight blocks and count in blocks rather than bytes. The struct stores byte offsets, but every one of them is a multiple of the block size, so dividing through loses nothing. Block 3 means the fourth block.
 
 Here's a base template fresh out of a build. Call its eight blocks A through H:
 
@@ -253,7 +253,7 @@ if rightBaseLength > 0 {
 ```
 [mapping.go:163](https://github.com/e2b-dev/infra/blob/da099cf305df080abd16b964ff8b664736ee6d34/packages/shared/pkg/storage/header/mapping.go#L163)
 
-Both offsets move by the same `rightBaseShift`, which is the invariant the whole format rests on. Break it and nothing throws. Reads return other data, which is a worse outcome than a crash, and it's why this is the code to read twice.
+Both offsets move by the same `rightBaseShift`, which is the invariant the whole format rests on. Break it and nothing throws. Reads return other data, which is a worse outcome than a crash.
 
 ### Reading one block
 
@@ -299,13 +299,13 @@ Entry 3 is `diff-a` at physical block 1, and our request starts exactly where th
 
 Read that as: open `s3://templates/diff-a/rootfs.ext4` and take one block starting at block 1. Those bytes are `F'`. Ask for block 6 instead and the same search lands on entry 4, giving physical block 6 of the base file, which is `G`. Same call, different object, and the caller never had to know which.
 
-That third value is the one people ignore. A caller asking for four blocks starting at block 5 gets told one block is available, because block 6 lives in a different S3 object entirely. It has to stop at the boundary, resolve again, and fetch the rest from the base file. Every layer above this one loops for that reason, and Part 3 gets to skip the loop by indexing its cache differently.
+That third value is the one that's easy to ignore and expensive to get wrong. A caller asking for four blocks starting at block 5 gets told one block is available, because block 6 lives in a different S3 object entirely. It has to stop at the boundary, resolve again, and fetch the rest from the base file. Every layer above this one loops for that reason, and Part 3 gets to skip the loop by indexing its cache differently.
 
-### Two more details
+### Keeping the entry count down
 
-A build ID of `uuid.Nil` means the range is all zeros. There's no object to open, so the reader zero-fills the buffer and moves on. A sandbox that wiped a gigabyte of scratch space uploads one mapping entry and no bytes for it, and it still reads back as zeros.
+A build ID of `uuid.Nil` is the cheap case, meaning the range is all zeros with no object to open, so the reader zero-fills the buffer and moves on. A sandbox that wiped a gigabyte of scratch space uploads one mapping entry and no bytes at all for it, and it still reads back as zeros.
 
-Left alone, that entry array grows by a few entries per snapshot until a long-lived sandbox is carrying thousands of them. `NormalizeMappings` joins neighbours to keep the count down, and the condition is stricter than sharing a build ID. Their physical offsets have to line up too:
+Everything else accumulates. That entry array grows by a few entries per snapshot until a long-lived sandbox is carrying thousands of them, so `NormalizeMappings` joins neighbours to keep the count down, on a condition stricter than sharing a build ID. Their physical offsets have to line up too:
 
 ```go
 storageContiguous := mp.BuildId == ignoreBuildID ||
@@ -316,17 +316,6 @@ if mp.BuildId == current.BuildId && storageContiguous {
 [mapping.go:256](https://github.com/e2b-dev/infra/blob/da099cf305df080abd16b964ff8b664736ee6d34/packages/shared/pkg/storage/header/mapping.go#L256)
 
 Sitting next to each other in the virtual image says nothing about sitting next to each other in a packed data file. Picture one `base` entry covering virtual blocks 0 through 2 from physical 0, and the next covering virtual block 3 from physical 9. Adjacent virtually, six blocks apart physically, so a joined entry would send that last read to physical 3 and hand back the wrong contents. Same failure as a bad split, and just as silent.
-
-Block size is per device rather than global. Guest memory sits on hugepages so it works in 2 MiB blocks, while a rootfs uses 4 KiB:
-
-```go
-const (
-	PageSize        = 4 << 10 // 4 KiB
-	HugepageSize    = 2 << 20 // 2 MiB
-	RootfsBlockSize = 4 << 10 // 4 KiB
-)
-```
-[diff.go:10](https://github.com/e2b-dev/infra/blob/da099cf305df080abd16b964ff8b664736ee6d34/packages/shared/pkg/storage/header/diff.go#L10)
 
 A metadata record, a sorted array, and a binary search with a `- 1` on the end. That's the whole mechanism, and it buys considerably more than the eight blocks it took to explain.
 
@@ -346,7 +335,7 @@ Resume the paused sandbox, let it write to block 7, and pause it again. `diff-b`
 
 Reading block 3 opens `diff-a`, block 7 opens `diff-b`, and the other six come from the base template. The guest sees one flat filesystem and has no idea it's a view stitched from three objects, none of which were rewritten to make it happen.
 
-Each pause bumps `Generation`, mints a new `BuildID`, and leaves `BaseBuildID` pointing at the root, so any header knows both who it is and where its chain started. That's the metadata a rebase pass needs later, once a chain gets long enough to hurt.
+Each pause bumps `Generation`, mints a new `BuildID`, and leaves `BaseBuildID` pointing at the root, so any header knows both who it is and where its chain started. That's the metadata a rebase pass would need to flatten a long chain, which nothing in this series builds.
 
 ## The chunker
 
@@ -390,14 +379,13 @@ one 4 MiB chunk fetch
 
 The fetch loop reads in batches of `max(blockSize, 16 KiB)`, advances `bytesReady` at block granularity, and pops satisfied waiters off the front of the list. A reader waiting on the first block of a chunk gets released after about 16 KiB rather than 4 MiB, which on a cold `git status` is the difference between usable and not.
 
-Two details in there are the kind that only show up under load:
+Two orderings in there only bite under load. The fetch goroutine runs on `context.WithoutCancel(ctx)`, because otherwise the first caller giving up cancels a fetch four other waiters are depending on. And `runFetch` marks the chunk cached *before* deleting its session from `fetchMap`, since the other order leaves a window where a late caller finds no in-flight session and no cached chunk, so it starts a second fetch for bytes that are already sitting there.
 
-- The fetch goroutine runs on `context.WithoutCancel(ctx)`. Without it, the first caller giving up would cancel a fetch that four other waiters are depending on.
-- `runFetch` marks the chunk cached *before* deleting its session from `fetchMap`. Do it the other way around and there's a window where a late caller finds no in-flight session and no cached chunk, so it starts a redundant fetch for bytes that are already there.
+Sitting where, though. Both of those hazards are about a chunk being "cached," and that word has been doing a lot of unexamined work.
 
 ## The cache
 
-Everything above keeps saying "writes into the cache's mmap," so it's worth pinning down. `block.Cache` is one sparse file per device, truncated to the full image size and mmap'd:
+`block.Cache` is one sparse file per device, truncated to the full image size and mmap'd:
 
 ```go
 cache, err := NewCache(size, blockSize, cachePath, false)
@@ -436,17 +424,45 @@ read  block 3 ──> write cache dirty?  ──yes──> serve from write cach
 write block 3 ──> write cache only, mark dirty
 ```
 
-Notice what the write arrow doesn't do. It never reaches the read device, so the read device holds bytes identical to what's in S3 for as long as the sandbox lives. Two sandboxes booted from the same template can therefore point at one read device and diverge only in their private write caches. That's a footnote in E2B, and it turns into the headline feature by Part 4.
+The write arrow never reaches the read device, so the read device holds bytes identical to what's in S3 for as long as the sandbox lives. Two sandboxes booted from the same template can therefore point at one read device and diverge only in their private write caches. That's a footnote in E2B, and it turns into the headline feature by Part 4.
 
 There's a subtle ordering problem at teardown, too. Snapshotting needs the write cache, and closing the overlay wants to destroy it. `EjectCache` settles it with a compare-and-swap on `cacheEjected` that hands the cache over exactly once, after which the overlay refuses I/O and `Close` becomes a no-op. A snapshot in progress can't lose its data to a concurrent teardown.
 
 ## The two consumers
 
-The overlay gets served two different ways, and it doesn't know the difference.
+The overlay gets served two different ways, and it doesn't know the difference:
+
+```text
+  ROOTFS                                 GUEST MEMORY
+
+  guest does block I/O                   guest touches a page
+    │                                      │
+    ▼  virtio-blk                          ▼  page fault
+  /dev/vda                               userfaultfd
+    │                                      │
+    ▼  NBD over Unix sockets               ▼  UFFD handler calls Prefault
+  /dev/nbdN                              writes into the guest's address space
+    │                                      │
+    └──────────────┬───────────────────────┘
+                   ▼
+             block.Overlay
+       same headers, same chunker, same cache
+
+  4 KiB blocks                           2 MiB blocks (hugepages)
+```
 
 The rootfs goes out over NBD. `NewNBDProvider` builds the cache, wraps the read device in an overlay, and hands it to a direct-path mount speaking the NBD protocol over Unix sockets to `/dev/nbdN`. Firecracker sees an ordinary block device, the guest kernel does ordinary block I/O, and every miss quietly becomes a 4 MiB range GET.
 
-Guest memory goes out over userfaultfd instead. Firecracker maps the memory file, the UFFD handler catches page faults, and `Prefault` writes resolved bytes into the guest's address space. Same headers, same chunker, same cache, different fault mechanism. That's the only reason guest memory works in 2 MiB blocks while the rootfs uses 4 KiB.
+Guest memory goes out over userfaultfd instead. Firecracker maps the memory file, the UFFD handler catches page faults, and `Prefault` writes resolved bytes into the guest's address space. Same headers, same chunker, same cache, different fault mechanism. Block size is per device for exactly that reason, since guest memory sits on hugepages and works in 2 MiB units while a rootfs uses 4 KiB:
+
+```go
+const (
+	PageSize        = 4 << 10 // 4 KiB
+	HugepageSize    = 2 << 20 // 2 MiB
+	RootfsBlockSize = 4 << 10 // 4 KiB
+)
+```
+[diff.go:10](https://github.com/e2b-dev/infra/blob/da099cf305df080abd16b964ff8b664736ee6d34/packages/shared/pkg/storage/header/diff.go#L10)
 
 Part 3 adds a third consumer that E2B doesn't have: the host kernel's own ext4 driver.
 
@@ -454,7 +470,7 @@ Part 3 adds a third consumer that E2B doesn't have: the host kernel's own ext4 d
 
 Now the write-cache bitmap earns its keep. A paused sandbox has to become two S3 objects, a data file holding only what changed and a header describing where the changes go, and the bitmap already knows which blocks those are.
 
-Five steps, and three of them are Linux mechanisms worth explaining rather than naming:
+Steps 1, 2, and 5 are bookkeeping. Steps 3 and 4 are Linux behaving in ways that lose your data if you assume the obvious thing:
 
 ```text
 1  EjectCache          take the write cache out of the overlay

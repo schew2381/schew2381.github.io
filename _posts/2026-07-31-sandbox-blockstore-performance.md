@@ -12,7 +12,7 @@ tags: [csi, performance, caching, prefetch, s3, mincore]
 > 4. Optimizing startup performance (this post)
 {: .prompt-info }
 
-A Pod in the warm pool passed its readiness probe, sat there reporting `Ready`, and then took 59.3 seconds to answer its first `git status`.
+A Pod sitting in the warm pool, pre-started so that nobody would have to wait for scheduling, passed its readiness probe and then took 56.8 seconds to answer its first request.
 
 Nothing was broken, which is the part worth sitting with. Lazy block fetch was doing exactly what Part 1 promised: it moves the cost out of the mount and into the first read. That's a great trade until the first read is the one a user is watching a spinner for.
 
@@ -20,7 +20,7 @@ Two changes went after that from opposite ends. One shares fetched bytes between
 
 ## Where the time actually went
 
-Readiness is the trap. A warm-pool Pod passes its probe as soon as the volume is mounted and the container is up, and Part 3's mount is one header read plus local setup, so that lands in well under a second:
+Readiness is the trap. A Pod passes its probe as soon as the volume is mounted and the container is up, and Part 3's mount is one header read plus local setup, so that lands in well under a second:
 
 ```text
   WHAT READY MEANS                       WHAT'S ACTUALLY ON THE NODE
@@ -45,25 +45,13 @@ git status over 62,115 index entries
                                                  S3 range GET
 ```
 
-Each of those entries is a `stat` and usually a read, scattered across an 8 GiB image with no locality worth speaking of, and any read that lands in an unfetched chunk blocks on a round trip to object storage. So `Ready` was true, every health check was green, and the Pod was useless for a minute.
+Each of those entries is a `stat` and usually a read, scattered across an 8 GiB image with no locality worth speaking of, and any read that lands in an unfetched chunk blocks on a round trip to object storage. So `Ready` was true, every health check was green, and the Pod was useless for the next minute.
 
 ## Change one: share the cache across Pods
 
-Part 3 already built the node-shared read cache, so what's left here is what it bought.
+Part 3 built the node-shared read cache and argued for why it's safe. What it bought is a number, and getting it meant running the same thing twice.
 
-It works because the read side stays byte-identical to S3 for a volume's whole life, which is what lets N Pods on one template point at a single cache file:
-
-```text
-  before                                after
-
-  Pod A ──> cache A ──> S3              Pod A ──┐
-  Pod B ──> cache B ──> S3              Pod B ──┼──> shared cache ──> S3
-  Pod C ──> cache C ──> S3              Pod C ──┘
-
-  3 copies, 3x the GETs                 1 copy, only the first Pod pays
-```
-
-Which means the second Pod on a template reads from local disk what the first Pod paid a round trip for. Here's a full development environment startup measured twice, once on an empty node cache and once on a populated one:
+The workload is a full development environment coming up: a startup script waits for the CSI mount to be readable, then brings up Postgres, Redis, and OpenSearch concurrently, then waits for the slow ones, then re-syncs the toolchain. Run it on a node whose cache is empty, then run it again on the same node with the cache populated:
 
 | Phase | Empty | Populated | Saved | Improvement |
 |---|---|---|---|---|
@@ -73,9 +61,7 @@ Which means the second Pod on a template reads from local disk what the first Po
 | Final dev sync | 2.726s | 1.265s | 1.461s | 53.59% |
 | **Total startup** | **52.009s** | **30.651s** | **21.358s** | **41.07%** |
 
-Those phases, in order, are the sentinel wait blocking until the CSI-mounted codebase is readable, then a concurrent stretch installing Claude plugins while PostgreSQL, Redis, and OpenSearch come up, then whatever's left of PostgreSQL and OpenSearch finishing, then a final sync rechecking the toolchain, dependencies, generated files, and the step cache.
-
-The sentinel wait is the row that explains the rest. It goes from 1.182s to 0.010s, because that phase is nothing but first-read latency and there's no first read left to pay for. Every other row is the same effect diluted by however much real CPU work that phase also happens to do.
+The first row is the one that explains the rest. It's nothing but first-read latency, and with the cache populated there's no first read left to pay for, so it drops by two orders of magnitude. Every row below it is the same effect diluted by however much real CPU work that phase also does.
 
 Nothing about the workload changed between the two columns. Same bytes, same order, same everything. 21 of those 52 seconds were one Pod refetching what another Pod on the same machine already had sitting on local disk.
 
@@ -88,24 +74,22 @@ Sharing fixes the second Pod. The first one still pays in full, and on a freshly
 The second change comes at it from the other side, and it starts from noticing who the read set actually belongs to. What `git status` touches isn't a fact about this Pod or this request. It's a fact about the template's contents, fixed at build time, identical for every Pod that ever boots from it. So record it once, and prefetch it during the mount:
 
 ```text
-phase 1  at template build time
-  ┌────────────────────────────────────────────────────────┐
-  │ 1. populate the image, refresh the git index           │
-  │ 2. evict the backing file from the page cache          │
-  │ 3. run git status through a buffered loop mount        │
-  │ 4. mincore(2) the backing file for resident pages      │
-  │ 5. map pages to 4 MiB chunk offsets, write a manifest  │
-  └────────────────────────────────────────────────────────┘
-                               │
-                               ▼
-       s3://…/<build>/rootfs.ext4.startup-hotset.v1.json
+  ONCE PER TEMPLATE, AT BUILD TIME
 
-phase 2  at mount time on a warm node
-  ┌────────────────────────────────────────────────────────┐
-  │ 1. read the manifest, validate against the header      │
-  │ 2. coalesce offsets into contiguous ranges             │
-  │ 3. prefetch with bounded concurrency, before serving   │
-  └────────────────────────────────────────────────────────┘
+  run git status against the image
+    │
+    ▼
+  ask the page cache what it touched
+    │
+    ▼
+  s3://…/<build>/rootfs.ext4.startup-hotset.v1.json      a few KiB
+    │
+    │  EVERY MOUNT, ON EVERY NODE, FOREVER AFTER
+    ▼
+  validate it against the header we just read
+    │
+    ▼
+  coalesce the offsets, fetch them before serving
 ```
 
 ### Recording it
@@ -214,7 +198,7 @@ Where the prefetch sits in the mount matters more than how it works. `prefetchSt
   nothing could have read anything       blocked behind it
 ```
 
-`PrefetchStartupOffsets` enforces that directly and refuses to run once the chunker has started serving. Losing a race to your own optimization is a bad way to spend an afternoon.
+`PrefetchStartupOffsets` enforces that directly and refuses to run once the chunker has started serving. A prefetch that steals sockets from a reader with a real process behind it has made things worse while looking like it helped.
 
 Planning happens before any fetch goes out:
 
@@ -282,9 +266,9 @@ Both paths are one GET. The reader stays open across batches and only reopens at
 | Scenario | Before | After | Improvement |
 |---|---|---|---|
 | Mount plus first `git status` | 9.80s | 6.97s | 28.9% |
-| Warm-pod Git preparation | 11.48s | 7.01s | 39.0% |
+| Warm-Pod Git preparation | 11.48s | 7.01s | 39.0% |
 | Ordinary demand read | 10.94s | 9.18s | 16.1% |
-| Ready-Pod Claude first turn | 56.8s | 4.9-7.2s | 87-91% |
+| Ready-Pod first agent turn | 56.8s | 4.9 to 7.2s | 87-91% |
 
 The last row is the one the work was for. 56.8 seconds down to 5 to 7, on a Pod that Kubernetes had already been calling `Ready` the whole time.
 

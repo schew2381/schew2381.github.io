@@ -117,14 +117,14 @@ The first is that staging is keyed by volume ID, and those twenty Pods have twen
   what kubelet keys staging on     what the sharing actually keys on
 
   vol-a1b2 ──> stage once          vol-a1b2 ──┐
-  vol-c3d4 ──> stage once          vol-c3d4 ──┼──> build X + header digest
-  vol-e5f6 ──> stage once          vol-e5f6 ──┘     one cache file
+  vol-c3d4 ──> stage once          vol-c3d4 ──┼──> the same template
+  vol-e5f6 ──> stage once          vol-e5f6 ──┘     contents, one cache
   ... 20 distinct IDs
                                    the volume IDs are unrelated to
   20 stages, 0 deduped             what makes these three shareable
 ```
 
-The build ID and the header digest are facts about the volume's *contents*, and Kubernetes has no vocabulary for those.
+What makes those three shareable is a fact about their *contents*, and a volume ID can't say anything about contents. Kubernetes has no vocabulary for it, which is why Part 3 ends up inventing its own key.
 
 The second is that kubelet doesn't offer the choice at all here. Staging only exists on the PVC path:
 
@@ -163,7 +163,7 @@ The unpublish rule is the one that bites, and it bites specifically because the 
 
 ## Volume parameters
 
-Configuration reaches a driver through two channels that show up at different RPCs, and getting them straight before writing either one saves an afternoon of wondering why a parameter is empty.
+Configuration reaches a driver through two channels that show up at different RPCs, and getting them straight before writing either one saves a lot of wondering why a parameter is empty.
 
 The first channel is StorageClass `parameters`, set by whoever administers the cluster, and they arrive in `CreateVolume`'s request:
 
@@ -224,7 +224,7 @@ That's the whole thing. Kubelet invents a volume ID, calls `NodePublishVolume`, 
           CreateVolume                     │  kubelet mints an ID
             │                              │
             ▼                              ▼
-          PV ──> kubelet ──> publish      kubelet ──> publish
+          PV ──> kubelet ──> publish     kubelet ──> publish
 
   4 objects, 1 sidecar, 2 RPCs           1 object, 0 sidecars, 1 RPC
 ```
@@ -249,7 +249,7 @@ Each one switches off a specific piece of machinery:
 - `podInfoOnMount: true` adds `csi.storage.k8s.io/pod.name`, `pod.namespace`, `pod.uid`, and `serviceAccount.name` to the `VolumeContext`, which is how a driver learns which Pod it's mounting for.
 - `volumeLifecycleModes` lists the allowed paths. List both `Persistent` and `Ephemeral` to support each.
 
-What you give up is the one place a driver could have rejected a bad request early. Without `CreateVolume` there's no moment before scheduling where anyone validates anything, so a typo in `templateBuildID` doesn't fail fast. It shows up as a Pod wedged in `ContainerCreating` with the real error buried in kubelet's events, which is a worse afternoon than a `Pending` PVC carrying a clear message.
+What you give up is the one place a driver could have rejected a bad request early. Without `CreateVolume` there's no moment before scheduling where anyone validates anything, so a typo in `templateBuildID` doesn't fail fast. It shows up as a Pod wedged in `ContainerCreating` with the real error buried in kubelet's events, where a `Pending` PVC would have carried a clear message.
 
 ## Mount propagation
 
@@ -288,7 +288,22 @@ volumeMounts:
 
 That's the whole failure: the mount worked, in a namespace nobody else can see. It needs `privileged: true` too, since shared propagation is privileged.
 
-One more detail that catches people. The `/var/lib/kubelet` mount has to cover the whole directory, not just the pod path, because kubelet passes an absolute target path and that exact path has to resolve inside the driver's namespace.
+One more detail catches people, which is that the `/var/lib/kubelet` mount has to cover the whole directory rather than just the Pod path. Kubelet passes an absolute target path, and that exact path has to resolve inside the driver's container:
+
+```text
+  kubelet passes: /var/lib/kubelet/pods/<uid>/volumes/…/codebase
+
+  MOUNTING ONLY THE POD PATH             MOUNTING /var/lib/kubelet
+
+  driver sees /pods/<uid>/…              driver sees the same absolute
+  under some other prefix                path kubelet named
+    │                                      │
+    ▼                                      ▼
+  mount(2) on a path that                mount lands where kubelet
+  doesn't exist in this namespace        will go looking for it
+```
+
+The driver never gets to rewrite the path, so the namespace has to make the literal string valid.
 
 ## A minimal Node service
 
