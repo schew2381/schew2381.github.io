@@ -2,64 +2,102 @@
 
 ## Read these first
 
-Before writing or editing any post, read all four of these end to end.
-Not a summary of them. The actual posts.
+Before writing or editing any post, read these end to end. Not a summary
+of them. The actual posts.
 
 1. [Sharding Postgres at Notion](https://www.notion.com/blog/sharding-postgres-at-notion)
 2. [The Great Re-shard](https://www.notion.com/blog/the-great-re-shard)
 3. [How Figma's databases team lived to tell the scale](https://www.figma.com/blog/how-figmas-databases-team-lived-to-tell-the-scale/)
 4. [Why Uber switched from Postgres to MySQL](https://www.uber.com/us/en/blog/postgres-to-mysql-migration)
+5. [Inside the Magic Pocket](https://dropbox.tech/infrastructure/inside-the-magic-pocket)
+6. [From Monolith to Lakebase to LTAP](https://www.databricks.com/blog/lakebase-ltap-rethinking-database-storage)
+7. [Why we built our background agent](https://builders.ramp.com/post/why-we-built-our-background-agent)
+8. [How we made Ramp Sheets self-maintaining](https://ramplabs.substack.com/p/self-maintaining)
 
 Read them for specific things, not as general inspiration. Every item
 below is a decision you have to make in your own draft, so read to find
 out how they made it.
 
+For a post about internals, 5 and 6 are the closest match in genre. Magic
+Pocket walks a storage system from requirements down to protocols, and
+the Lakebase post argues one design against another, which is the shape
+of anything comparing two engines.
+
 **How the opening earns the reader's attention.** Count the beats before
-their first heading. All four land on three or four, and none of those
-beats is a definition. Notion opens on a five-minute maintenance window
-that a user tweeted about. Uber opens on the architecture they moved off
-and why. Watch how little mechanism they explain up there, and how
-willing they are to gesture at it in half a sentence and move on.
+their first heading. Every one of them lands between three and five, and
+none of those beats is a definition. Notion opens on a five-minute
+maintenance window that a user tweeted about. Uber opens on the
+architecture they moved off and why. Lakebase opens on a PhD advisor
+telling the author that databases were fragile and hard to scale. Watch
+how little mechanism they explain up there, and how willing they are to
+gesture at it in half a sentence and move on.
 
 **How much they defer.** Figma's opening mentions vertical partitioning
 and caching in one breath and doesn't explain either until roughly 40%
-into the post. Notion says "horizontally-partitioned database fleet" up
-front and doesn't reveal the 480-shard scheme until the section built
-for it. The opening's job is to make the reader want the mechanism, not
-to deliver it.
+into the post. Magic Pocket names erasure coding, volumes, cells, and
+OSDs in its setup and doesn't draw the architecture until past halfway.
+Lakebase names SafeKeeper and PageServer in a roadmap sentence and gets
+to them 1,500 words later. The opening's job is to make the reader want
+the mechanism, not to deliver it.
 
 **How intuition gets built.** Uber walks through updating one row's
-birth year, in full, before ever saying "write amplification". The
-concrete case comes first and the name for it comes after, so the reader
-meets the term already knowing what it refers to. When they do name
-something first, a problem statement always comes before it.
+birth year, in full, before ever saying "write amplification". Lakebase
+describes appending a description of a change to a sequential log before
+calling it a write-ahead log. Magic Pocket explains what an OSD does
+before the acronym means anything. The concrete case comes first and the
+name for it comes after, so the reader meets the term already knowing
+what it refers to. When they do name something first, a problem
+statement comes before it.
 
 **How a new section opens.** Read the first sentence under each heading.
-The pattern across all four is a problem, a callback, or a bare fact.
-Almost never a definition, and never a rhetorical question. Figma's
-sections open by shifting off what the previous one established rather
-than introducing something fresh.
+The distribution is problems, callbacks, bare facts, and the occasional
+definition when the section exists to define one thing. Not one
+rhetorical question across all eight posts. Figma's sections open by
+shifting off what the previous one established, and Lakebase's callbacks
+go further back than the section immediately above.
 
-**How they use "we".** Notion and Figma both run past 30 instances. It's
+**How they use "we".** Notion and Figma both run past 30 instances,
+Magic Pocket lands near 40, and both Ramp posts sit in the twenties. It's
 doing work every time: a decision got made, an option got rejected, a
 thing broke on somebody. The Notion line about how clicking the RDS
 resize button forever isn't a strategy tells you vertical scaling was
 considered and dropped, and it sounds like a person said it.
 
-**How they break up prose.** Count their lists. Each post runs two to
-six numbered lists and eight to twelve bullet lists, and the lists carry
-parallel items: steps in a sequence, constraints, options rejected,
-failure modes. The explanations stay in prose. This is the balance to
-copy, because a draft that puts everything in prose ends up cramming
-parallel items into sentences with colons.
+**How willing they are to say what they think.** Lakebase calls one
+paper its favorite and warns you another is punishing to read. Ramp
+admits teams hate owning observability, themselves included. An opinion
+with a person behind it is the thing a generated draft never has, and
+it costs one clause.
+
+**How they break up prose.** Count their lists. Notion, Figma, and Uber
+run two to six numbered lists and eight to twelve bullet lists. The
+other four barely number anything and run two to seven bullet lists,
+with Magic Pocket almost pure prose. What holds across all of them is
+what goes in a list: parallel items, meaning steps in a sequence,
+constraints, options rejected, failure modes, capability inventories.
+Explanations stay in prose. Don't manufacture lists to hit a count,
+and don't cram parallel items into a sentence with a colon because the
+draft has no lists yet.
 
 **Where numbers live.** In sentences, not only in tables. "600
 connections to each shard" reads better inside the sentence explaining
-where the number came from.
+where the number came from. Ramp gets a whole post's thesis out of one
+monitor per 75 lines of code, and Magic Pocket paces its scale story
+from petabytes up to exabytes rather than opening on the big number.
 
 **How sections hand off.** They end on a consequence, a decision, or a
 question the next section answers, not on a restatement of what the
-section just said.
+section just said. Ramp Sheets is the cleanest version: each section's
+weakness is the next section's premise, so the post reads as one attempt
+after another rather than a tour of finished parts.
+
+**How a comparison gets structured.** Lakebase is the one to copy for
+anything weighing two designs. It doesn't alternate pros and cons. The
+old design's problems come first, then what the new one does about them,
+then what that unlocks, so the reader is always being handed the next
+consequence instead of scoring a tie. When it does critique a rival
+approach, it names three specific deficiencies rather than calling the
+approach worse.
 
 ## Narrative flow (the thing most drafts get wrong)
 
@@ -230,10 +268,9 @@ all four in one sentence to find out there was no fifth.
 Numbered when the items carry an order (steps, a preference ranking, a
 try-this-then-that). Dashes when they're unordered peers.
 
-Reach for a list more often than feels necessary. The example posts each
-run two to six numbered lists and eight to twelve bullet lists, and a
-draft with two lists across five posts is hiding all that structure
-inside sentences.
+Reach for a list more often than feels necessary. Every example post runs
+at least two bullet lists and most run more, so a draft with two lists
+across five posts is hiding all that structure inside sentences.
 
 Keep the colon for the cases where it's doing something a list can't:
 two items rather than three, or a single restatement that lands harder
@@ -338,6 +375,11 @@ that works, and the shape Notion and Figma both use:
 The callback is one sentence and it points at a specific thing the
 previous post established, not at the previous post in general. Then
 the question, which is the actual hook. Then the walkthrough.
+
+Lakebase runs the same move between sections rather than between posts,
+and it's worth stealing at either scale: acknowledge what the previous
+piece settled, then pivot on the thing it didn't. "Everything so far has
+been about one database" is a callback and a scope change in one clause.
 
 Don't re-explain the previous post. A reader who skipped it can follow a
 one-sentence reminder, and a reader who didn't will resent the recap.

@@ -70,9 +70,15 @@ So `(0,1)` has to stick around as long as any transaction might still want it. C
 
 ## What a delete actually does
 
-Which brings back the ten million rows from the top. A delete in Postgres doesn't remove anything: it sets `xmax` on the tuple and returns, leaving the tuple, its data, and every index entry pointing at it exactly where they were. Hence a table that didn't shrink.
+Which brings back the ten million rows from the top. A delete in Postgres doesn't remove anything, it sets `xmax` on the tuple and returns, and three things stay exactly where they were:
 
-Nothing in the index stops a later query from finding that surviving entry, either. An index tuple is [a key and a TID](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/include/access/itup.h#L35) and nothing else, with no `xmin` or `xmax` of its own, so all it can do is hand over an address. Postgres fetches that heap tuple, checks its header against the snapshot, and throws the row away as invisible which it will do again on every query that goes looking.
+- The tuple itself.
+- Its data.
+- Every index entry pointing at it.
+
+Hence a table that didn't shrink.
+
+Nothing in the index stops a later query from finding that surviving entry, either. An index tuple is [a key and a TID](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/include/access/itup.h#L35) and nothing else, with no `xmin` or `xmax` of its own, so all it can do is hand over an address. Postgres fetches that heap tuple, checks its header against the snapshot, and throws the row away as invisible, which it will do again on every query that goes looking.
 
 So an index entry never points at "the current version" of a row, it points at one specific physical tuple whose header is the only thing deciding whether you're allowed to see it. Hold onto that, because it's about to explain why vacuum can't be a single pass.
 
@@ -92,7 +98,7 @@ name index                        heap page 0
 two index entries, two heap tuples, one logical row
 ```
 
-Both entries are real and both get followed. A reader searching for `foo` lands on `(0,1)`, checks the header, and sees it or doesn't depending on its snapshot. Old readers still need that entry which is exactly why the index can't drop it at update time.
+Both entries are real and both get followed. A reader searching for `foo` lands on `(0,1)`, checks the header, and sees it or doesn't depending on its snapshot. Old readers still need that entry, so the index can't drop it at update time.
 
 That's the easy version, though, because the two keys differ, so any one search only ever finds one of the entries. Now change a column nobody indexed, on a row whose heap page has no room left for the new version. Nothing indexed changed, so both entries carry the same key while pointing at different TIDs.
 
@@ -131,7 +137,7 @@ SELECT * FROM users WHERE name = 'foo';   -- snapshot at xid 110
 
 Heap slots get reused, so picture vacuum freeing a slot while an index entry still points at it. The next insert drops an unrelated row into that slot, the stale entry resolves to it, and a query for `email = 'a@a.com'` quietly returns somebody else's row with no error anywhere the database can detect. Postgres rules that out with one invariant, spelled out in the [`lazy_scan_heap`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/heap/vacuumlazy.c#L1279) header comment: no index entry may ever point at a reusable slot.
 
-Holding that line comes down to the slot itself which is the line pointer from [Part 1](/posts/postgres-vs-mysql-storage-clustered-vs-heap/) and carries a [state flag](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/include/storage/itemid.h#L38) alongside its offset:
+Holding that line comes down to the slot itself, the line pointer from [Part 1](/posts/postgres-vs-mysql-storage-clustered-vs-heap/). It carries a [state flag](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/include/storage/itemid.h#L38) alongside its offset:
 
 - `LP_NORMAL`, pointing at real tuple data on the page.
 - `LP_DEAD`, tuple data gone, slot not reusable yet.
@@ -251,7 +257,7 @@ The bit says nothing about this tuple specifically, because it's a page-level gu
 
 Which is what the `Heap Fetches` line in `EXPLAIN (ANALYZE)` is telling you. A freshly-vacuumed static table reports zero and never touches the heap. A table under constant writes has most of its bits cleared, so the identical plan does a heap fetch per row and performs nothing like the plan you thought you had. Postgres labels the node "Index Only Scan" either way, so `Heap Fetches` is your only warning that it stopped being one.
 
-HOT doesn't help here which is worth saying since HOT is otherwise all about avoiding index work. [`heap_update` clears the page's visibility bits](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/heap/heapam.c#L4223) whether the update took the HOT path or not, so index-only scans over a recently updated page fetch from the heap until vacuum sets the bit again. HOT saves index writes, the visibility map saves heap reads, and neither one implies the other. Reaching for `INCLUDE` to get an index-only scan also costs you on the HOT side which [Part 3](/posts/postgres-vs-mysql-hot-updates/) gets into.
+HOT doesn't help here, which is worth saying since HOT is otherwise all about avoiding index work. [`heap_update` clears the page's visibility bits](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/heap/heapam.c#L4223) whether the update took the HOT path or not, so index-only scans over a recently updated page fetch from the heap until vacuum sets the bit again. HOT saves index writes, the visibility map saves heap reads, and neither one implies the other. Reaching for `INCLUDE` to get an index-only scan also costs you on the HOT side, and [Part 3](/posts/postgres-vs-mysql-hot-updates/) gets into that.
 
 ## MySQL: update in place, old version to the undo log
 
@@ -289,7 +295,7 @@ reader with snapshot < 105
 
 The read-view logic behind those decisions lives in [`read0read.cc`](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/read/read0read.cc), and the consequence is what counts: the live row never moves, so the main table never fills with dead versions the way a Postgres heap does.
 
-The undo records still need cleaning, and a background [purge thread](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/trx/trx0purge.cc#L2396) drops them once no active transaction needs them. It works on a separate structure rather than on your table which is why MySQL ships no `VACUUM` for you to tune or forget to schedule.
+The undo records still need cleaning, and a background [purge thread](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/trx/trx0purge.cc#L2396) drops them once no active transaction needs them. It works on a separate structure rather than on your table, so MySQL ships no `VACUUM` for you to tune or forget to schedule.
 
 None of which is free, since a long-running transaction pins the undo it might need, so undo grows as long as that transaction stays open and readers walking deep chains pay per hop. Postgres bloats the table you query, InnoDB grows a structure off to the side, and both are held hostage by the same idle transaction somebody left open in a psql window.
 
@@ -311,7 +317,7 @@ InnoDB's patch for that hole is close enough to the visibility map to be uncanny
 
 [`lock_sec_rec_cons_read_sees`](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/lock/lock0lock.cc#L273) is what runs that check against the reader's view, using [`PAGE_MAX_TRX_ID`](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/include/page0types.h#L77) out of the page header. Two bits per heap page on one side and one transaction ID per index page on the other, both a page-level watermark that lets a reader skip the visibility check.
 
-One asymmetry undercuts the tidy story which is that an update changing an indexed column does *not* rewrite the secondary entry in place:
+One asymmetry undercuts the tidy story. An update changing an indexed column does *not* rewrite the secondary entry in place:
 
 ```text
 UPDATE users SET email = 'new@a.com' WHERE id = 1
@@ -331,7 +337,7 @@ InnoDB delete-marks the old one, inserts a new one, and leaves purge to sort it 
 
 Update ten million rows, then change your mind. `ROLLBACK` comes back instantly on Postgres and makes you wait on MySQL, and the reason is the same place old versions go.
 
-Postgres has nothing to undo. Every new tuple it wrote carries `xmin` set to the aborting transaction's ID, and visibility comes from asking the commit log whether that transaction committed, so marking the transaction aborted makes all ten million tuples invisible to everybody at once. [`RecordTransactionAbort`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/transam/xact.c#L1796) does it through [`TransactionIdAbortTree`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/transam/transam.c#L269) which is a single [`TransactionIdSetTreeStatus`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/transam/clog.c#L192) call setting one status. One row or ten million, same work.
+Postgres has nothing to undo. Every new tuple it wrote carries `xmin` set to the aborting transaction's ID, and visibility comes from asking the commit log whether that transaction committed, so marking the transaction aborted makes all ten million tuples invisible to everybody at once. [`RecordTransactionAbort`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/transam/xact.c#L1796) does it through [`TransactionIdAbortTree`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/transam/transam.c#L269), a single [`TransactionIdSetTreeStatus`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/transam/clog.c#L192) call setting one status. One row or ten million, same work.
 
 The ten million tuples stay on disk, of course, dead now and indistinguishable from what a committed update leaves behind, so the three-phase vacuum from earlier reclaims them the same way. Nothing got cheaper, it just moved onto a bill Postgres was already going to pay.
 
@@ -388,7 +394,7 @@ back out of 10000000 total (43% complete).
 
 A percentage-complete message only exists because rollbacks routinely run long enough for somebody to wonder whether the server hung. You can watch the same number climb live in `information_schema.innodb_trx`, where [`trx_rows_modified`](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/trx/trx0i_s.cc#L474) reports the undo count.
 
-Practically, a batch job you kill halfway through bills you a second time for what it already spent, and killing the client doesn't get you out of it, since the rollback runs server-side either way. Postgres in that spot aborts instantly and hands the mess to autovacuum which is the better deal if you cancel things often and the worse one if you were hoping to stay out of a vacuum problem. Neither engine gives the work back.
+Practically, a batch job you kill halfway through bills you a second time for what it already spent, and killing the client doesn't get you out of it, since the rollback runs server-side either way. Postgres in that spot aborts instantly and hands the mess to autovacuum. That's the better deal if you cancel things often and the worse one if you were hoping to stay out of a vacuum problem. Neither engine gives the work back.
 
 ## Why the difference exists
 
@@ -409,6 +415,6 @@ Neither is free, and they don't fail in comparable ways. Postgres pays with vacu
 
 Postgres has one sharp edge left, the one the two-entry diagrams above already showed you. Every update writes a new tuple at a new TID, so every index needs a new entry pointing at it, including indexes on columns the update didn't touch.
 
-So: a table with a dozen indexes, an `UPDATE` setting `last_login = now()` on a column nobody indexed, and Postgres writes thirteen things. Uber hit this exact wall on their trips table and [wrote it up](https://www.uber.com/us/en/blog/postgres-to-mysql-migration) as write amplification, where a single field update turned into a rewrite of every index on the row, plus the WAL to replicate all of it to their followers.
+So put a dozen indexes on a table and run an `UPDATE` setting `last_login = now()`, a column nobody indexed, and Postgres writes thirteen things. Uber hit this exact wall on their trips table and [wrote it up](https://www.uber.com/us/en/blog/postgres-to-mysql-migration) as write amplification. A single field update turned into a rewrite of every index on the row, plus the WAL to replicate all of it to their followers.
 
-Postgres would be unusable for that workload if it actually behaved this way which is a strong hint it doesn't. [Part 3](/posts/postgres-vs-mysql-hot-updates/) is the mechanism that saves it.
+Postgres would be unusable for that workload if it actually behaved this way, which is a strong hint it doesn't. [Part 3](/posts/postgres-vs-mysql-hot-updates/) is the mechanism that saves it.
