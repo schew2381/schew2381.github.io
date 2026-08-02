@@ -12,7 +12,7 @@ tags: [csi, kubernetes, kubelet, grpc, volumes, storage]
 > 4. [Optimizing startup performance](/posts/sandbox-blockstore-performance/)
 {: .prompt-info }
 
-Part 1 left off with a storage layer that serves a block device out of S3. Handing that to a Pod means convincing Kubernetes it's a volume, and the [Container Storage Interface](https://github.com/container-storage-interface/spec/blob/master/spec.md) is the contract for doing that: implement some gRPC methods, register a Unix socket with kubelet, and Kubernetes calls your code whenever a Pod needs a volume.
+[Part 1](/posts/e2b-block-storage-layer/) ended on one property, which is that the read side never changes, so a chunk one sandbox fetched is safe to hand to a stranger. What does Kubernetes need to hear before it will mount that as a volume? The [Container Storage Interface](https://github.com/container-storage-interface/spec/blob/master/spec.md) is the contract, and most of the answer turned out to be which parts of it we didn't have to implement.
 
 Writing the RPCs turned out to be the quick part. The time went into working out which ones we actually had to implement and how much of Kubernetes' default machinery we were allowed to switch off, because a lazily-fetched, node-local, per-Pod volume gets to skip most of it. Knowing that up front saves you from writing two services that do nothing.
 
@@ -52,7 +52,7 @@ Controller runs as a Deployment, usually one replica with leader election. Node 
 
 ## Who calls what
 
-Nothing in Kubernetes talks to a CSI driver directly, which surprises people the first time they go looking for the caller. Kubelet handles the Node service, and a set of sidecar containers translate Kubernetes API objects into Controller calls on your behalf.
+Nothing in Kubernetes talks to a CSI driver directly, which took us a while to find, because we went looking for the caller and there isn't one. Kubelet handles the Node service, and a set of sidecar containers translate Kubernetes API objects into Controller calls on your behalf.
 
 ```text
 PersistentVolumeClaim
@@ -74,7 +74,12 @@ PersistentVolumeClaim
                                 /var/lib/kubelet/pods/<uid>/volumes/...
 ```
 
-The sidecars are separate binaries from [kubernetes-csi](https://github.com/kubernetes-csi): `external-provisioner` watches PVCs, `external-attacher` handles `ControllerPublishVolume`, `external-resizer` handles expansion, and `node-driver-registrar` runs beside the Node service to tell kubelet the driver exists.
+The sidecars are four separate binaries from [kubernetes-csi](https://github.com/kubernetes-csi), none of them yours to write.
+
+- `external-provisioner` watches PVCs and calls `CreateVolume`.
+- `external-attacher` calls `ControllerPublishVolume`.
+- `external-resizer` handles expansion.
+- `node-driver-registrar` runs beside the Node service to tell kubelet the driver exists.
 
 That registration is the whole discovery mechanism. The registrar opens a socket at a path kubelet watches and reports two things: the driver name and where the driver's own socket lives.
 
@@ -86,7 +91,7 @@ That registration is the whole discovery mechanism. The registrar opens a socket
     - --kubelet-registration-path=/var/lib/kubelet/plugins/my-driver.csi.dev/csi.sock
 ```
 
-Those two flags point at the same socket from two different vantage points. `--csi-address` is where the registrar reaches your driver from inside the Pod, and `--kubelet-registration-path` is where kubelet will find it from the host. Swap them and you get a driver that registers successfully and then fails every single mount, because kubelet is dialing a path that doesn't exist in its namespace. The registration succeeding is what makes this one annoying to debug.
+Those two flags point at the same socket from two different vantage points. `--csi-address` is where the registrar reaches your driver from inside the Pod, and `--kubelet-registration-path` is where kubelet will find it from the host. Swap them and you get a driver that registers successfully and then fails every single mount, because kubelet is dialing a path that doesn't exist in its namespace. We swapped them, and the registration kept succeeding, which is what made it take an afternoon.
 
 ## The staging split
 
@@ -105,9 +110,9 @@ without staging (one volume, one Pod)
   NodePublishVolume  ──> mount straight into pod-A's path
 ```
 
-The division is about cost. Staging is the expensive half that should happen once per node, formatting the disk and running `fsck` and mounting it. Publishing is a bind mount, which is nearly free, and it happens once per Pod.
+The division is about cost. Staging is the expensive half that should happen once per node, formatting the disk and running `fsck` and mounting it. Publishing is a bind mount that costs almost nothing, once per Pod.
 
-Opting out is a matter of leaving `STAGE_UNSTAGE_VOLUME` out of `NodeGetCapabilities`, after which kubelet skips both staging calls. Part 3's driver leaves it out, and the reason is worth being precise about, because "it shares nothing" would be false there. It shares plenty. Twenty Pods on one template read from one cache file on the node.
+Opting out is a matter of leaving `STAGE_UNSTAGE_VOLUME` out of `NodeGetCapabilities`, after which kubelet skips both staging calls. Part 3's driver leaves it out, and not because it shares nothing. Twenty Pods on one template read from one cache file on the node.
 
 Staging can't express that sharing, though, for two separate reasons.
 
@@ -163,7 +168,7 @@ The unpublish rule is the one that bites, and it bites specifically because the 
 
 ## Volume parameters
 
-Configuration reaches a driver through two channels that show up at different RPCs, and getting them straight before writing either one saves a lot of wondering why a parameter is empty.
+Configuration reaches a driver through two channels, and they arrive at different RPCs.
 
 The first channel is StorageClass `parameters`, set by whoever administers the cluster, and they arrive in `CreateVolume`'s request:
 
@@ -179,7 +184,7 @@ volumeBindingMode: WaitForFirstConsumer
 reclaimPolicy: Delete
 ```
 
-`volumeBindingMode: WaitForFirstConsumer` is doing more than it looks like, since it holds provisioning back until a Pod has been scheduled and that's the only way the driver ever learns which node it's provisioning for:
+`volumeBindingMode: WaitForFirstConsumer` does more than throttle provisioning. It holds `CreateVolume` back until a Pod has been scheduled, and that scheduling decision is the only way the driver ever learns which node it's provisioning for:
 
 ```text
   Immediate                              WaitForFirstConsumer
@@ -213,7 +218,7 @@ volumes:
         templateBuildID: "9f3c1a20-..."
 ```
 
-That's the whole thing. Kubelet invents a volume ID, calls `NodePublishVolume`, and passes `volumeAttributes` straight through as the `VolumeContext`, and the volume lives exactly as long as the Pod does. No PVC, no PV, no `CreateVolume`, and no provisioner Deployment to keep leader-elected:
+Kubelet invents a volume ID, calls `NodePublishVolume`, and passes `volumeAttributes` straight through as the `VolumeContext`, and the volume lives exactly as long as the Pod does. No PVC, no PV, no `CreateVolume`, and no provisioner Deployment to keep leader-elected:
 
 ```text
   PVC path                               ephemeral inline
@@ -243,17 +248,13 @@ spec:
     - Ephemeral
 ```
 
-Each one switches off a specific piece of machinery:
-
-- `attachRequired: false` means no `VolumeAttachment` objects and no `external-attacher`, so kubelet goes straight to the Node service. Right for anything that isn't a genuine network-attached disk.
-- `podInfoOnMount: true` adds `csi.storage.k8s.io/pod.name`, `pod.namespace`, `pod.uid`, and `serviceAccount.name` to the `VolumeContext`, which is how a driver learns which Pod it's mounting for.
-- `volumeLifecycleModes` lists the allowed paths. List both `Persistent` and `Ephemeral` to support each.
+Each of those three fields deletes a piece of machinery. `attachRequired: false` deletes the `VolumeAttachment` objects and the `external-attacher` that would create them, so kubelet goes straight to the Node service, which is right for anything that isn't a genuine network-attached disk. `podInfoOnMount: true` is how a driver finds out which Pod it's mounting for, since kubelet then stuffs `pod.name`, `pod.namespace`, `pod.uid`, and `serviceAccount.name` into the `VolumeContext`. And `volumeLifecycleModes` has to name both paths if you want both.
 
 What you give up is the one place a driver could have rejected a bad request early. Without `CreateVolume` there's no moment before scheduling where anyone validates anything, so a typo in `templateBuildID` doesn't fail fast. It shows up as a Pod wedged in `ContainerCreating` with the real error buried in kubelet's events, where a `Pending` PVC would have carried a clear message.
 
 ## Mount propagation
 
-Now for the part that costs everyone an afternoon. A Node service that mounts filesystems has to make those mounts visible outside its own container, and Kubernetes mount namespaces hide them by default.
+A Node service that mounts filesystems has to make those mounts visible outside its own container, and Kubernetes mount namespaces hide them by default.
 
 ```yaml
 volumeMounts:
@@ -286,9 +287,9 @@ volumeMounts:
   nothing errors anywhere
 ```
 
-That's the whole failure: the mount worked, in a namespace nobody else can see. It needs `privileged: true` too, since shared propagation is privileged.
+Nothing in that path returns an error, so the mount worked in a namespace nobody else can see. It needs `privileged: true` too, since shared propagation is privileged.
 
-One more detail catches people, which is that the `/var/lib/kubelet` mount has to cover the whole directory rather than just the Pod path. Kubelet passes an absolute target path, and that exact path has to resolve inside the driver's container:
+We also mounted only the Pod's own directory, which looks tidier and fails every publish. The `/var/lib/kubelet` mount has to cover the whole directory. Kubelet passes an absolute target path, and that exact path has to resolve inside the driver's container:
 
 ```text
   kubelet passes: /var/lib/kubelet/pods/<uid>/volumes/…/codebase
@@ -340,13 +341,13 @@ func (n *NodeServer) NodeGetCapabilities(
 }
 ```
 
-The validation at the top is where the effort belongs. `GetMount() == nil` means the Pod asked for a raw block device rather than a filesystem, and a filesystem-only driver has to say so instead of mounting something and hoping. Access modes, read-only flags, and unrecognised `VolumeContext` keys all deserve the same treatment, since each one is a request you can't honor, and a loud failure at publish beats a Pod that starts and then behaves strangely for reasons nobody can trace.
+The validation at the top is where the effort belongs. `GetMount() == nil` means the Pod asked for a raw block device rather than a filesystem, and a filesystem-only driver has to say so instead of mounting something and hoping. Access modes, read-only flags, and unrecognised `VolumeContext` keys all deserve the same treatment, since each one is a request you can't honor. A loud failure at publish beats a Pod that starts and then behaves strangely for reasons nobody can trace.
 
 ## Testing
 
 [csi-sanity](https://github.com/kubernetes-csi/csi-test) runs the spec's conformance suite against a live socket, checking error codes, the idempotency rules, and the capability declarations. It's good at catching the class of bug where a driver works fine when you exercise it by hand and then deadlocks the first time kubelet retries something.
 
-It tells you nothing about your storage, though, and it can't reach mount propagation or registration paths. Those are the two things most likely to be broken on a first deploy, so passing csi-sanity and then getting an empty directory in your Pod is a normal afternoon.
+It tells you nothing about your storage, though, and it can't reach mount propagation or registration paths. Those are the two things most likely to be broken on a first deploy, so we passed csi-sanity and then spent the rest of the day looking at an empty directory inside the Pod.
 
 ## Trade-offs
 

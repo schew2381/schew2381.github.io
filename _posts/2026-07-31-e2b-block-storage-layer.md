@@ -16,7 +16,7 @@ A sandbox is a throwaway Linux box you hand to somebody else's code. An agent cl
 
 [E2B](https://github.com/e2b-dev/infra) runs each sandbox as a Firecracker microVM, which covers both of those. Every sandbox gets its own kernel, so the isolation is a hardware boundary rather than a namespace, and Firecracker's [spec](https://github.com/firecracker-microvm/firecracker/blob/main/SPECIFICATION.md) puts at most 125 ms between the start API call and the guest reaching `/sbin/init`. The VM isn't what anyone waits on.
 
-The disk is. A microVM needs a root filesystem to boot from, and E2B's is a few gigabytes of ext4 with a guest memory snapshot of similar size behind it, both sitting in S3. Download them first and that 125 ms boot turns into thirty seconds of network. So E2B doesn't download them. It hands the guest kernel a block device that claims to be the whole image and fetches 4 MiB pieces the first time something reads them, which works because a sandbox barely touches its own disk: a process starts, reads its own binary, pulls in a few libraries, opens some config files, and idles. This post is the storage layer that makes that hold up.
+The disk is. A microVM needs a root filesystem to boot from, and E2B's is a few gigabytes of ext4 with a guest memory snapshot of similar size behind it, both sitting in S3. Download them first and that 125 ms boot turns into thirty seconds of network. So E2B doesn't download them. It hands the guest kernel a block device that claims to be the whole image and fills the pieces in as the guest reads them. So let's follow one read down from the guest kernel to S3 and back, then pause the sandbox and watch what it uploads.
 
 ## Overview
 
@@ -138,7 +138,7 @@ ONE ENTRY, TWO ADDRESS SPACES
            └── BuildStorageOffset
 ```
 
-That's the entire format. Whether it makes sense is another question.
+That's the entire format, and it's easier to believe once you've watched one get built.
 
 ### Eight blocks
 
@@ -197,7 +197,7 @@ That covers two blocks out of eight. Ask this mapping about block 2 and it has n
 
 ### Merging
 
-`MergeMappings` walks the base mapping and the diff mapping in lockstep and produces one mapping that covers all eight blocks with no gaps. Six overlap cases show up in the code and five of them are bookkeeping. The one worth looking at is a diff entry landing strictly inside a base entry, because it splits the base in two.
+`MergeMappings` walks the base mapping and the diff mapping in lockstep and produces one mapping that covers all eight blocks with no gaps. Six overlap cases show up in the code, which is five more than the interesting one. The one worth looking at is a diff entry landing strictly inside a base entry, because it splits the base in two.
 
 It happens twice here, once per dirty block. Take them one at a time, starting with `D'` at block 3:
 
@@ -377,9 +377,9 @@ one 4 MiB chunk fetch
     released  released       still blocked
 ```
 
-The fetch loop reads in batches of `max(blockSize, 16 KiB)`, advances `bytesReady` at block granularity, and pops satisfied waiters off the front of the list. A reader waiting on the first block of a chunk gets released after about 16 KiB rather than 4 MiB, which on a cold `git status` is the difference between usable and not.
+The fetch loop reads in batches of `max(blockSize, 16 KiB)`, advances `bytesReady` at block granularity, and pops satisfied waiters off the front of the list. A reader waiting on the first block of a chunk gets released after about 16 KiB rather than 4 MiB. On a cold `git status` that's the difference between usable and not.
 
-Two orderings in there only bite under load. The fetch goroutine runs on `context.WithoutCancel(ctx)`, because otherwise the first caller giving up cancels a fetch four other waiters are depending on. And `runFetch` marks the chunk cached *before* deleting its session from `fetchMap`, since the other order leaves a window where a late caller finds no in-flight session and no cached chunk, so it starts a second fetch for bytes that are already sitting there.
+Two orderings in there only bite under load. The fetch goroutine runs on `context.WithoutCancel(ctx)`, because otherwise the first caller giving up cancels a fetch four other waiters are depending on. And `runFetch` marks the chunk cached *before* deleting its session from `fetchMap`. The other order leaves a window where a late caller finds no in-flight session and no cached chunk, so it starts a second fetch for bytes that are already sitting there.
 
 Sitting where, though. Both of those hazards are about a chunk being "cached," and that word has been doing a lot of unexamined work.
 
@@ -392,9 +392,9 @@ cache, err := NewCache(size, blockSize, cachePath, false)
 ```
 [cache.go:62](https://github.com/e2b-dev/infra/blob/da099cf305df080abd16b964ff8b664736ee6d34/packages/orchestrator/pkg/sandbox/block/cache.go#L62)
 
-Sparse is doing real work there. The file claims to be 8 GiB while occupying only what the filesystem has actually allocated, which for a fresh cache is nothing. That gap between claimed and real size is why `FileSize` reports `stat.Blocks * fsStat.Bsize` instead of trusting the stat size, and it comes back as a problem worth its own section in Part 3.
+The file claims to be 8 GiB while occupying only what the filesystem has actually allocated, and for a fresh cache that's nothing. That gap between claimed and real size is why `FileSize` reports `stat.Blocks * fsStat.Bsize` instead of trusting the stat size, and it comes back as a problem worth its own section in Part 3.
 
-Alongside the mapping sits a bitmap with one bit per block, and asking it for a range that isn't fully set gets you a `BytesNotAvailableError` rather than zeros, which is how a caller finds out it has to go fetch something. Which side of the overlay you're on decides what a set bit means: on the read cache it's "S3 already gave me this," and on the write cache it's "the sandbox changed this." Snapshotting is built entirely on the second reading.
+Alongside the mapping sits a bitmap with one bit per block, and asking it for a range that isn't fully set gets you a `BytesNotAvailableError` rather than zeros, which is how a caller finds out it has to go fetch something. Snapshotting is built entirely on the write cache's reading of that bit.
 
 `addressBytes` hands out a slice of the mmap plus a closure that drops a read lock. The chunker fetches directly into that slice, so bytes go from the S3 socket into a page that already is the cache, with no intermediate buffer. Filling the cache and serving a read are the same operation.
 
@@ -468,7 +468,7 @@ Part 3 adds a third consumer that E2B doesn't have: the host kernel's own ext4 d
 
 ## Snapshotting
 
-Now the write-cache bitmap earns its keep. A paused sandbox has to become two S3 objects, a data file holding only what changed and a header describing where the changes go, and the bitmap already knows which blocks those are.
+A paused sandbox has to become two S3 objects, a data file holding only what changed and a header describing where the changes go, and the bitmap already knows which blocks those are.
 
 Steps 1, 2, and 5 are bookkeeping. Steps 3 and 4 are Linux behaving in ways that lose your data if you assume the obvious thing:
 
@@ -505,7 +505,7 @@ That looseness would be alarming if the call mattered, and it doesn't. E2B treat
 
 The obvious way to build a diff file is to read each dirty range into a buffer and write it back out. That's two copies through userspace for data nobody inspects, and for a 500 MiB diff it's 500 MiB of pointless memory traffic.
 
-[`copy_file_range(2)`](https://man7.org/linux/man-pages/man2/copy_file_range.2.html) skips it. The kernel copies between two file descriptors without the bytes ever entering the calling process, and on a filesystem that supports it the copy becomes a reflink instead: two inodes pointing at the same copy-on-write blocks on disk, with no data movement at all. XFS supports that. ext4 doesn't, so the same call there does a real in-kernel copy, which is still better than a round trip through userspace but not free.
+[`copy_file_range(2)`](https://man7.org/linux/man-pages/man2/copy_file_range.2.html) skips it. The kernel copies between two file descriptors without the bytes ever entering the calling process, and on a filesystem that supports it the copy becomes a reflink instead: two inodes pointing at the same copy-on-write blocks on disk, with no data movement at all. XFS supports that. ext4 doesn't, so the same call there does a real in-kernel copy. Format the snapshot disk XFS if you get the choice, because on ext4 a 500 MiB diff is 500 MiB the kernel actually moves.
 
 ```text
   read + write                        copy_file_range
@@ -519,13 +519,19 @@ The obvious way to build a diff file is to read each dirty range into a buffer a
   diff file
 ```
 
-Three error codes get special handling, and each one is a filesystem declining for a different reason. `EXDEV` means the two files are on different filesystems, which the syscall used to refuse outright. `EOPNOTSUPP` means this filesystem doesn't implement it. `ENOSYS` means the kernel is older than 4.5, when the call was added. Any of the three flips a `fallback` flag and the export finishes with `io.Copy`, so a node on an unusual filesystem gets slower snapshots rather than no snapshots.
+Three error codes get special handling, and each one is a filesystem declining for a different reason.
+
+- `EXDEV`, the two files are on different filesystems, which the syscall used to refuse outright.
+- `EOPNOTSUPP`, this filesystem doesn't implement the call.
+- `ENOSYS`, the kernel is older than 4.5, when the call was added.
+
+Any of the three flips a `fallback` flag and the export finishes with `io.Copy`, so a node on an unusual filesystem gets slower snapshots rather than no snapshots.
 
 ### What ends up in S3
 
 Step 5 turns the bitmap back into mapping entries. Every contiguous run of set bits becomes one `BuildMap` whose `BuildStorageOffset` counts up through the diff file in the order the ranges were written, which is precisely the packed layout from the worked example. Those entries merge onto the parent's mapping, normalize, and the generation goes up by one.
 
-Zero blocks take the `uuid.Nil` path from earlier. A sandbox that filled 2 GiB of scratch space and then deleted it produces a mapping entry saying "this range is zeros" and uploads nothing for it, which beats putting 2 GiB of zeros in object storage.
+Zero blocks take the `uuid.Nil` path from earlier. A sandbox that filled 2 GiB of scratch space and then deleted it produces a mapping entry saying "this range is zeros" and uploads nothing for it, instead of putting 2 GiB of zeros in object storage.
 
 ## Trade-offs
 
@@ -537,8 +543,8 @@ Zero blocks take the `uuid.Nil` path from earlier. A sandbox that filled 2 GiB o
 | Failure mode | Object storage outage stalls live I/O | Fails before boot |
 | Snapshot cost | Dirty blocks only | Full image copy |
 
-The costs are real and they don't go away. Downloading the image front-loads all the pain into a place where you expect it, and lazy fetch spreads it across the sandbox's whole life instead. A cache miss is an S3 round trip that the guest kernel experiences as very slow block-device latency, and it can land on the user's first keystroke or on hour six.
+Downloading the image front-loads all the pain into a place where you expect it, and lazy fetch spreads it across the sandbox's whole life instead. A cache miss is an S3 round trip that the guest kernel experiences as very slow block-device latency, and it can land on the user's first keystroke or on hour six. Worth it, on balance, because a sandbox that starts in a second and occasionally stalls for 40 ms beats one that starts in thirty seconds every single time. Read most of the image on every boot and the trade inverts.
 
-Snapshot chains are the other slow leak. Every pause adds mapping entries and one more object that reads might fan out to, so a sandbox someone has been snapshotting for a week eventually needs a rebase pass to flatten it. Cheap snapshots aren't free snapshots, they're deferred ones.
+Snapshot chains are the other slow leak. Every pause adds mapping entries and one more object that reads might fan out to, so a sandbox someone has been snapshotting for a week eventually needs a rebase pass to flatten it. The cost of a cheap snapshot arrives later rather than never.
 
 The whole thing rests on one assumption worth stating plainly: the read side never changes. That's what makes it safe for a chunk fetched by one sandbox to be handed to a completely unrelated one, and it's the property that turns this into something you can put behind a Kubernetes volume. [Part 2](/posts/kubernetes-csi-interface/) covers that interface, and it's much less clever than this.
