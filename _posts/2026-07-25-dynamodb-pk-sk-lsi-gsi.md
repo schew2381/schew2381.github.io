@@ -9,7 +9,14 @@ A `Scan` with `FilterExpression` on `Status = PENDING` returned ten orders. `Sca
 
 The 1 MB page limit works the same way, applied before the filter rather than after, so those 400 MB also arrived as roughly 400 round trips, most of them returning zero items. `Count` was 10. Only the other number reaches the bill.
 
-DynamoDB has no query planner. A SQL database lets you filter or sort on any column and trusts the optimizer to find a path to the answer. DynamoDB makes you build that path yourself out of keys, and any read the keys don't cover degrades into exactly the scan above. The keys are the query engine, so there are four things to get right: a partition key that decides which machine an item lives on, a sort key that orders items once they're there, and two kinds of secondary index that give a read its own key layout when the table's keys can't serve it.
+DynamoDB has no query planner. A SQL database lets you filter or sort on any column and trusts the optimizer to find a path to the answer. DynamoDB makes you build that path yourself out of keys, and any read the keys don't cover degrades into exactly the scan above. The keys are the query engine, and each one only makes sense once the one before it is in place.
+
+1. A partition key decides which machine an item lives on.
+2. A sort key orders the items once they're on it.
+3. A local secondary index keeps that machine and re-sorts what's on it.
+4. A global secondary index picks a different machine entirely.
+
+The first two are free, because they are the table. The other two are second copies of your data that DynamoDB keeps in sync on every write, and most of this post is about what that costs and which of the two costs less.
 
 ## Partition key and sort key
 
@@ -49,11 +56,11 @@ That's the shape of every read DynamoDB is good at. You know the partition key, 
 
 Then the account screen wants a customer's orders newest first, by `OrderDate` rather than `OrderID`. And the operations team wants every `PENDING` order across all customers, because somebody has to work the queue. Neither read has a key to travel on. The table sorts by `OrderID` inside each customer, and `Status` isn't part of any key at all, so both requests fall off the fast path into the [`Scan`](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Scan.html) from the top of the post.
 
-A secondary index is how you buy a key for a read that doesn't have one. DynamoDB stores the same items under a different key layout and keeps that copy in sync on every write. There are two kinds, and the entire difference between them is whether you keep the table's partition key or pick a new one, which sounds like a detail and decides almost everything else about how the index behaves.
+A secondary index is how you buy a key for a read that doesn't have one. DynamoDB stores the same items under a different key layout and keeps that copy in sync on every write. There are two kinds, and the entire difference between them is whether you keep the table's partition key or pick a new one. That sounds like a detail and decides almost everything else about how the index behaves.
 
 ## Local secondary index (LSI)
 
-An LSI keeps the table's partition key and gives it a different sort key. Same grouping, new order. Its entries live on the same physical partition as the items they point at, which is what "local" means, and that colocation is why an LSI is the only secondary index in DynamoDB that can serve a strongly consistent read. There's nothing to fall behind.
+An LSI keeps the table's partition key and gives it a different sort key. Same grouping, new order. Its entries live on the same physical partition as the items they point at, which is what "local" means. That colocation is worth more than it sounds, because it makes an LSI the only secondary index in DynamoDB that can serve a strongly consistent read. There's nothing to fall behind.
 
 So the account screen gets an LSI on `CustomerID` plus `OrderDate`. The ISO-8601 timestamps sort chronologically as plain strings, so no encoding work is needed to make the order come out right.
 
@@ -68,7 +75,7 @@ ORDER#1042   07-25            07-25   ORDER#1042
 
 The screen now queries `CUSTOMER#A` descending, stops after 20 items, and pays for 20 items instead of the whole history. It can ask for a strongly consistent read if it needs one, and the application sorts nothing.
 
-Assuming the index projects what the screen displays. Ask an LSI for an attribute it doesn't project and DynamoDB will go get it from the base table for you, transparently, charging you a read for each entire base item it fetches rather than for the attribute you asked about. A query that looks like it reads a slim index is quietly reading full items, which is the LSI cost that surprises people. It's also a capability a GSI flatly doesn't have, since a GSI query can only ever see attributes the index projects.
+Assuming the index projects what the screen displays. Ask an LSI for an attribute it doesn't project and DynamoDB fetches it from the base table for you, transparently. The charge is for each whole base item it had to fetch, not for the attribute you asked about, so a query that looks like it reads a slim index is quietly reading full items. That's the LSI cost that surprises people, and it's also a capability a GSI flatly doesn't have.
 
 Sharing the partition is where the rest of the bill comes due. An LSI has to be declared at `CreateTable` and can never be added afterward, so it only helps with requirements you saw coming, and requirements arriving late is the normal case. Then there's the ceiling: the base items for one partition key plus that key's index entries have to stay under [10 GB](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/LSI.html) combined, because they all live on the one partition. A table with no LSI has no such limit. Add one and your largest customer can wedge a table that would otherwise have grown indefinitely, with `ItemCollectionSizeLimitExceededException` on every further write to that key.
 
@@ -108,9 +115,15 @@ AWS says it straight: "If you perform heavy write activity on the table, but a g
 
 A GSI inherits its capacity mode from the base table, so on-demand takes away the number you can get wrong and leaves the coupling in place. The docs are blunt about the rule underneath: for a table write to succeed, the table and all of its GSIs need enough write capacity for it, or the write to the table is throttled. On-demand removes the provisioning mistake, not the dependency.
 
-Getting that number right means counting index writes rather than item writes, and one `UpdateItem` is not one index write. Flipping `Status` from `PENDING` to `SHIPPED` costs two writes in the status GSI, a delete of the `PENDING` entry and a put of the `SHIPPED` one, because changing an indexed key attribute moves the entry to a different place in the index. Update a projected non-key attribute instead and it's one write. Update an attribute the index neither keys on nor projects and it's zero, though the base table still charges you for the write.
+Getting that number right means counting index writes rather than item writes, and one `UpdateItem` is not one index write. What a single update costs the status GSI depends on which attribute you touched:
 
-Which makes the projection list a throughput decision wearing the costume of a storage decision. `KEYS_ONLY` stores the base table's key plus the index key, `INCLUDE` adds the attributes you name, and `ALL` copies the whole item. Each index entry also carries [100 bytes of overhead](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GSI.html) on top of that, which disappears against a large item and dominates a small one. Project `ALL` on three GSIs and every write to that table is four writes to four copies of the data.
+- Changing `Status` costs two, a delete of the old entry and a put of the new one, because an indexed key attribute moving means the entry moves with it.
+- Changing an attribute the index projects but doesn't key on costs one.
+- Changing anything the index neither keys on nor projects costs nothing, though the base table still charges you for the write.
+
+## Projection is a throughput decision
+
+Since what you project decides which of those three costs you pay, the projection list is a throughput decision wearing the costume of a storage decision. `KEYS_ONLY` stores the base table's key plus the index key, `INCLUDE` adds the attributes you name, and `ALL` copies the whole item. Each index entry also carries [100 bytes of overhead](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GSI.html) on top of that, which disappears against a large item and dominates a small one. Project `ALL` on three GSIs and every write to that table is four writes to four copies of the data.
 
 Projecting less has a hard edge on a GSI that it doesn't have on an LSI, though. A GSI query cannot fetch attributes from the base table, at any price. If the attribute isn't projected, the index cannot return it, so the application has to go `GetItem` the base table itself for every result it got back. Under-project a GSI and you've built an index that hands you a list of keys to look up one at a time.
 
@@ -180,7 +193,9 @@ PENDING            PENDING#00
                    PENDING#15
 ```
 
-On write, pick a suffix at random so an order becomes `PENDING#07` instead of `PENDING`. Sixteen shards, sixteen partitions, sixteen times the ceiling. On read, the queue queries all sixteen in parallel and merges the date-ordered pages itself, which is real work you now own and a `Limit` that no longer means what it says, since twenty items per shard is 320 items to merge for the first twenty you want.
+On write, pick a suffix at random so an order becomes `PENDING#07` instead of `PENDING`. Sixteen shards, sixteen partitions, sixteen times the ceiling.
+
+The read side is where you pay for it. The queue now queries all sixteen shards in parallel and merges the date-ordered pages itself, which is application code you own and maintain. `Limit` also stops meaning what it says, because asking each shard for twenty items is 320 items to merge for the first twenty you actually want.
 
 Combine that with the sparse index from earlier and the whole thing gets cheap in a satisfying way. Shipped orders drop out of the index entirely, so sixteen shards divide a backlog rather than a table, and the fan-out reads pages that are small because there was never much in them.
 
