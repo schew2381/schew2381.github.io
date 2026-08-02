@@ -12,13 +12,15 @@ tags: [csi, kubernetes, kubelet, grpc, volumes, storage]
 > 4. [Optimizing startup performance](/posts/sandbox-blockstore-performance/)
 {: .prompt-info }
 
-[Part 1](/posts/e2b-block-storage-layer/) ended on one property, which is that the read side never changes, so a chunk one sandbox fetched is safe to hand to a stranger. What does Kubernetes need to hear before it will mount that as a volume? The [Container Storage Interface](https://github.com/container-storage-interface/spec/blob/master/spec.md) is the contract, and most of the answer turned out to be which parts of it we didn't have to implement.
+[Part 1](/posts/e2b-block-storage-layer/) ended on one property, which is that the read side never changes, so a chunk one sandbox fetched is safe to hand to a stranger. Now what does Kubernetes need to hear before it will mount that as a volume?
 
-Writing the RPCs turned out to be the quick part. The time went into working out which ones we actually had to implement and how much of Kubernetes' default machinery we were allowed to switch off, because a lazily-fetched, node-local, per-Pod volume gets to skip most of it. Knowing that up front saves you from writing two services that do nothing.
+Less than the size of the contract suggests. The [Container Storage Interface](https://github.com/container-storage-interface/spec/blob/cd4eba751417ddeddb7d5f41656baa61c1a0cb67/spec.md) defines 32 RPCs across five services, and a driver for a node-local, per-Pod volume answers seven of them. Writing those seven wasn't the work, and working out which of the other 25 we could leave out was. The spec's optional list and kubelet's aren't the same list either, so the way to find out is to watch who calls what.
+
+So let's follow one Pod's volume from a few lines of YAML in its spec down to a mount on a node.
 
 ## Overview
 
-Three gRPC services, and a driver implements Identity plus whichever of the other two it needs.
+Three of those five services are the ones any driver deals with, since the other two exist for volume groups and snapshot metadata. A driver implements Identity plus whichever of the remaining two it needs.
 
 ```text
 ┌────────────────────────────────────────────────────────────┐
@@ -52,7 +54,7 @@ Controller runs as a Deployment, usually one replica with leader election. Node 
 
 ## Who calls what
 
-Nothing in Kubernetes talks to a CSI driver directly, which took us a while to find, because we went looking for the caller and there isn't one. Kubelet handles the Node service, and a set of sidecar containers translate Kubernetes API objects into Controller calls on your behalf.
+Nothing in Kubernetes talks to a CSI driver directly. We spent a while looking for the caller before working out that there isn't one. Kubelet handles the Node service, and a set of sidecar containers translate Kubernetes API objects into Controller calls on your behalf.
 
 ```text
 PersistentVolumeClaim
@@ -93,6 +95,17 @@ That registration is the whole discovery mechanism. The registrar opens a socket
 
 Those two flags point at the same socket from two different vantage points. `--csi-address` is where the registrar reaches your driver from inside the Pod, and `--kubelet-registration-path` is where kubelet will find it from the host. Swap them and you get a driver that registers successfully and then fails every single mount, because kubelet is dialing a path that doesn't exist in its namespace. We swapped them, and the registration kept succeeding, which is what made it take an afternoon.
 
+Kubelet's first call down that socket is `NodeGetInfo`, and this is the first place the spec and kubelet disagree. The spec makes it conditional on a Controller capability the driver doesn't have, so by the letter of it you can leave the RPC out. Kubelet calls it during registration regardless, and unregisters your driver if it returns an error:
+
+```go
+driverNodeID, maxVolumePerNode, accessibleTopology, err := csi.NodeGetInfo(ctx)
+if err != nil {
+	if unregErr := unregisterDriver(pluginName); unregErr != nil {
+```
+[csi_plugin.go:149](https://github.com/kubernetes/kubernetes/blob/v1.33.10/pkg/volume/csi/csi_plugin.go#L149)
+
+The node ID it returns is what lands in the `CSINode` object, so a driver that skips the call never gets that far.
+
 ## The staging split
 
 Two mount RPCs looks redundant until you consider a volume that several Pods on one node legitimately share.
@@ -129,7 +142,7 @@ The first is that staging is keyed by volume ID, and those twenty Pods have twen
   20 stages, 0 deduped             what makes these three shareable
 ```
 
-What makes those three shareable is a fact about their *contents*, and a volume ID can't say anything about contents. Kubernetes has no vocabulary for it, which is why Part 3 ends up inventing its own key.
+Kubernetes has no vocabulary for a volume's *contents*, which is why Part 3 ends up inventing a key of its own.
 
 The second is that kubelet doesn't offer the choice at all here. Staging only exists on the PVC path:
 
@@ -341,7 +354,7 @@ func (n *NodeServer) NodeGetCapabilities(
 }
 ```
 
-The validation at the top is where the effort belongs. `GetMount() == nil` means the Pod asked for a raw block device rather than a filesystem, and a filesystem-only driver has to say so instead of mounting something and hoping. Access modes, read-only flags, and unrecognised `VolumeContext` keys all deserve the same treatment, since each one is a request you can't honor. A loud failure at publish beats a Pod that starts and then behaves strangely for reasons nobody can trace.
+The validation at the top is where the effort belongs. `GetMount() == nil` means the Pod asked for a raw block device rather than a filesystem, and a filesystem-only driver has to say so instead of mounting something and hoping. Access modes, read-only flags, and unrecognised `VolumeContext` keys all deserve the same treatment. Each one is a request you can't honor. A loud failure at publish beats a Pod that starts and then behaves strangely for reasons nobody can trace.
 
 ## Testing
 
@@ -362,4 +375,4 @@ It tells you nothing about your storage, though, and it can't reach mount propag
 
 When storage is genuinely per-Pod and derived from something immutable, the ephemeral inline path deletes most of the moving parts. Nothing to leak, no reclaim policy to reason about, no provisioner to keep alive. The one thing you give up is early validation, and when the only parameter is a build ID that's a trade worth taking.
 
-Which is exactly the shape [Part 3](/posts/sandbox-blockstore-csi-driver/) needs. One Pod, one writable view of one immutable template, a read side shared across the node, and nothing per-Pod except the copy-on-write layer from Part 1.
+[Part 3](/posts/sandbox-blockstore-csi-driver/) takes that trade, because its whole volume is one build ID. One Pod, one writable view of one immutable template, a read side shared across the node, and nothing per-Pod except the copy-on-write layer from Part 1.

@@ -49,6 +49,12 @@ class Paragraph:
         return f"L{self.start}" if self.start == self.end else f"L{self.start}-{self.end}"
 
 
+# Anything that can sit directly above or below a `│` and still be the same
+# wall, so a corner and a tee count and an arrowhead terminating the line does
+# too.
+BOX_CHARS = "│┌┐└┘├┤┬┴┼▼▲╪╫"
+
+
 @dataclass(frozen=True, slots=True)
 class Fence:
     start: int
@@ -94,6 +100,9 @@ ABBREV_RE = re.compile(
 LOWER_START = r"(?:ext[234]|nbd|mysqld|postgres|kubelet|systemd|iostat|fsync)\b"
 CODE_SPAN_RE = re.compile(r"`[^`]+`")
 LINK_RE = re.compile(r"\[([^\]]*)\]\(([^)]*)\)")
+# What a permalink can point at and still show the same bytes next year. A full
+# SHA, or a release tag, which upstream projects don't move once it's cut.
+PINNED_REF = re.compile(r"[0-9a-f]{40}|v?\d+\.\d+(?:\.\d+)*(?:-[\w.]+)?")
 CONTRACTION_RE = re.compile(r"\b\w+['\u2019](?:s|t|re|ve|ll|d|m)\b", re.I)
 
 
@@ -441,7 +450,7 @@ def check_links(post: Post, slugs: set[str]) -> list[Finding]:
                     found.append(Finding(number, "mechanical", "dead-internal-link", url))
             elif "github.com" in url and "/blob/" in url:
                 ref = url.split("/blob/")[1].split("/")[0]
-                if not re.fullmatch(r"[0-9a-f]{40}", ref):
+                if not PINNED_REF.fullmatch(ref):
                     found.append(Finding(number, "mechanical", "unpinned-link", f"/blob/{ref}/"))
     return found
 
@@ -464,28 +473,34 @@ def check_nav(post: Post) -> list[Finding]:
 
 
 def check_diagram(fence: Fence) -> list[Finding]:
+    """Flag a vertical bar that misses what's drawn directly above and below it.
+
+    A diagram is checked line by line rather than as one column histogram,
+    because a stacked figure indents its lower boxes differently on purpose.
+    Pooling every bar in the fence compares a write-cache wall at column 17
+    against a read-cache wall at 19 two levels down and calls it a typo.
+
+    A wall that really is off by a column has neither neighbour meeting it and
+    has one of them a column or two to the side.
+    """
     if not fence.is_diagram:
         return []
-    found: list[Finding] = []
-    columns: dict[int, int] = {}
-    per_line: list[tuple[int, list[int]]] = []
-    for offset, text in enumerate(fence.body):
-        positions = [i for i, ch in enumerate(text) if ch == "│"]
-        if positions:
-            per_line.append((fence.start + 1 + offset, positions))
-            for position in positions:
-                columns[position] = columns.get(position, 0) + 1
+    occupied = [{i for i, ch in enumerate(text) if ch in BOX_CHARS} for text in fence.body]
 
-    popular = {c for c, n in columns.items() if n >= 3}
-    for number, positions in per_line:
-        for position in positions:
-            if position in popular:
+    found: list[Finding] = []
+    for offset, text in enumerate(fence.body):
+        above = occupied[offset - 1] if offset else set()
+        below = occupied[offset + 1] if offset + 1 < len(occupied) else set()
+        for column, char in enumerate(text):
+            if char != "│" or column in above or column in below:
                 continue
-            near = [c for c in popular if 0 < abs(c - position) <= 2]
+            near = sorted(
+                c for c in above | below if 0 < abs(c - column) <= 2
+            )
             if near:
                 found.append(
-                    Finding(number, "mechanical", "box-column",
-                            f"bar at col {position}, {near[0]} elsewhere in the diagram")
+                    Finding(fence.start + 1 + offset, "mechanical", "box-column",
+                            f"bar at col {column}, the line above or below draws at {near[0]}")
                 )
     return found
 

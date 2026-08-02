@@ -12,11 +12,11 @@ tags: [e2b, firecracker, nbd, block-storage, s3, copy-on-write]
 > 4. [Optimizing startup performance](/posts/sandbox-blockstore-performance/)
 {: .prompt-info }
 
-A sandbox is a throwaway Linux box you hand to somebody else's code. An agent clones a repo into it, runs `pip install`, executes whatever it just wrote, and none of that is allowed to reach anything you care about. It also has to be ready more or less now, because there's a user at the other end watching a spinner.
+An agent clones a repo into a throwaway Linux box, runs `pip install`, and executes whatever it just wrote. None of that is allowed to reach anything you care about, and there's a user at the other end watching a spinner, so it has to be ready now.
 
-[E2B](https://github.com/e2b-dev/infra) runs each sandbox as a Firecracker microVM, which covers both of those. Every sandbox gets its own kernel, so the isolation is a hardware boundary rather than a namespace, and Firecracker's [spec](https://github.com/firecracker-microvm/firecracker/blob/main/SPECIFICATION.md) puts at most 125 ms between the start API call and the guest reaching `/sbin/init`. The VM isn't what anyone waits on.
+[E2B](https://github.com/e2b-dev/infra) runs each of those sandboxes as a Firecracker microVM, which covers both halves. Every sandbox gets its own kernel, so the isolation is a hardware boundary rather than a namespace, and Firecracker's [spec](https://github.com/firecracker-microvm/firecracker/blob/054b647d47745ab1ef945238d06a2112040eda1b/SPECIFICATION.md) puts at most 125 ms between the start API call and the guest reaching `/sbin/init`. The VM isn't what anyone waits on. The disk is.
 
-The disk is. A microVM needs a root filesystem to boot from, and E2B's is a few gigabytes of ext4 with a guest memory snapshot of similar size behind it, both sitting in S3. Download them first and that 125 ms boot turns into thirty seconds of network. So E2B doesn't download them. It hands the guest kernel a block device that claims to be the whole image and fills the pieces in as the guest reads them. So let's follow one read down from the guest kernel to S3 and back, then pause the sandbox and watch what it uploads.
+A microVM needs a root filesystem to boot from, and E2B's is a few gigabytes of ext4 with a guest memory snapshot of similar size behind it, both sitting in S3. Download them first and that 125 ms boot turns into thirty seconds of network, so E2B doesn't download them. It hands the guest kernel a block device that claims to be the whole image and fills the pieces in as the guest reads them. So let's follow one read down from the guest kernel to S3 and back, then pause the sandbox and watch what it uploads.
 
 ## Overview
 
@@ -67,22 +67,19 @@ ONE RUNNING SANDBOX
                             └───────────────────────┘
 ```
 
-Writes stop at the left branch under `block.Overlay` and never travel any further, so the right branch stays byte-identical to what's in S3 for as long as the sandbox lives, which is the one property the last two posts spend their time exploiting.
+Writes stop at the left branch under `block.Overlay` and never travel any further. So the right branch stays byte-identical to what's in S3 for as long as the sandbox lives, and the last two posts spend their time exploiting that.
 
-Both branches are the same structure, a sparse mmap'd file with a bitmap over it, and the bitmap flips meaning depending on which one you're standing in. A set bit on the left says the sandbox wrote this block. On the right it says S3 already gave it to us. That's the whole vocabulary for the rest of the post.
+Both branches are the same structure, a sparse mmap'd file with a bitmap over it, and the bitmap flips meaning depending on which one you're standing in. A set bit on the left says the sandbox wrote this block, and on the right it says S3 already gave it to us. That's the whole vocabulary for the rest of the post.
 
 ## A build in object storage
 
-Everything below is written in terms of a build, so start there. A build is a UUID, and what you get for it is a prefix in the bucket with five objects under it:
+Everything below is written in terms of a build, so start there. A build is a UUID, and what you get for it is the prefix `s3://templates/<build-id>/` holding five objects.
 
-```text
-s3://templates/<build-id>/
-    rootfs.ext4          packed rootfs blocks for this build
-    rootfs.ext4.header   metadata plus the block mapping
-    memfile              packed guest-memory chunks
-    memfile.header       metadata plus the block mapping
-    snapfile             Firecracker VM state
-```
+- `rootfs.ext4`, the packed rootfs blocks for this build.
+- `rootfs.ext4.header`, metadata plus the block mapping.
+- `memfile`, the packed guest-memory chunks.
+- `memfile.header`, its own metadata and mapping.
+- `snapfile`, Firecracker's VM state.
 
 The interesting one is `rootfs.ext4`, because it isn't an image. It holds only the blocks that this particular build contains, packed end to end with no gaps. A base template happens to contain all of them. A snapshot contains whatever the sandbox dirtied before someone paused it, which is usually a few megabytes against a multi-gigabyte parent.
 
@@ -144,7 +141,7 @@ That's the entire format, and it's easier to believe once you've watched one get
 
 Real images have too many digits to follow, so shrink one down to eight blocks and count in blocks rather than bytes. The struct stores byte offsets, but every one of them is a multiple of the block size, so dividing through loses nothing. Block 3 means the fourth block.
 
-Here's a base template fresh out of a build. Call its eight blocks A through H:
+So take one through a build and then a snapshot, and watch the mapping change under it. A base template fresh out of a build, eight blocks called A through H:
 
 ```text
 virtual image, what the guest sees
@@ -184,9 +181,9 @@ s3://templates/diff-a/rootfs.ext4, 2 blocks on disk (not 8)
                └────────── new contents of virtual block 3
 ```
 
-`D'` is virtual block 3 living at physical block 0, and `F'` is virtual block 5 living at physical block 1. The data file records neither fact. It's two blocks with no structure and no idea where its contents belong.
+`D'` is virtual block 3 living at physical block 0, and `F'` is virtual block 5 living at physical block 1. The data file records neither fact. It's two blocks with no structure and no idea where its contents belong. Recording that is the header's job.
 
-Which is the job the header does. `diff-a`'s own mapping states where its two blocks go, virtual on the left, physical on the right:
+`diff-a`'s own mapping states where its two blocks go, virtual on the left, physical on the right:
 
 ```text
 BuildMap[0] = {Offset: 3, Length: 1, BuildId: diff-a, BuildStorageOffset: 0}
@@ -305,7 +302,7 @@ That third value is the one that's easy to ignore and expensive to get wrong. A 
 
 A build ID of `uuid.Nil` is the cheap case, meaning the range is all zeros with no object to open, so the reader zero-fills the buffer and moves on. A sandbox that wiped a gigabyte of scratch space uploads one mapping entry and no bytes at all for it, and it still reads back as zeros.
 
-Everything else accumulates. That entry array grows by a few entries per snapshot until a long-lived sandbox is carrying thousands of them, so `NormalizeMappings` joins neighbours to keep the count down, on a condition stricter than sharing a build ID. Their physical offsets have to line up too:
+Everything else accumulates. That entry array grows by a few entries per snapshot until a long-lived sandbox is carrying thousands of them. `NormalizeMappings` joins neighbours to keep the count down, on a condition stricter than sharing a build ID. Their physical offsets have to line up too:
 
 ```go
 storageContiguous := mp.BuildId == ignoreBuildID ||
@@ -335,11 +332,11 @@ Resume the paused sandbox, let it write to block 7, and pause it again. `diff-b`
 
 Reading block 3 opens `diff-a`, block 7 opens `diff-b`, and the other six come from the base template. The guest sees one flat filesystem and has no idea it's a view stitched from three objects, none of which were rewritten to make it happen.
 
-Each pause bumps `Generation`, mints a new `BuildID`, and leaves `BaseBuildID` pointing at the root, so any header knows both who it is and where its chain started. That's the metadata a rebase pass would need to flatten a long chain, which nothing in this series builds.
+Each pause bumps `Generation`, mints a new `BuildID`, and leaves `BaseBuildID` pointing at the root. Any header therefore knows both who it is and where its chain started, which is what a rebase pass would need to flatten a long chain back into one object.
 
 ## The chunker
 
-`build.File` can resolve any virtual offset to a build and a physical offset, which is enough to serve a read and nowhere near enough to serve a filesystem. Ask it for one block and it fetches exactly one block, so a `git status` walking a source tree turns into thousands of independent HTTPS round trips, each one paying full S3 latency to move 4 KiB:
+`build.File` can resolve any virtual offset to a build and a physical offset, which is enough to serve a read and nowhere near enough to serve a filesystem. Ask it for one block and it fetches exactly one block. So a `git status` walking a source tree turns into thousands of independent HTTPS round trips, each paying full S3 latency to move 4 KiB:
 
 ```text
   per block                              per 4 MiB chunk
@@ -360,7 +357,7 @@ MemoryChunkSize = 4 * 1024 * 1024 // 4 MB
 ```
 [storage.go:42](https://github.com/e2b-dev/infra/blob/da099cf305df080abd16b964ff8b664736ee6d34/packages/shared/pkg/storage/storage.go#L42)
 
-Which raises its own problem. Ten readers can want the same chunk at once, and the obvious fix, collapsing them into one fetch and waking everybody when it lands, makes the reader who only wanted the first 4 KiB wait on all 4 MiB.
+Ten readers can want the same chunk at once, though, and the obvious fix makes things worse. Collapse them into one fetch, wake everybody when it lands, and the reader who only wanted the first 4 KiB waits on all 4 MiB.
 
 So the chunker releases readers as their bytes arrive instead. Each in-flight chunk gets a `fetchSession` holding waiters sorted by the offset they need, plus an atomic `bytesReady` counter:
 
@@ -379,7 +376,10 @@ one 4 MiB chunk fetch
 
 The fetch loop reads in batches of `max(blockSize, 16 KiB)`, advances `bytesReady` at block granularity, and pops satisfied waiters off the front of the list. A reader waiting on the first block of a chunk gets released after about 16 KiB rather than 4 MiB. On a cold `git status` that's the difference between usable and not.
 
-Two orderings in there only bite under load. The fetch goroutine runs on `context.WithoutCancel(ctx)`, because otherwise the first caller giving up cancels a fetch four other waiters are depending on. And `runFetch` marks the chunk cached *before* deleting its session from `fetchMap`. The other order leaves a window where a late caller finds no in-flight session and no cached chunk, so it starts a second fetch for bytes that are already sitting there.
+Two orderings in there only bite under load, and each one is a way for a correct-looking fetch to waste a round trip or lose one.
+
+- The fetch goroutine runs on `context.WithoutCancel(ctx)`, since otherwise the first caller giving up cancels a fetch four other waiters are depending on.
+- `runFetch` marks the chunk cached *before* deleting its session from `fetchMap`. The other order leaves a window where a late caller finds no in-flight session and no cached chunk, so it starts a second fetch for bytes already sitting there.
 
 Sitting where, though. Both of those hazards are about a chunk being "cached," and that word has been doing a lot of unexamined work.
 
@@ -392,9 +392,9 @@ cache, err := NewCache(size, blockSize, cachePath, false)
 ```
 [cache.go:62](https://github.com/e2b-dev/infra/blob/da099cf305df080abd16b964ff8b664736ee6d34/packages/orchestrator/pkg/sandbox/block/cache.go#L62)
 
-The file claims to be 8 GiB while occupying only what the filesystem has actually allocated, and for a fresh cache that's nothing. That gap between claimed and real size is why `FileSize` reports `stat.Blocks * fsStat.Bsize` instead of trusting the stat size, and it comes back as a problem worth its own section in Part 3.
+The file claims to be 8 GiB while occupying only what the filesystem has actually allocated, and for a fresh cache that's nothing. That gap between claimed and real size is why `FileSize` reports `stat.Blocks * 512`, in the 512-byte units POSIX always uses, instead of trusting the stat size. In Part 3 the same gap turns into a sweep evicting the one cache worth keeping.
 
-Alongside the mapping sits a bitmap with one bit per block, and asking it for a range that isn't fully set gets you a `BytesNotAvailableError` rather than zeros, which is how a caller finds out it has to go fetch something. Snapshotting is built entirely on the write cache's reading of that bit.
+Alongside the mapping sits a bitmap with one bit per block. Ask it for a range that isn't fully set and you get a `BytesNotAvailableError` rather than zeros, which is how a caller finds out it has to go fetch something. Snapshotting is built entirely on the write cache's reading of that bit.
 
 `addressBytes` hands out a slice of the mmap plus a closure that drops a read lock. The chunker fetches directly into that slice, so bytes go from the S3 socket into a page that already is the cache, with no intermediate buffer. Filling the cache and serving a read are the same operation.
 
@@ -470,15 +470,13 @@ Part 3 adds a third consumer that E2B doesn't have: the host kernel's own ext4 d
 
 A paused sandbox has to become two S3 objects, a data file holding only what changed and a header describing where the changes go, and the bitmap already knows which blocks those are.
 
-Steps 1, 2, and 5 are bookkeeping. Steps 3 and 4 are Linux behaving in ways that lose your data if you assume the obvious thing:
+Steps 1, 2, and 5 are bookkeeping. Steps 3 and 4 are Linux behaving in ways that lose your data if you assume the obvious thing.
 
-```text
-1  EjectCache          take the write cache out of the overlay
-2  destroy sandbox     let in-flight NBD and UFFD requests drain
-3  SyncFileRange       push the mmap's dirty pages down to the filesystem
-4  ExportToDiff        copy_file_range each dirty range into the diff file
-5  ToDiffHeader        bitmap -> BuildMap entries -> merge -> normalize
-```
+1. `EjectCache` takes the write cache out of the overlay.
+2. Destroying the sandbox lets in-flight NBD and UFFD requests drain.
+3. `SyncFileRange` pushes the mmap's dirty pages down to the filesystem.
+4. `ExportToDiff` copies each dirty range into the diff file with `copy_file_range`.
+5. `ToDiffHeader` turns the bitmap into `BuildMap` entries, then merges and normalizes.
 
 ### Why step 3 exists
 
@@ -499,13 +497,13 @@ Which is a problem for a snapshot, because step 4 reads that file through an ord
 
 Read the fd before writeback runs and the diff is missing the block. So step 3 calls [`sync_file_range(2)`](https://man7.org/linux/man-pages/man2/sync_file_range.2.html) with `SYNC_FILE_RANGE_WRITE`, which asks the kernel to start writing out the dirty pages in a range. Not a full `fsync`, and it doesn't wait for the disk to confirm, it just kicks writeback into starting.
 
-That looseness would be alarming if the call mattered, and it doesn't. E2B treats it as an optimization and logs a warning on failure rather than aborting, because the copy in step 4 goes through the page cache anyway and sees the dirty pages whether or not they've reached the platter. The sync just means fewer of them are still in flight when the copy starts.
+That looseness would be alarming if the call mattered, and it doesn't. E2B treats it as an optimization, logging a warning on failure rather than aborting. The copy in step 4 goes through the page cache anyway and sees the dirty pages whether or not they've reached the platter. The sync just means fewer of them are still in flight when the copy starts.
 
 ### Why step 4 is fast
 
 The obvious way to build a diff file is to read each dirty range into a buffer and write it back out. That's two copies through userspace for data nobody inspects, and for a 500 MiB diff it's 500 MiB of pointless memory traffic.
 
-[`copy_file_range(2)`](https://man7.org/linux/man-pages/man2/copy_file_range.2.html) skips it. The kernel copies between two file descriptors without the bytes ever entering the calling process, and on a filesystem that supports it the copy becomes a reflink instead: two inodes pointing at the same copy-on-write blocks on disk, with no data movement at all. XFS supports that. ext4 doesn't, so the same call there does a real in-kernel copy. Format the snapshot disk XFS if you get the choice, because on ext4 a 500 MiB diff is 500 MiB the kernel actually moves.
+[`copy_file_range(2)`](https://man7.org/linux/man-pages/man2/copy_file_range.2.html) skips it. The kernel copies between two file descriptors without the bytes ever entering the calling process. On a filesystem that supports it the copy becomes a reflink, so two inodes end up pointing at the same copy-on-write blocks and no data moves at all. XFS supports that. ext4 doesn't, so the same call there does a real in-kernel copy. Format the snapshot disk XFS if you get the choice, because on ext4 a 500 MiB diff is 500 MiB the kernel actually moves.
 
 ```text
   read + write                        copy_file_range
@@ -531,7 +529,7 @@ Any of the three flips a `fallback` flag and the export finishes with `io.Copy`,
 
 Step 5 turns the bitmap back into mapping entries. Every contiguous run of set bits becomes one `BuildMap` whose `BuildStorageOffset` counts up through the diff file in the order the ranges were written, which is precisely the packed layout from the worked example. Those entries merge onto the parent's mapping, normalize, and the generation goes up by one.
 
-Zero blocks take the `uuid.Nil` path from earlier. A sandbox that filled 2 GiB of scratch space and then deleted it produces a mapping entry saying "this range is zeros" and uploads nothing for it, instead of putting 2 GiB of zeros in object storage.
+Zero blocks take the `uuid.Nil` path from earlier. A sandbox that filled 2 GiB of scratch space and then deleted it uploads nothing for that range. The mapping entry says "this range is zeros" instead of object storage holding 2 GiB of them.
 
 ## Trade-offs
 
@@ -545,6 +543,6 @@ Zero blocks take the `uuid.Nil` path from earlier. A sandbox that filled 2 GiB o
 
 Downloading the image front-loads all the pain into a place where you expect it, and lazy fetch spreads it across the sandbox's whole life instead. A cache miss is an S3 round trip that the guest kernel experiences as very slow block-device latency, and it can land on the user's first keystroke or on hour six. Worth it, on balance, because a sandbox that starts in a second and occasionally stalls for 40 ms beats one that starts in thirty seconds every single time. Read most of the image on every boot and the trade inverts.
 
-Snapshot chains are the other slow leak. Every pause adds mapping entries and one more object that reads might fan out to, so a sandbox someone has been snapshotting for a week eventually needs a rebase pass to flatten it. The cost of a cheap snapshot arrives later rather than never.
+Snapshot chains are the other slow leak. Every pause adds mapping entries and one more object that reads might fan out to, so a sandbox someone has been snapshotting for a week eventually needs a rebase pass to flatten it. Part 3 puts a number on how fast that accumulates once the snapshots are on a timer.
 
-The whole thing rests on one assumption worth stating plainly: the read side never changes. That's what makes it safe for a chunk fetched by one sandbox to be handed to a completely unrelated one, and it's the property that turns this into something you can put behind a Kubernetes volume. [Part 2](/posts/kubernetes-csi-interface/) covers that interface, and it's much less clever than this.
+The whole thing rests on one assumption worth stating plainly: the read side never changes. That's what makes it safe for a chunk fetched by one sandbox to be handed to a completely unrelated one. It's also the property that turns this into something you can put behind a Kubernetes volume. [Part 2](/posts/kubernetes-csi-interface/) covers that interface, and it's much less clever than this.

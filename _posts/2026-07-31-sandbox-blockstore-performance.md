@@ -14,13 +14,13 @@ tags: [csi, performance, caching, prefetch, s3, mincore]
 
 [Part 3](/posts/sandbox-blockstore-csi-driver/)'s mount finishes in under a second because it reads one header and nothing else. So what does the first real request against that Pod cost? On a warm-pool Pod that had already passed its readiness probe, 56.8 seconds.
 
-Nothing was broken. Lazy block fetch was doing exactly what Part 1 promised, moving the cost out of the mount and into the first read, which is a great trade until the first read is the one a user is watching a spinner for.
+Nothing was broken, and lazy block fetch was doing exactly what Part 1 promised, moving the cost out of the mount and into the first read. That's a great trade until the first read is the one a user is watching a spinner for.
 
-Two changes came at that from opposite ends. One shares fetched bytes between Pods on a node so the second Pod doesn't repay what the first already paid, and the other fetches the right bytes before anybody asks. Each has a number against a cold node, and together they do a third thing neither one does alone.
+Two changes came at that from opposite ends. One shares fetched bytes between Pods on a node so the second Pod doesn't repay what the first already paid, and the other fetches the right bytes before anybody asks. So let's price the sharing by bringing the same environment up twice on one cold node, then go record what a startup actually reads and fetch it during the mount.
 
 ## Where the time went
 
-Readiness is the trap. A Pod passes its probe as soon as the volume is mounted and the container is up, and Part 3's mount is one header read plus local setup, so that lands in well under a second:
+Readiness is the trap. A Pod passes its probe as soon as the volume is mounted and the container is up. Part 3's mount is one header read plus local setup, so that lands in well under a second:
 
 ```text
   WHAT READY MEANS                       WHAT'S ACTUALLY ON THE NODE
@@ -45,7 +45,7 @@ git status over 62,115 index entries
                                                  S3 range GET
 ```
 
-Each of those entries is a `stat` and usually a read, scattered across an 8 GiB image with no locality worth speaking of, and any read that lands in an unfetched chunk blocks on a round trip to object storage. So `Ready` was true, every health check was green, and the Pod was useless for the next minute.
+Each of those entries is a `stat` and usually a read, scattered across an 8 GiB image with no locality worth speaking of. Any read landing in an unfetched chunk blocks on a round trip to object storage. So `Ready` was true, every health check was green, and the Pod was useless for the next minute.
 
 ## Sharing the cache across Pods
 
@@ -68,7 +68,7 @@ Run it on a node whose cache is empty, then run it again on the same node with t
 | Final dev sync | 2.726s | 1.265s | 1.461s | 53.59% |
 | **Total startup** | **52.009s** | **30.651s** | **21.358s** | **41.07%** |
 
-Waiting on the mount sentinel went from 1.182s to 0.010s, because that phase is nothing but first-read latency and a populated cache leaves no first read to pay for. The phase that actually dominates the total, three services coming up at once, only fell from 30.5s to 20.5s, since most of what it spends is CPU no cache can help with. Every row is the same effect diluted by however much real work that phase also does.
+The sentinel is a file the image ships with, which the entrypoint reads to find out whether the volume is serving yet. Waiting on it went from 1.182s to 0.010s, because that phase is nothing but first-read latency and a populated cache leaves no first read to pay for. The phase that actually dominates the total, three services coming up at once, only fell from 30.5s to 20.5s. Most of what it spends is CPU no cache can help with. Every row is the same effect diluted by however much real work that phase also does.
 
 Nothing about the workload changed between the two columns, so 21 of those 52 seconds were one Pod refetching what another Pod on the same machine already had sitting on local disk.
 
@@ -117,7 +117,7 @@ The obvious way to record a read set is to trace the workload, with `strace` or 
   block allocator in your head
 ```
 
-So the recording pass in `template-builder`, under `--record-startup-hotset`, asks the kernel instead. Run the workload through a loop mount, then ask the page cache which pages of the backing file are resident, and whatever it says is by construction exactly what the read path touched.
+So the recording pass asks the kernel instead. It runs in the build pipeline, the same pass that produces a template's objects in the first place, under `--record-startup-hotset`. Run the workload through a loop mount, then ask the page cache which pages of the backing file are resident, and whatever it says is by construction exactly what the read path touched.
 
 ```text
 1. cp -a the source tree into the image through a loop mount
@@ -184,7 +184,7 @@ Going from resident pages to chunk offsets is also where the manifest gets small
   manifest can't exceed 2048 offsets no matter what the workload did
 ```
 
-`residentPagesToOffsets` is picky about that arithmetic, refusing to run unless the chunk size divides cleanly by the page size and the page count matches the mapping length, because an off-by-one here publishes offsets that point somewhere else in the image entirely.
+`residentPagesToOffsets` is picky about that arithmetic. It refuses to run unless the chunk size divides cleanly by the page size and the page count matches the mapping length, because an off-by-one here publishes offsets pointing somewhere else in the image entirely.
 
 ```go
 type StartupHotset struct {
@@ -236,7 +236,7 @@ coalesced into ranges, capped at maxRangeBytes
 
 The step the diagram doesn't show is the skip. `prefetchRanges` drops anything already cached before it coalesces, which is where the two changes meet, because on a warm node most of the hot set is already there and the prefetch turns into almost nothing.
 
-Each range opens one reader and still walks it a chunk at a time, because completion is recorded per 4 MiB chunk and a range that dies halfway should leave behind the chunks it did finish rather than nothing.
+Each range opens one reader and still walks it a chunk at a time. Completion is recorded per 4 MiB chunk, so a range that dies halfway leaves behind the chunks it did finish rather than nothing.
 
 Concurrency is a weighted semaphore where each range's weight is its chunk count, so the permits bound bytes in flight rather than requests in flight:
 

@@ -85,6 +85,53 @@ SEAM_OPENER: list[tuple[str, bool]] = [
     ("So the export runs on a timer instead:", False),
 ]
 
+PINNED: list[tuple[str, bool]] = [
+    ("https://github.com/e2b-dev/infra/blob/main/packages/shared/x.go", True),
+    ("https://github.com/container-storage-interface/spec/blob/master/spec.md", True),
+    ("https://github.com/e2b-dev/infra/blob/da099cf305df080abd16b964ff8b664736ee6d34/x.go", False),
+    # A release tag doesn't move once upstream cuts it, so it reads the same
+    # next year as a SHA does.
+    ("https://github.com/kubernetes/kubernetes/blob/v1.33.10/pkg/volume/csi/csi_plugin.go#L706", False),
+    ("https://github.com/postgres/postgres/blob/REL_17_2/src/include/access/htup.h", True),
+]
+
+# Two boxes stacked over a third, which is the shape that made a column
+# histogram over the whole fence flag correct diagrams: the write-cache walls
+# sit at 12 and the read-cache wall below them at 19, two columns apart.
+STACKED = report.Fence(
+    start=1,
+    end=9,
+    info="text",
+    body=(
+        "    ▼       │        ▼       │",
+        "┌───────┐   │    ┌───────┐   │",
+        "│ write │   │    │ write │   │",
+        "│cache A│   │    │cache B│   │",
+        "└───────┘   │    └───────┘   │",
+        "            │                │",
+        "            └────────────────┘",
+        "                     ▼",
+        "           ┌──────────────────┐",
+        "           │ read cache       │",
+        "           └──────────────────┘",
+    ),
+)
+
+# The third line is indented one column past the wall it belongs to, which is
+# the typo the check exists for.
+MISALIGNED = report.Fence(
+    start=1,
+    end=7,
+    info="text",
+    body=(
+        "  ┌───────┐",
+        "  │ write │",
+        "   │cache│ ",
+        "  │  bit  │",
+        "  └───────┘",
+    ),
+)
+
 DIAGRAM = report.Fence(
     start=1,
     end=9,
@@ -138,6 +185,17 @@ def main() -> int:
         if flagged != expected:
             failures.append(f"diagram_echo({text!r}) share {share:.2f}, want flagged={expected}")
 
+    for url, expected in PINNED:
+        ref = url.split("/blob/")[1].split("/")[0]
+        flagged = report.PINNED_REF.fullmatch(ref) is None
+        if flagged != expected:
+            failures.append(f"unpinned-link /blob/{ref}/ is {flagged}, want {expected}")
+
+    if report.check_diagram(STACKED):
+        failures.append(f"box-column flagged a stacked diagram: {report.check_diagram(STACKED)}")
+    if not report.check_diagram(MISALIGNED):
+        failures.append("box-column missed a bar indented one column off its wall")
+
     posts = sorted(p for p in report.POSTS.glob("*.md") if p.name not in report.NOT_POSTS)
     slugs = {p.stem[11:] for p in posts}
     for path in posts:
@@ -153,7 +211,7 @@ def main() -> int:
         print(f"FAIL  {failure}")
     checks = (
         len(SPLITS) + len(READING) + len(ANNOUNCES) + len(SPEC_SHEET) + len(COLON)
-        + len(SEAM_OPENER) + len(ECHO) + len(posts)
+        + len(SEAM_OPENER) + len(ECHO) + len(PINNED) + 2 + len(posts)
     )
     print(f"\n{checks - len(failures)}/{checks} passed over {len(posts)} posts")
     return 1 if failures else 0
