@@ -31,13 +31,12 @@ Compression comes first, though, which is the half people forget:
 step 1: compress in place
 
   ┌──────────────────────────────────┐
-  │ id=1  status=active              │
   │ payload = 3 KB of JSON           │  tuple is over ~2 KB
   └──────────────────────────────────┘
-                 │  compress payload
+                 │  compress
                  ▼
   ┌──────────────────────────────────┐
-  │ payload = 1.4 KB compressed      │  under the limit, done,
+  │ payload = 1.4 KB                 │  under the limit, done,
   └──────────────────────────────────┘  no TOAST table involved
 ```
 
@@ -56,11 +55,11 @@ step 2: move out of line
 
 That TOAST table is an ordinary heap, which is the part worth holding on to. It chops the big value into page-sized chunks stored as its own rows keyed by an OID, so a scan that doesn't `SELECT` the big column never touches them. Being an ordinary heap also means it has its own dead tuples and needs its own vacuuming, which is how a table with a 4 KB `jsonb` column ends up with twice the bloat you were accounting for. See [`toast_internals.c`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/common/toast_internals.c).
 
-InnoDB does nearly the same thing under a different name, off-page storage. Large `BLOB` and `TEXT` columns move to overflow pages and the clustered-index leaf keeps a [20-byte pointer](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/include/page0size.h#L39). Row format decides how much stays inline, where `DYNAMIC` keeps only the pointer and the older `COMPACT` kept a 768-byte prefix, but the motive matches Postgres's: leaf pages are what every lookup traverses, so they need to stay small.
+InnoDB does nearly the same thing under a different name, off-page storage. Large `BLOB` and `TEXT` columns move to overflow pages and the clustered-index leaf keeps a [20-byte pointer](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/include/page0size.h#L39). How much stays inline depends on the row format, so a table still on the older `COMPACT` carries a 768-byte prefix of every large column in its leaves where `DYNAMIC` keeps 20 bytes. The motive matches Postgres's either way, since leaf pages are what every lookup traverses, so they need to stay small.
 
 Postgres gets a bonus out of [Part 2](/posts/postgres-vs-mysql-mvcc-vacuum-vs-undo/)'s copy-on-write MVCC. Updating a small column writes a new main-table tuple that copies the TOAST pointer, so a multi-megabyte value doesn't get rewritten because you touched a boolean next to it. Update the big column and you get new chunks, with the old ones sticking around for older transactions until `VACUUM` gets them.
 
-So oversized values get handled about equivalently on both engines, which makes them the boring case.
+Oversized values are the case where the two engines agree, and they agree because the value is too big for anybody's page, which makes the decision for them. Take the size away and the disagreement starts.
 
 ## Growth: page splits vs the free space map
 
@@ -70,11 +69,11 @@ A full 16 KB leaf page holds ids 10 through 20 and you insert id 15. It belongs 
 
 ### Where InnoDB splits, and why it matters
 
-Which record it splits at is the part nobody talks about, and it decides whether your table ends up dense or half empty. InnoDB tries three things in order:
+Which record it splits at is the part nobody talks about, and it decides whether your table ends up dense or half empty. InnoDB tries the cheap cases first, and three of them matter here:
 
 1. Insert into the right sibling page instead, if the record fits there. No split at all. See [`btr_insert_into_right_sibling`](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/btr/btr0btr.cc#L2192).
 2. If this insert lands right after the previous one on the same page, treat it as a sequential pattern and split at the new record, leaving the old page nearly full. That's [`btr_page_get_split_rec_to_right`](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/btr/btr0btr.cc#L1703), and the comment in it calls the heuristic "eager."
-3. Otherwise give up on guessing and split down the middle, at [`page_get_middle_rec`](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/btr/btr0btr.cc#L2415), producing two pages about half full each.
+3. Otherwise give up on guessing and split down the middle, at [`page_get_middle_rec`](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/btr/btr0btr.cc#L2415), producing two pages about half full each. There's a mirror of the sequential case for descending inserts on the way there, and it doesn't change the outcome for random keys.
 
 Attempt 1 is the cheapest outcome available, since a record that sorts past everything on the full page can just go next door:
 
@@ -110,13 +109,31 @@ page A stays sealed and full        every future insert near
 
 Same table, same rows, roughly double the disk, decided entirely by the order the keys showed up in.
 
-Splits cost more than space, since each one is CPU plus I/O plus a parent-node update, and the new page is allocated wherever the tablespace has room, often nowhere near its logical neighbor. The tree stays perfectly ordered while the pages scatter physically underneath it, so a range scan reading "sequential" leaf pages can be doing random I/O. Fixing that means rebuilding with [`OPTIMIZE TABLE`](https://dev.mysql.com/doc/refman/8.4/en/optimize-table.html), which writes a fresh densely packed B+Tree and drops the old one.
+Splits cost more than space, since each one is CPU plus I/O plus a parent-node update, and the new page is allocated wherever the tablespace has room, often nowhere near its logical neighbor:
+
+```text
+what the tree says            where the pages are
+
+  leaf order                    tablespace offset
+  ┌──────────────────┐          ┌──────────────────┐
+  │ 10..14  page A   │          │ page A     0 MB  │
+  │ 15..20  page B   │          │ page C    12 MB  │
+  │ 21..27  page C   │          │ page D    12 MB  │
+  │ 28..34  page D   │          │ page B    47 MB  │
+  └──────────────────┘          └──────────────────┘
+   perfectly ordered             B split off late and
+                                 landed 47 MB away
+
+  ──> "scan ids 10 through 34 in order" seeks four times
+```
+
+The tree stays perfectly ordered while the pages scatter physically underneath it, so a range scan reading "sequential" leaf pages can be doing random I/O. Fixing that means rebuilding with [`OPTIMIZE TABLE`](https://dev.mysql.com/doc/refman/8.4/en/optimize-table.html), which writes a fresh densely packed B+Tree and drops the old one.
 
 ### Postgres has no table-data splits at all
 
 The heap has no required order, so an insert goes to any page with room, found via the free space map, or to the end of the file. No table-data page splits exist, which makes insert order genuinely irrelevant to how densely a Postgres table packs. Postgres B-Tree indexes do split much like InnoDB's, but an index entry is a key and a TID rather than an entire row, so the same split moves far fewer bytes.
 
-Postgres pays for the same problem in a different currency, which is the honest version of the comparison. Dead tuples from [Part 2](/posts/postgres-vs-mysql-mvcc-vacuum-vs-undo/) leave Swiss-cheese holes once `VACUUM` frees them, and a heap that doesn't refill its holes efficiently bloats just as badly as a fragmented B+Tree. The heavy fix is [`VACUUM FULL`](https://www.postgresql.org/docs/current/sql-vacuum.html) or `pg_repack`, rewriting the heap into a compact new file. Both engines degrade with churn, for different reasons, rebuilt by different commands.
+Which is not the same as Postgres staying compact, and the honest version of the comparison is that both engines end up needing a rewrite command, for unrelated reasons. Dead tuples from [Part 2](/posts/postgres-vs-mysql-mvcc-vacuum-vs-undo/) leave Swiss-cheese holes once `VACUUM` frees them, and a heap that doesn't refill its holes efficiently bloats just as badly as a fragmented B+Tree. That's MVCC garbage rather than insert geometry, and it arrives on a table nobody ever inserted into out of order. The heavy fix is [`VACUUM FULL`](https://www.postgresql.org/docs/current/sql-vacuum.html) or `pg_repack`, rewriting the heap into a compact new file.
 
 | | PostgreSQL | MySQL (InnoDB) |
 |---|---|---|
@@ -126,7 +143,7 @@ Postgres pays for the same problem in a different currency, which is the honest 
 | Main degradation mode | Heap bloat from dead tuples | Fragmentation from splits |
 | Heavy fix | `VACUUM FULL` / `pg_repack` | `OPTIMIZE TABLE` |
 
-That third row ruins someone's quarter and looks like nothing on a comparison table. Insert order is invisible in your schema, absent from your query plans, and for Postgres genuinely irrelevant. For InnoDB it's the difference between a table that packs itself and a table that doubles.
+The third row is the one that costs money and looks like nothing on a comparison table, since insert order is invisible in your schema, absent from your query plans, and for Postgres genuinely irrelevant. For InnoDB it's the difference between a table that packs itself and a table that doubles.
 
 ## Back to that UUID
 
@@ -138,7 +155,7 @@ UUIDv4 is 122 bits of randomness, so every insert targets a random leaf and the 
 - Every split takes the 50/50 path, so the steady state is half-full pages and a table roughly double the size it needs to be.
 - The target page is usually not in memory. InnoDB reads a random 16 KB page from disk, inserts, splits, flushes, and repeats.
 
-The third one is what takes the system down, since the first two are a space problem you can throw disk at while a buffer pool asked to cache a working set spread uniformly across the entire table has nothing left to give. Follow one row in:
+The third one is what takes the system down, since the first two are a space problem you can throw disk at. A buffer pool asked to cache a working set spread uniformly across the entire table has nothing left to give. Follow one row in:
 
 ```text
 one UUIDv4 insert, start to finish
@@ -154,7 +171,9 @@ one UUIDv4 insert, start to finish
 
 Postgres mostly shrugs, because rows go into the heap wherever there's room no matter what the key says. The random-insert cost is confined to the index B-Tree, where an entry is a key and a TID rather than a full row, so the bloat is bounded by something much smaller than your table. Real cost, different order of magnitude.
 
-The fix is [UUIDv7](https://www.rfc-editor.org/rfc/rfc9562#name-uuid-version-7), which moves the leading bits from random to sortable and leaves the rest alone:
+### The fix is a different UUID, not a different key
+
+[UUIDv7](https://www.rfc-editor.org/rfc/rfc9562#name-uuid-version-7) moves the leading bits from random to sortable and leaves the rest alone:
 
 ```text
 UUIDv4  ┌──────────────────────────────────────────────────────┐
@@ -171,20 +190,20 @@ UUIDv7  ┌──────────────────────┬
 
 Time only moves forward, so v7 values sort roughly in generation order and append to the right edge like an integer while staying globally unique with no coordination.
 
-It isn't quite an auto-increment, since concurrent generators inside the same millisecond interleave, so the insert point stays within the rightmost page or two rather than being strictly monotonic, which is enough for the heuristic but not the same thing. And a v7 tells anyone holding it when it was created, which matters if opaque IDs were the point.
+It isn't quite an auto-increment, since concurrent generators inside the same millisecond interleave. The insert point stays within the rightmost page or two rather than being strictly monotonic, which is enough for the heuristic but not the same thing. And a v7 tells anyone holding it when it was created, which matters if opaque IDs were the point.
 
-If you've already shipped v4, InnoDB will tell you how bad it is before you plan a migration:
+If you've already shipped v4, the number you want is how full the leaf pages actually are, and the obvious place to look is the wrong one. `information_schema.tables.data_free` counts whole free extents in the tablespace, so half-empty pages contribute nothing to it, because they're allocated. Ask the buffer pool instead:
 
 ```sql
 SELECT table_name,
-       data_length,
-       data_free,
-       ROUND(data_free / NULLIF(data_length, 0) * 100, 1) AS pct_free
-FROM information_schema.tables
-WHERE table_schema = DATABASE()
-ORDER BY data_length DESC;
+       COUNT(*)                                AS pages_cached,
+       ROUND(AVG(data_size) / 16384 * 100, 1)  AS avg_pct_full
+FROM information_schema.innodb_buffer_page
+WHERE page_type = 'INDEX' AND table_name IS NOT NULL
+GROUP BY table_name
+ORDER BY pages_cached DESC;
 ```
 
-`data_free` on a clustered index fed random keys creeps toward a third or more of `data_length`. Run `OPTIMIZE TABLE` on a copy to see how much of that is recoverable versus structural, and keep it off production, since it rebuilds the table and takes a metadata lock at the end.
+`data_size` is a page's live record bytes, so `avg_pct_full` hovering near 50 on a table fed random keys is the 50/50 split path showing up in the only place it's visible. Only cached pages get counted, which is fine, since those are the ones your workload touches. To size the recoverable part, run `OPTIMIZE TABLE` on a copy and compare, and keep it off production, since it rebuilds the table and takes a metadata lock at the end.
 
 Everything so far has been one connection's view of storage. [Part 5](/posts/postgres-vs-mysql-connection-models/) is what happens when several thousand clients show up at once, where a second root decision, entirely independent of clustered-versus-heap, explains why the two servers fall over in completely different ways.

@@ -20,9 +20,9 @@ SELECT * FROM users WHERE email = 'a@a.com';
 SELECT * FROM users WHERE id = 1;
 ```
 
-Same schema and same rows, and the winner flips between them. MySQL walks two B+Trees to answer the first one and reads the row straight out of an index leaf for the second, while Postgres does one index hop plus a trip to the table either way, which is a bargain on `email` and a tax on `id`.
+Same schema and same rows, and the winner flips between them. MySQL does twice the work of Postgres on the first query and half the work on the second, and both results come out of one decision about where row data physically lives.
 
-Both results come out of a single decision about where row data physically lives. InnoDB keeps the table *inside* the primary key index, an arrangement called a [clustered index](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/include/dict0mem.h#L95), so the index and the table are one B+Tree with the rows sitting in its leaves. Postgres keeps rows in a [heap](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/heap/heapam.c), an unordered pile of pages, and every index is a separate structure pointing back into that pile, primary key included.
+InnoDB keeps the table *inside* the primary key index, an arrangement called a [clustered index](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/include/dict0mem.h#L95), so the index and the table are the same B+Tree with the rows sitting in its bottom level. Postgres keeps rows in a [heap](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/heap/heapam.c), an unordered pile of pages, and every index is a separate structure pointing back into that pile, primary key included.
 
 That one split decides how fast each kind of read is, what an update costs, and how both engines age over months in production. Two rows are enough to see all of it:
 
@@ -108,9 +108,9 @@ Notice that each secondary index stores a primary key value instead of a physica
 
 ## PostgreSQL: heap plus pointers
 
-Postgres drops each row wherever there's free space, in no particular order. To find it again, every version gets tagged with a Tuple ID, or [TID](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/include/storage/itemptr.h#L36), a physical address written as `(block number, offset)`. Read that as a page and a slot on that page.
+Postgres drops each row wherever there's free space, in no particular order. To find it again, every version gets tagged with a Tuple ID, or [TID](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/include/storage/itemptr.h#L36), a physical address written as `(block number, offset)`. Read that as a page and a slot on that page, where the slot is a real thing: each page opens with an array of pointers into its own body, and the offset picks one out. Rows shuffle around inside a page without their TIDs changing, because the slot number is what the TID names.
 
-Every index stores the indexed value plus a TID, the primary key index included. Nothing is clustered so in Postgres terms, every index is a secondary index and every one of them points straight at the heap.
+Every index stores the indexed value plus a TID, the primary key index included. Nothing is clustered, so every index is alike, and every one of them points straight at the heap.
 
 Both indexes therefore hold a TID and neither holds a row, so both queries take the identical two-step route:
 

@@ -80,7 +80,7 @@ Vary the rhythm deliberately. Uniform paragraphs of uniform length are
 the strongest tell that a machine wrote something.
 
 A short punchy line lands mid-paragraph or at the end, where it closes
-something off. It usually fails at the *start* of a paragraph, where it
+something off. It often fails at the *start* of a paragraph, where it
 reads as throat-clearing before the real sentence arrives:
 
 ```
@@ -97,6 +97,44 @@ line that states the paragraph's whole claim stays. "Not free, though."
 and "Nothing warns you." only announce, so they fold into the sentence
 after them.
 
+## Sentence length
+
+Folding a throat-clearing opener into the next sentence fixes that one
+sentence. It isn't a license to keep going. The failure on the other
+side is a sentence that swallows the whole paragraph:
+
+```
+BAD:  `LP_DEAD` is the tombstone that makes it workable, since the
+      tuple body is gone and its bytes reclaimed while the slot number
+      stays reserved, so an index entry still pointing there lands on
+      something well-defined instead of a stranger's row, which buys
+      vacuum time to go clean the indexes across three phases.
+
+GOOD: `LP_DEAD` is the tombstone that makes it workable. The tuple body
+      is gone and its bytes are reclaimed, but the slot number stays
+      reserved, so an index entry still pointing there lands on
+      something well-defined instead of a stranger's row. That's what
+      buys vacuum time to clean the indexes.
+```
+
+Both carry the same facts. The first makes the reader hold all of them
+at once to find out which one the sentence was about, and the second
+lets them bank each one and move on.
+
+Rough ceilings, not laws:
+
+- Past 35 words a sentence needs a reason to be that long, and past 45
+  there usually isn't one.
+- Two subordinate clauses reads fine. Three is the ceiling, and a chain
+  of "since ... so ... which ..." has already gone past it.
+- One consequence per sentence. When a "so" or a "which" introduces
+  something the reader has to reason about rather than just absorb,
+  that's the next sentence.
+
+Split at the joint carrying the most weight and keep every fact.
+Deleting words isn't the fix, because the problem is that the reader
+has nowhere to breathe rather than that they've been told too much.
+
 Describing a structure is where prose goes stiff, because a run of flat
 subject-verb-object statements about what a thing contains reads like a
 spec sheet even when every fact in it is right:
@@ -110,9 +148,9 @@ GOOD: The header opens with 64 bytes of metadata and then just repeats
       the first block and treating the rest as an array.
 ```
 
-The fix isn't shorter sentences. Write the structure through what
-happens to somebody using it, and let each sentence earn the next one
-with a "so" or a "which" instead of stacking facts side by side.
+What made the first one stiff was the flat "X contains Y" framing, not
+the sentence count. Write the structure through what somebody using it
+does with it, and the facts stop needing to be stacked side by side.
 
 End sections with a practical takeaway when there is one. Don't
 manufacture one when there isn't.
@@ -305,8 +343,10 @@ come down without losing a mechanism, the section wanted splitting.
    state of the world? Delete it, start with the second sentence.
 4. Does any paragraph open on a sentence under nine words that only
    announces what's coming? Fold it into the sentence after it.
-5. Does any step-by-step explanation have one diagram where it should
+5. Does any sentence run past 35 words or chain three subordinate
+   clauses? Split it at the joint carrying the most weight.
+6. Does any step-by-step explanation have one diagram where it should
    have one per step?
-6. Read every paragraph that describes a structure. If it's a run of
+7. Read every paragraph that describes a structure. If it's a run of
    flat "X contains Y" statements, rewrite it around what a reader does
    with the structure.

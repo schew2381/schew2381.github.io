@@ -15,9 +15,9 @@ tags: [postgres, mysql, innodb, mvcc, vacuum]
 
 `DELETE FROM events WHERE created_at < '2025-01-01'`, ten million rows gone, and the table is exactly the same size on disk afterward. Run it against MySQL and the space eventually comes back on its own. Run it against Postgres and it won't, not until something else runs.
 
-Both engines implement MVCC, multi-version concurrency control, which is why a reader never waits on a writer and a writer never waits on a reader. Note the pairing there, because it's read against write and nothing else. MVCC does nothing for you between two writers, so `UPDATE`'s to the same row still serialize on a row lock exactly as you'd expect.
+A twenty-minute analytics report shouldn't block a checkout, and a checkout shouldn't make the report fail halfway through. Both engines get you that by keeping more than one version of a row around, which is what MVCC, multi-version concurrency control, buys: a reader never waits on a writer and a writer never waits on a reader. Read against write and nothing else, though, so `UPDATE`'s to the same row still serialize on a row lock exactly as you'd expect.
 
-What the guarantee costs is that old row versions have to stay readable as long as some snapshot might still want them. Where each engine puts those old versions is the whole difference between them, and it follows straight from [Part 1](/posts/postgres-vs-mysql-storage-clustered-vs-heap/):
+Keeping old versions around means keeping them readable as long as some snapshot might still want them, and where each engine puts them is the whole difference between the two, following straight from [Part 1](/posts/postgres-vs-mysql-storage-clustered-vs-heap/):
 
 ```text
 Postgres                             InnoDB
@@ -60,7 +60,7 @@ before                             after
                                    └─────────────────────────┘
 ```
 
-Keeping the old version is the entire trick. A transaction that started at `xid=103` still reads `(0,1)` and sees `foo`, because `xmax=105` belongs to a transaction it can't see yet. A transaction that starts after 105 commits reads `(0,2)` and sees `bar`. Same logical row, two physical tuples, and not one lock between them.
+Keeping the old version is the entire trick, since a transaction that started at `xid=103` still reads `(0,1)` and sees `foo`, because `xmax=105` belongs to a transaction it can't see yet. A transaction that starts after 105 commits reads `(0,2)` and sees `bar`. Same logical row, two physical tuples, and not one lock between them.
 
 So `(0,1)` has to stick around as long as any transaction might still want it. Correct behavior, and also how a table full of dead weight gets built one update at a time, because when the last interested transaction finishes, nothing about the tuple changes. It sits there taking up space until something reclaims it.
 
@@ -127,14 +127,14 @@ SELECT * FROM users WHERE name = 'foo';   -- snapshot at xid 110
 
 Heap slots get reused, so picture vacuum freeing a slot while an index entry still points at it. The next insert drops an unrelated row into that slot, the stale entry resolves to it, and a query for `email = 'a@a.com'` quietly returns somebody else's row with no error anywhere the database can detect. Postgres rules that out with one invariant, spelled out in the [`lazy_scan_heap`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/heap/vacuumlazy.c#L1279) header comment: no index entry may ever point at a reusable slot.
 
-Holding that line comes down to the slot itself. Every heap page opens with an array of line pointers, a TID's offset picks one out, and each carries a [state flag](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/include/storage/itemid.h#L38):
+Holding that line comes down to the slot itself, which is the line pointer from [Part 1](/posts/postgres-vs-mysql-storage-clustered-vs-heap/) and carries a [state flag](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/include/storage/itemid.h#L38) alongside its offset:
 
 - `LP_NORMAL`, pointing at real tuple data on the page.
 - `LP_DEAD`, tuple data gone, slot not reusable yet.
 - `LP_UNUSED`, slot free for the next insert.
 - `LP_REDIRECT`, forwarding to another slot, used by HOT.
 
-`LP_DEAD` is the tombstone that makes it workable. The tuple body is gone and its bytes reclaimed while the slot number stays reserved, so an index entry still pointing there lands on something well-defined instead of a stranger's row, which buys vacuum time to go clean the indexes across three phases.
+`LP_DEAD` is the tombstone that makes it workable. The tuple body is gone and its bytes are reclaimed, but the slot number stays reserved, so an index entry still pointing there lands on something well-defined instead of a stranger's row. That's what buys vacuum time to clean the indexes across three phases.
 
 [`lazy_scan_prune`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/heap/vacuumlazy.c#L2021) walks each page, frees the data of tuples dead to every running transaction, and records their TIDs:
 
@@ -172,13 +172,15 @@ phase 3: revisit the heap page
   └──────────────────────────┘
 ```
 
-Phase 3 waits on phase 2 and phase 2 scans every index in full, so vacuuming a table with eight indexes costs roughly eight complete index scans. Drop the indexes and the same work collapses to one pass, `LP_NORMAL` straight to `LP_UNUSED`, since nothing could be holding a stale pointer. Every index you add makes vacuum more expensive, a cost nobody thinks about when adding one.
+Phase 3 waits on phase 2 and phase 2 scans every index in full, so vacuum costs one complete index scan per index on the table. Drop them all and the same work collapses to one pass, `LP_NORMAL` straight to `LP_UNUSED`, since nothing could be holding a stale pointer. Every index you add makes vacuum more expensive, a cost nobody thinks about when adding one.
 
-Vacuum won't shrink the file, either, because compacting the heap would mean moving live tuples and invalidating every index entry aimed at their old addresses. Live rows keep their TIDs for life while vacuum recycles the gaps around them, so those ten million deleted rows became free space *inside* the file rather than on the volume. Trailing empty pages are the one exception, handed back to the OS by [`lazy_truncate_heap`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/heap/vacuumlazy.c#L3142).
+### What vacuum doesn't do
 
-Freezing is a second job with nothing to do with space. Transaction IDs are 32 bits and they wrap, so an old enough tuple's `xmin` would eventually look like it came from the future, and vacuum *freezes* those tuples with [`HEAP_XMIN_FROZEN`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/include/access/htup_details.h#L206) to mark them unconditionally visible and retire `xmin` from comparison. It's why autovacuum suddenly works over a static table nobody has written to in months.
+Vacuum won't shrink the file, because compacting the heap would mean moving live tuples and invalidating every index entry aimed at their old addresses. Live rows keep their TIDs for life while vacuum recycles the gaps around them, so those ten million deleted rows became free space *inside* the file rather than on the volume. Trailing empty pages are the one exception, handed back to the OS by [`lazy_truncate_heap`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/heap/vacuumlazy.c#L3142).
 
-Ordinary queries pitch in on the index side. An index scan that follows a TID and finds every tuple in the chain dead sets a `kill_prior_tuple` hint in [`index_fetch_heap`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/index/indexam.c#L677), and [`_bt_killitems`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/nbtree/nbtutils.c#L191) marks the entry `LP_DEAD` so the next scan skips it without a heap fetch. That only helps entries somebody actually read, and the duplicate pile from two sections ago accumulates whether anyone queries it or not.
+Freezing rides along on the same scan without being about space at all. Transaction IDs are 32 bits and they wrap, so an old enough tuple's `xmin` would eventually look like it came from the future, and vacuum *freezes* those tuples with [`HEAP_XMIN_FROZEN`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/include/access/htup_details.h#L206) to mark them unconditionally visible and retire `xmin` from comparison. It's why autovacuum suddenly works over a static table nobody has written to in months.
+
+Ordinary queries pitch in on the index side, because an index scan that follows a TID and finds a whole HOT chain dead sets a `kill_prior_tuple` hint in [`index_fetch_heap`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/index/indexam.c#L677). [`_bt_killitems`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/nbtree/nbtutils.c#L191) then marks the entry `LP_DEAD`, so the next scan skips it without a heap fetch. That only helps entries somebody actually read, and the duplicate pile from two sections ago accumulates whether anyone queries it or not.
 
 ## Bottom-up index deletion
 
@@ -186,13 +188,13 @@ Picture those same-key duplicates piling up on one leaf page. Each update that l
 
 Splitting to make room for garbage is a bad trade, and since PostgreSQL 14 the B-Tree tries not to. When an incoming entry [doesn't fit](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/nbtree/nbtinsert.c#L917) on its target leaf page, [`_bt_delete_or_dedup_one_page`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/nbtree/nbtinsert.c#L2730) gets a shot at freeing space before the split happens. It works down three options:
 
-1. Delete entries already marked `LP_DEAD` by `_bt_killitems`. Free, and guaranteed to find at least one, since that's the gating condition.
+1. Delete entries already marked `LP_DEAD` by `_bt_killitems`, if the page has any. Cheapest of the three, since a `LP_DEAD` entry is already known garbage and the pass throws in a few unmarked neighbors while it's visiting their heap blocks anyway.
 2. Run a [bottom-up deletion pass](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/nbtree/nbtdedup.c#L309) if the executor says this insert is version churn.
 3. Deduplicate, merging equal keys into a posting list.
 
-Step 2's trigger is the interesting half, since the executor already knows whether an `UPDATE` touched any column this particular index cares about. [`index_unchanged_by_update`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/executor/execIndexing.c#L1019) compares the updated columns against the index's key columns and passes down an `indexUnchanged` hint when they don't overlap, and a true hint says the incoming entry is a logical duplicate that exists only for MVCC, which is a strong signal that most of its neighbors are too.
+Step 2's trigger is the interesting half, since the executor already knows whether an `UPDATE` touched any column this particular index cares about. [`index_unchanged_by_update`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/executor/execIndexing.c#L1019) compares the updated columns against the index's key columns and passes down an `indexUnchanged` hint when they don't overlap. A true hint means the entry is a logical duplicate that exists only for MVCC, so most of its neighbors probably are too.
 
-The pass groups the page's entries into runs of equal keys, marks the duplicates "promising", and asks the heap which of their TIDs point at tuples dead to everyone, with nothing known-deletable going in. The B-Tree names a [space target](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/nbtree/nbtdedup.c#L358) of a sixteenth of the page or the new entry's size, whichever is larger, and the heap stops checking once it hits that or decides the visits aren't paying off.
+The pass groups the page's entries into runs of equal keys, marks the duplicates "promising", and asks the heap which of their TIDs point at tuples dead to everyone, with nothing known-deletable going in. The B-Tree names a [space target](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/nbtree/nbtdedup.c#L358) of a sixteenth of the page or the new entry's size, whichever is larger. The heap stops checking once it hits that target, or once it decides the visits aren't paying off.
 
 ```text
 leaf page, key=foo repeated by version churn
@@ -207,13 +209,15 @@ before pass                        after pass
 └──────────────────────────┘       └──────────────────────────┘
 ```
 
+### Why guessing is the right design here
+
 All of it is speculative, and the [nbtree README](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/nbtree/README#L589) is upfront about that, calling the pass a backstop against unnecessary version-driven page splits and borrowing the generational hypothesis from garbage collectors: most objects die young. A pass that finds nothing costs a few heap page visits and the page splits as it would have anyway, while a pass that succeeds can keep that page from ever splitting.
 
 Which makes it a different kind of mechanism from vacuum, and that difference is the reason it exists. Vacuum is a scheduled sweep over the whole table reclaiming space long after the fact. Bottom-up deletion is targeted and synchronous, running on the page that has a problem at the moment it has one, so a table under steady non-indexed updates keeps its indexes in shape between autovacuum runs rather than waiting on one. It does nothing for heap bloat, so vacuum keeps its job.
 
 ## Index-only scans and the visibility map
 
-Covering indexes run headfirst into all of this. If every column a query needs is already in the index, Postgres would love to answer from the index alone, and it can't, for the reason from two sections ago: the index tuple has no `xmin`/`xmax`, so skipping the heap means skipping the visibility check, and the query cheerfully returns rows deleted last week.
+Covering indexes run headfirst into all of this, because if every column a query needs is already in the index, Postgres would love to answer from the index alone. It can't, for the reason from two sections ago: the index tuple has no `xmin`/`xmax`. Skipping the heap means skipping the visibility check, and the query cheerfully returns rows deleted last week.
 
 The way out is the visibility map, a bitmap alongside each table with [two bits per heap page](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/include/access/visibilitymapdefs.h#L17):
 
@@ -239,7 +243,7 @@ index-only scan, one index entry
                               xmin/xmax the normal way.
 ```
 
-The bit says nothing about this tuple specifically. It's a page-level guarantee, and the logic is that if every tuple on the page is visible to everyone, the one the TID points at is visible too. Enough to skip the fetch without reading a single tuple header.
+The bit says nothing about this tuple specifically, because it's a page-level guarantee, and the logic is that if every tuple on the page is visible to everyone, the one the TID points at is visible too. Enough to skip the fetch without reading a single tuple header.
 
 Which is what the `Heap Fetches` line in `EXPLAIN (ANALYZE)` is telling you. A freshly-vacuumed static table reports zero and never touches the heap. A table under constant writes has most of its bits cleared, so the identical plan does a heap fetch per row and performs nothing like the plan you thought you had. Postgres labels the node "Index Only Scan" either way, so `Heap Fetches` is your only warning that it stopped being one.
 
@@ -293,23 +297,31 @@ Secondary indexes are where the two designs accidentally converge, because an In
 
 InnoDB's patch for that hole is close enough to the visibility map to be uncanny:
 
-```text
-                Postgres                  InnoDB
-                visibility map            index page header
-
-  granularity   one heap page             one index page
-  the value     2 bits: ALL_VISIBLE       PAGE_MAX_TRX_ID, the highest
-                and ALL_FROZEN            trx to touch this page
-  the question  is every tuple here       did every change here happen
-                visible to everyone?      before my snapshot?
-  yes ──>       answer from the index     trust the record as-is
-  no  ──>       fetch the heap tuple      take Part 1's second
-                and check xmin/xmax       traversal to the PK
-```
+| | Postgres visibility map | InnoDB index page header |
+|---|---|---|
+| Granularity | One heap page | One index page |
+| The value | 2 bits, `ALL_VISIBLE` and `ALL_FROZEN` | `PAGE_MAX_TRX_ID`, the highest transaction to touch this page |
+| The question | Is every tuple here visible to everyone? | Did every change here happen before my snapshot? |
+| Yes | Answer from the index | Trust the record as-is |
+| No | Fetch the heap tuple and check `xmin`/`xmax` | Take Part 1's second traversal to the primary key |
 
 [`lock_sec_rec_cons_read_sees`](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/lock/lock0lock.cc#L273) is what runs that check against the reader's view, using [`PAGE_MAX_TRX_ID`](https://github.com/mysql/mysql-server/blob/d229bb760c49b65e19ec28342236961ad961d7fe/storage/innobase/include/page0types.h#L77) out of the page header. Two bits per heap page on one side and one transaction ID per index page on the other, both a page-level watermark that lets a reader skip the visibility check.
 
-One asymmetry undercuts the tidy story, which is that an update changing an indexed column does *not* rewrite the secondary entry in place. InnoDB delete-marks the old one, inserts a new one, and leaves purge to sort it out, so index churn on that column looks a lot like Postgres. "InnoDB updates in place" is true of the row and only sometimes true of the indexes.
+One asymmetry undercuts the tidy story, which is that an update changing an indexed column does *not* rewrite the secondary entry in place:
+
+```text
+UPDATE users SET email = 'new@a.com' WHERE id = 1
+
+  clustered index                email index
+  ┌────────────────────────┐     ┌──────────────────────────────┐
+  │ id=1  email=new@a.com  │     │ a@a.com   ──> id=1  DELETED  │
+  └────────────────────────┘     │ new@a.com ──> id=1           │
+   rewritten in place            └──────────────────────────────┘
+   1 write                        old entry delete-marked, new
+                                  entry inserted, purge cleans up
+```
+
+InnoDB delete-marks the old one, inserts a new one, and leaves purge to sort it out, so index churn on that column looks a lot like Postgres. "InnoDB updates in place" is true of the row and only sometimes true of the indexes.
 
 ## Rollback: one write against ten million
 
@@ -317,7 +329,7 @@ Update ten million rows, then change your mind. `ROLLBACK` comes back instantly 
 
 Postgres has nothing to undo. Every new tuple it wrote carries `xmin` set to the aborting transaction's ID, and visibility comes from asking the commit log whether that transaction committed, so marking the transaction aborted makes all ten million tuples invisible to everybody at once. [`RecordTransactionAbort`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/transam/xact.c#L1796) does it through [`TransactionIdAbortTree`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/transam/transam.c#L269), which is a single [`TransactionIdSetTreeStatus`](https://github.com/postgres/postgres/blob/e395fbd32a07557de4ac98088928c1749d4845d8/src/backend/access/transam/clog.c#L192) call setting one status. One row or ten million, same work.
 
-The ten million tuples stay on disk, of course. They're dead now, indistinguishable from what a committed update leaves behind, and the three-phase vacuum from earlier reclaims them the same way. Nothing got cheaper, it just moved onto a bill Postgres was already going to pay.
+The ten million tuples stay on disk, of course, dead now and indistinguishable from what a committed update leaves behind, so the three-phase vacuum from earlier reclaims them the same way. Nothing got cheaper, it just moved onto a bill Postgres was already going to pay.
 
 InnoDB can't take that route, because the update already overwrote the row. The clustered-index leaf holds the new value and the only surviving copy of the old one is in the undo log, so restoring means reading undo records and applying them, one row at a time, in reverse.
 
@@ -363,7 +375,7 @@ The loop driving all of it is [`row_undo`](https://github.com/mysql/mysql-server
 
 ### Which one you notice in production
 
-Long enough rollbacks get their own progress report. `long_running_diag` in `row0undo.cc` checks in every hundredth row and writes this to the error log:
+Long enough rollbacks get their own progress report, because `long_running_diag` in `row0undo.cc` checks in every hundredth row and logs at most once every ten seconds:
 
 ```text
 Still rolling back transaction 900; 4300000 undo records rolled
@@ -376,7 +388,7 @@ Practically, a batch job you kill halfway through bills you a second time for wh
 
 ## Why the difference exists
 
-All of it comes back to that one question about where old versions go.
+Eight rows of consequence out of one decision about where old versions go:
 
 | | PostgreSQL | MySQL (InnoDB) |
 |---|---|---|
@@ -393,6 +405,6 @@ Neither is free, and they don't fail in comparable ways. Postgres pays with vacu
 
 Postgres has one sharp edge left, the one the two-entry diagrams above already showed you. Every update writes a new tuple at a new TID, so every index needs a new entry pointing at it, including indexes on columns the update didn't touch.
 
-So: a table with a dozen indexes, an `UPDATE` setting `last_login = now()` on a column nobody indexed, and Postgres writes thirteen things. Uber hit this exact wall and [wrote it up](https://www.uber.com/us/en/blog/postgres-to-mysql-migration) as one of the reasons they left.
+So: a table with a dozen indexes, an `UPDATE` setting `last_login = now()` on a column nobody indexed, and Postgres writes thirteen things. Uber hit this exact wall on their trips table and [wrote it up](https://www.uber.com/us/en/blog/postgres-to-mysql-migration) as write amplification, where a single field update turned into a rewrite of every index on the row, plus the WAL to replicate all of it to their followers.
 
 Postgres would be unusable for that workload if it actually behaved this way, which is a strong hint it doesn't. [Part 3](/posts/postgres-vs-mysql-hot-updates/) is the mechanism that saves it.
