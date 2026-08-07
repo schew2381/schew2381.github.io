@@ -14,9 +14,11 @@ tags: [e2b, firecracker, nbd, block-storage, s3, copy-on-write]
 
 An agent clones a repo into a throwaway Linux box, runs `pip install`, and executes whatever it just wrote. None of that is allowed to reach anything you care about, and there's a user at the other end watching a spinner, so it has to be ready now.
 
-[E2B](https://github.com/e2b-dev/infra) runs each of those sandboxes as a Firecracker microVM, which covers both halves. Every sandbox gets its own kernel, so the isolation is a hardware boundary rather than a namespace, and Firecracker's [spec](https://github.com/firecracker-microvm/firecracker/blob/054b647d47745ab1ef945238d06a2112040eda1b/SPECIFICATION.md) puts at most 125 ms between the start API call and the guest reaching `/sbin/init`. The VM isn't what anyone waits on. The disk is.
+[E2B](https://github.com/e2b-dev/infra) runs each of those sandboxes as a Firecracker microVM, which covers both halves. Every sandbox gets its own kernel, so the isolation is a hardware boundary rather than a namespace, and Firecracker's [spec](https://github.com/firecracker-microvm/firecracker/blob/054b647d47745ab1ef945238d06a2112040eda1b/SPECIFICATION.md) puts at most 125 ms between the start API call and the guest reaching `/sbin/init`.
 
-A microVM needs a root filesystem to boot from, and E2B's is a few gigabytes of ext4 with a guest memory snapshot of similar size behind it, both sitting in S3. Download them first and that 125 ms boot turns into thirty seconds of network, so E2B doesn't download them. It hands the guest kernel a block device that claims to be the whole image and fills the pieces in as the guest reads them. So let's follow one read down from the guest kernel to S3 and back, then pause the sandbox and watch what it uploads.
+The disk it boots from is where the time actually goes. E2B's rootfs is a few gigabytes of ext4 with a guest memory snapshot of similar size behind it, and both of them sit in S3. Downloading that before boot turns 125 ms into thirty seconds of network, so E2B never downloads it.
+
+Instead the guest kernel gets a block device that claims to be the whole image and fills the pieces in as the guest reads them. Let's follow one read down from the guest kernel to S3 and back, then pause the sandbox and watch what it uploads.
 
 ## Overview
 
@@ -161,7 +163,7 @@ s3://templates/base/rootfs.ext4, 8 blocks on disk
   header:  {Offset: 0, Length: 8, BuildId: base, BuildStorageOffset: 0}
 ```
 
-One entry covers the whole image, and both of its offsets are zero, because virtual and physical are the same thing in a base template. Which is exactly why a base template teaches you nothing about the format. It gets interesting after a snapshot.
+One entry covers the whole image, and both of its offsets are zero, because virtual and physical are the same thing in a base template. Which is exactly why a base template teaches you nothing about the format, and why it only gets interesting after a snapshot.
 
 ### One snapshot
 
@@ -254,7 +256,7 @@ Both offsets move by the same `rightBaseShift`, which is the invariant the whole
 
 ### Reading one block
 
-Five entries, sorted, covering the image with no gaps, so exactly one of them owns any block you name. Finding it is the whole read path, and the question is simple: which is the last entry that starts at or before the block we want?
+Five entries, sorted, covering the image with no gaps, so exactly one of them owns any block you name. Finding it is the whole read path, and it comes down to asking which entry is the last one that starts at or before the block we want.
 
 That's a binary search over the entry start offsets, which for our five entries are `[0, 3, 4, 5, 6]`. Say the guest asks for block 5, one of the two the sandbox dirtied:
 

@@ -16,7 +16,9 @@ tags: [csi, performance, caching, prefetch, s3, mincore]
 
 Nothing was broken, and lazy block fetch was doing exactly what Part 1 promised, moving the cost out of the mount and into the first read. That's a great trade until the first read is the one a user is watching a spinner for.
 
-Two changes came at that from opposite ends. One shares fetched bytes between Pods on a node so the second Pod doesn't repay what the first already paid, and the other fetches the right bytes before anybody asks. So let's price the sharing by bringing the same environment up twice on one cold node, then go record what a startup actually reads and fetch it during the mount.
+Two changes came at that from opposite ends. One shares fetched bytes between Pods on a node so the second Pod doesn't repay what the first already paid, and the other fetches the right bytes before anybody asks.
+
+So let's price the sharing by bringing the same environment up twice on one cold node, then go record what a startup actually reads and fetch it during the mount.
 
 ## Where the time went
 
@@ -357,7 +359,7 @@ Before either change, a Pod on this driver paid three separate tolls.
 
 Sharing kills the first one and the prefetch kills the second, and together they replace the third with something deliberate. What each buys costs something in return, and the two bills are different shapes. Sharing is tuned with watermarks and an idle TTL, and the prefetch with a concurrency limit and a range cap.
 
-The hot set's weakness is that it's a recording of one workload, and it's honest about being one. It was recorded from `git status`, so it prefetches what `git status` reads. Start a Pod that does something else first and it pays mount latency for chunks it will never touch, then misses on the ones it needs. Widening the recording to cover more startup paths is possible, and every path you add grows the manifest and the prefetch. Push that far enough and you've reinvented downloading the image, at which point Part 1's whole premise was wrong.
+The hot set's weakness is that it's a recording of one workload, and it's honest about being one. It was recorded from `git status`, so it prefetches what `git status` reads. Start a Pod that does something else first and it pays mount latency for chunks it'll never touch, then misses on the ones it needs. Widening the recording to cover more startup paths is possible, and every path you add grows the manifest and the prefetch. Push that far enough and you've reinvented downloading the image, at which point Part 1's whole premise was wrong.
 
 The shared cache's weakness is coupling, and that's what you buy when you point twenty Pods at one file. A corrupt cache file, a full disk, or an eviction at an unlucky moment reaches all of them at once. The header digest in the key rules out the genuinely bad case, where two volumes read each other's data through mismatched mappings. Everything else is bounded rather than prevented. Watermarks keep the disk from filling, and the state file only ever records whole chunks, so a torn write never gets trusted.
 

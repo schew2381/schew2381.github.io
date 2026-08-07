@@ -66,7 +66,7 @@ The weight is what you pay, because `fork()` plus a fresh address space is expen
 
 `work_mem` is where this gets people, because it's per sort node and not per connection. A query with three sorts and a hash join can allocate several multiples of `work_mem` on its own, so 200 backends running that query against a 4 MB default aren't using 800 MB. They're using some larger number nobody computed, and the machine finds out before you do.
 
-Which is why serious Postgres deployments put PgBouncer in front and keep the backend count near the core count instead of near the client count. The pooler isn't there because connections are slow to open. It's there because a Postgres connection is a process, and processes are not something you want thousands of.
+Which is why serious Postgres deployments put PgBouncer in front and keep the backend count near the core count instead of near the client count. The pooler isn't there because connections are slow to open. It's there because a Postgres connection is a process, and processes aren't something you want thousands of.
 
 ## MySQL: a thread per connection
 

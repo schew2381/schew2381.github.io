@@ -149,6 +149,40 @@ ECHO: list[tuple[str, bool]] = [
     ("A crashed backend costs you one client, and the postmaster reinitialises shared memory.", False),
 ]
 
+PIVOT: list[tuple[str, str, bool]] = [
+    ("The VM isn't what anyone waits on.", "The disk is.", True),
+    ("Kubelet doesn't offer the choice here.", "The spec does.", True),
+    # The fragment carries a fact of its own, so it isn't just a pointer back.
+    ("The VM isn't what anyone waits on.", "The disk it boots from is where the time goes.", False),
+    # No denial in front of it, so the second sentence isn't filling a blank.
+    ("Every sandbox gets its own kernel.", "The isolation is.", False),
+    # Real sentences from _posts/ that the surrounding shape resembles.
+    ("XFS supports that.", "ext4 doesn't, so the same call does a real copy.", False),
+    ("Nothing on that path is synchronous with the write.", "Tear down early and writeback hits a closed socket.", False),
+    ("A checkpoint and a teardown both want the overlay.", "An unmount that waits can block for an interval.", False),
+]
+
+# The expected contraction, or None when the long form should survive.
+CONTRACT: list[tuple[str, str | None]] = [
+    ("The first two are free, because they are the table.", "they're"),
+    ("One `UpdateItem` is not one index write.", "isn't"),
+    ("It is the prefix that names the build.", "It's"),
+    ("There is no caller to find.", "there's"),
+    # `it is` and `that is` mid-sentence are a preposition's object closing a
+    # phrase, so contracting them puts `it's` where no verb belongs.
+    ("What you get for it is the prefix.", None),
+    ("Each one only makes sense once the one before it is in place.", None),
+    ("What Postgres buys with that is knowing how index entries died.", None),
+    # `there` as an adverb, not the existential that introduces a noun.
+    ("The only reason it feels less urgent there is that the wall is further out.", None),
+    # The long form is the emphasis, which the italics mark, so leave it.
+    ("What the batch size does *not* control is the S3 request count.", None),
+    # Quoting the spec, and its wording isn't ours to contract.
+    ("The spec says the plugin \"is not required to implement\" the call.", None),
+    # A SQL keyword reads as caps, so it never wants an apostrophe.
+    ("Rows where `table_name IS NOT NULL` are the cached ones.", None),
+]
+
 
 def main() -> int:
     failures: list[str] = []
@@ -185,6 +219,15 @@ def main() -> int:
         if flagged != expected:
             failures.append(f"diagram_echo({text!r}) share {share:.2f}, want flagged={expected}")
 
+    for first, second, expected in PIVOT:
+        if report.negation_pivot(first, second) != expected:
+            failures.append(f"negation_pivot({first!r}, {second!r}) is {not expected}, want {expected}")
+
+    for text, expected in CONTRACT:
+        hits = [contracted for _, contracted in report.contraction_hits(text)]
+        if hits != ([expected] if expected else []):
+            failures.append(f"contraction_hits({text!r}) is {hits}, want {expected}")
+
     for url, expected in PINNED:
         ref = url.split("/blob/")[1].split("/")[0]
         flagged = report.PINNED_REF.fullmatch(ref) is None
@@ -211,7 +254,7 @@ def main() -> int:
         print(f"FAIL  {failure}")
     checks = (
         len(SPLITS) + len(READING) + len(ANNOUNCES) + len(SPEC_SHEET) + len(COLON)
-        + len(SEAM_OPENER) + len(ECHO) + len(PINNED) + 2 + len(posts)
+        + len(SEAM_OPENER) + len(ECHO) + len(PIVOT) + len(CONTRACT) + len(PINNED) + 2 + len(posts)
     )
     print(f"\n{checks - len(failures)}/{checks} passed over {len(posts)} posts")
     return 1 if failures else 0

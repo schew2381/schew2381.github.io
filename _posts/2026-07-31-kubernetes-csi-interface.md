@@ -12,11 +12,11 @@ tags: [csi, kubernetes, kubelet, grpc, volumes, storage]
 > 4. [Optimizing startup performance](/posts/sandbox-blockstore-performance/)
 {: .prompt-info }
 
-[Part 1](/posts/e2b-block-storage-layer/) ended on one property, which is that the read side never changes, so a chunk one sandbox fetched is safe to hand to a stranger. Now what does Kubernetes need to hear before it will mount that as a volume?
+[Part 1](/posts/e2b-block-storage-layer/) ended on one property, which is that the read side never changes, so a chunk one sandbox fetched is safe to hand to a stranger. Now what does Kubernetes need to hear before it'll mount that as a volume?
 
-Less than the size of the contract suggests. The [Container Storage Interface](https://github.com/container-storage-interface/spec/blob/cd4eba751417ddeddb7d5f41656baa61c1a0cb67/spec.md) defines 32 RPCs across five services, and a driver for a node-local, per-Pod volume answers seven of them. Writing those seven wasn't the work, and working out which of the other 25 we could leave out was. The spec's optional list and kubelet's aren't the same list either, so the way to find out is to watch who calls what.
+Less than the size of the contract suggests. The [Container Storage Interface](https://github.com/container-storage-interface/spec/blob/cd4eba751417ddeddb7d5f41656baa61c1a0cb67/spec.md) defines 32 RPCs across five services, and a driver for a node-local, per-Pod volume answers seven of them. Most of our effort went into the other 25, because the spec's optional list and kubelet's aren't the same list.
 
-So let's follow one Pod's volume from a few lines of YAML in its spec down to a mount on a node.
+So let's follow one Pod's volume from a few lines of YAML in its spec down to a mount on a node, watching who calls what on the way.
 
 ## Overview
 
@@ -177,7 +177,7 @@ Kubelet can't tell those apart, so the driver has to make the retry correct in b
 - `NodeUnpublishVolume` on a path that isn't mounted must return success. Returning `NotFound` makes kubelet retry forever and the Pod never finishes terminating.
 - `CreateVolume` with the same name and parameters must return the existing volume. With different parameters it must return `ALREADY_EXISTS`.
 
-The unpublish rule is the one that bites, and it bites specifically because the honest implementation is wrong. A driver that faithfully reports "this volume was never mounted here" is telling the truth and producing Pods wedged in `Terminating` until somebody force-deletes them. Return success and move on.
+The unpublish rule is the one that bites, and it bites specifically because the honest implementation is wrong. A driver that faithfully reports "this volume was never mounted here" is telling the truth and producing Pods wedged in `Terminating` until somebody force-deletes them, so it has to return success and move on.
 
 ## Volume parameters
 

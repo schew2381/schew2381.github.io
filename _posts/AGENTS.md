@@ -312,6 +312,20 @@ GOOD: When an update qualifies, Postgres writes the new version and
       Heap-Only Tuple.
 ```
 
+The same move hides inside a denial answered by a bare verb, where the
+first sentence opens a blank and the second one only points back at it:
+
+```
+BAD:  The VM isn't what anyone waits on. The disk is.
+
+GOOD: The disk it boots from is where the time actually goes.
+```
+
+`The disk is.` carries no fact of its own, so the fix is to say which
+disk and what it costs and drop the denial. A second sentence that ends
+somewhere past the verb is fine, because by then it's telling you
+something.
+
 ## Linking to source
 
 Link to open-source code only. For E2B, that means
@@ -534,7 +548,9 @@ These mimic insight without providing any.
 
 ## Style
 
-- Use contractions. "It's," "don't," "won't."
+- Use contractions. "It's," "don't," "won't." The exceptions are a
+  quotation, where the wording isn't yours to change, and a long form
+  carrying the stress, which italics mark: `does *not* control`.
 - Maximum one em dash per response. Use commas or parentheses instead.
 - No semicolons in prose.
 - Pluralize a backticked identifier with an apostrophe outside the

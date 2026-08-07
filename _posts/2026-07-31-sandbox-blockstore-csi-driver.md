@@ -12,11 +12,13 @@ tags: [csi, kubernetes, nbd, block-storage, s3, e2b, ext4]
 > 4. [Optimizing startup performance](/posts/sandbox-blockstore-performance/)
 {: .prompt-info }
 
-[Part 1](/posts/e2b-block-storage-layer/) ended on the property that makes any of this legal, which is that the read side never changes. [Part 2](/posts/kubernetes-csi-interface/) ended on an ephemeral inline volume, which is a build ID in a Pod spec and one `NodePublishVolume` call. Now what breaks when you bolt them together?
+[Part 1](/posts/e2b-block-storage-layer/) ended on the property that makes any of this legal, which is that the read side never changes. Then [Part 2](/posts/kubernetes-csi-interface/) came down to a build ID in a Pod spec and one `NodePublishVolume` call. Now what breaks when you bolt them together?
 
 One substitution does most of the work. E2B serves its block device to a Firecracker guest kernel, and we serve the same device to the host kernel instead, so headers, chunker, and overlay all come over untouched. A Pod names a template build ID in its own spec and gets back a writable ext4 mount over a multi-gigabyte image nobody ever downloads.
 
-Everything that breaks is downstream of that one swap, because the kernel doing the I/O is now the kernel the driver itself runs on. So let's take one Pod through the eight phases of its mount and write a file through it. Then we'll tear that mount down in the wrong order and watch a diff reach S3 with pages missing and no error anywhere.
+Everything that breaks is downstream of that one swap, because the kernel doing the I/O is now the kernel the driver itself runs on.
+
+So let's take one Pod through the eight phases of its mount and write a file through it. Then we'll tear that mount down in the wrong order and watch a diff reach S3 with pages missing and no error anywhere.
 
 ## Overview
 
@@ -695,7 +697,7 @@ The DaemonSet manifest carries four things a normal workload's wouldn't:
 | Blast radius of the driver dying | Every mount on the node | Volumes survive |
 | Durability of writes | Only as good as the checkpoint interval | Continuous |
 
-Blast radius is the cost that actually keeps you up. Those dispatch goroutines aren't serving the block device, they are the block device. A dead DaemonSet Pod means every `/dev/nbdN` on the node stops answering at once, and every ext4 mount above them starts throwing I/O errors. A CSI driver for a network-attached disk can crash, restart, and find its volumes exactly where it left them. This one can't, and no amount of care inside the driver changes that.
+Blast radius is the cost that actually keeps you up. Those dispatch goroutines aren't serving the block device, they *are* the block device. A dead DaemonSet Pod means every `/dev/nbdN` on the node stops answering at once, and every ext4 mount above them starts throwing I/O errors. A CSI driver for a network-attached disk can crash, restart, and find its volumes exactly where it left them. This one can't, and no amount of care inside the driver changes that.
 
 Durability has a similar shape, since writes are safe up to the last checkpoint and speculative after it. That's a fine deal when the volume is a disposable view of a template and anything worth keeping gets pushed to a real store, and it's not a deal you'd take for a database.
 

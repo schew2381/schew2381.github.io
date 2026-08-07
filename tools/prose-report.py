@@ -391,6 +391,73 @@ def announces_only(sentence: str) -> bool:
     return ANNOUNCING_OPENER.match(stripped) is not None
 
 
+# `X isn't what anyone waits on. The disk is.` The denial sets up a blank and
+# the fragment fills it, which is the escalating-fragment habit wearing a
+# copula instead of a repeated number.
+DENIAL = re.compile(r"\b(?:isn'?t|aren'?t|wasn'?t|weren'?t|doesn'?t|don'?t|didn'?t|won'?t|never)\b", re.I)
+DANGLING_COPULA = re.compile(r"^(?:the|a|an|its|his|her|their|our|this|that)\b[^.!?]*\b(?:is|are|was|were|does|do|did|will)\.$", re.I)
+
+
+def negation_pivot(first: str, second: str) -> bool:
+    """Flag a denial answered by a fragment that ends on a bare verb.
+
+    The second sentence has to stop at the verb, so `The disk is.` counts and
+    `The disk is where the time goes.` doesn't. Ending there means the whole
+    sentence is a pointer back at the one before it, carrying no fact of its
+    own, which is what makes it the same move as `Not fewer. Zero.`
+    """
+    if len(second.split()) > 5 or not DENIAL.search(first):
+        return False
+    return DANGLING_COPULA.match(second.strip()) is not None
+
+
+# A quotation from the docs isn't ours to reword, and `does *not* control` is
+# leaning on the long form deliberately, so both spans come out before matching.
+EXEMPT_SPAN = re.compile(r"\"[^\"]*\"|“[^”]*”|\*[^*]+\*")
+
+
+# The guide asks for contractions, and a negation is where an uncontracted
+# form is most audible. `it is` and `that is` are sentence-initial only,
+# because mid-sentence they're a preposition's object closing a phrase, as in
+# `what you get for it is the prefix`, where nothing wants contracting.
+CONTRACTIONS = [
+    (r"\bis not\b", "isn't"), (r"\bare not\b", "aren't"),
+    (r"\bwas not\b", "wasn't"), (r"\bwere not\b", "weren't"),
+    (r"\bdoes not\b", "doesn't"), (r"\bdo not\b", "don't"),
+    (r"\bdid not\b", "didn't"), (r"\bcan ?not\b", "can't"),
+    (r"\bwill not\b", "won't"), (r"\bwould not\b", "wouldn't"),
+    (r"\bshould not\b", "shouldn't"), (r"\bcould not\b", "couldn't"),
+    (r"\bhas not\b", "hasn't"), (r"\bhave not\b", "haven't"),
+    (r"\bhad not\b", "hadn't"),
+    (r"\bthey are\b", "they're"), (r"\byou are\b", "you're"),
+    (r"\bwe are\b", "we're"), (r"\byou will\b", "you'll"),
+    (r"\bwe will\b", "we'll"), (r"\bit will\b", "it'll"),
+    (r"\blet us\b", "let's"),
+    # `there` is also an adverb, as in `less urgent there is that the wall is
+    # further out`, so this wants the noun phrase an existential introduces.
+    (r"\bthere is(?= (?:a|an|no|one|only|nothing|some|another|little|more|less)\b)", "there's"),
+    # Sentence-initial only, so a trailing `where it is` stays put.
+    (r"^It is\b", "It's"), (r"^That is\b", "That's"), (r"^What is\b", "What's"),
+]
+
+
+def contraction_hits(raw: str) -> list[tuple[str, str]]:
+    """Find long forms that read stiffer than the contraction, per sentence.
+
+    Matching runs on the raw paragraph so the emphasis and quotation spans are
+    still marked up. The sentence-initial patterns need the split to know where
+    a sentence starts, which is why this doesn't just scan the paragraph.
+    """
+    out: list[tuple[str, str]] = []
+    for sentence in sentences(normalize(EXEMPT_SPAN.sub(" ", raw))):
+        for pattern, contracted in CONTRACTIONS:
+            match = re.search(pattern, sentence, re.I)
+            # An all-caps match is a SQL or spec keyword, as in `MUST NOT`.
+            if match and not match.group(0).isupper():
+                out.append((f"{match.group(0)}  {short(sentence, 58)}", contracted))
+    return out
+
+
 # ---------------------------------------------------------------- checks
 
 def check_mechanical(post: Post, slugs: set[str]) -> list[Finding]:
@@ -534,6 +601,9 @@ def check_judgment(post: Post) -> list[Finding]:
             if commas >= 3 and re.match(r"\s+(which|since|because|so)\b", tail):
                 found.append(Finding(para.start, "judgment", "comma-pileup", f"{commas} commas  {short(sentence)}"))
 
+        for pattern, contracted in contraction_hits(para.raw):
+            found.append(Finding(para.start, "judgment", "uncontracted", f"{pattern} -> {contracted}"))
+
         if parts and len(parts) > 1 and announces_only(parts[0]):
             found.append(Finding(para.start, "judgment", "short-opener", f"{len(parts[0].split())}w  {parts[0]}"))
         if parts and parts[0].lower() in FILLER_OPENERS:
@@ -546,8 +616,12 @@ def check_judgment(post: Post) -> list[Finding]:
                 found.append(Finding(para.start, "judgment", "choppy-run", short(" ".join(parts))))
 
         for a, b in zip(parts, parts[1:]):
-            if len(b.split()) <= 3 and re.match(r"^(Not|Just|Zero|None|Never)\b", b) and len(a.split()) > 4:
+            if len(a.split()) <= 4:
+                continue
+            if len(b.split()) <= 3 and re.match(r"^(Not|Just|Zero|None|Never)\b", b):
                 found.append(Finding(para.start, "judgment", "escalating-fragment", f"{short(a, 50)} / {b}"))
+            elif negation_pivot(a, b):
+                found.append(Finding(para.start, "judgment", "negation-pivot", f"{short(a, 50)} / {b}"))
 
         flat = [s for s in parts if is_spec_sheet(s)]
         if len(flat) >= 3 and len(flat) >= len(parts) - 1:
@@ -808,6 +882,8 @@ GUIDE = {
     "announce-example": "name the walkthrough, not the artifact (Handing off to an example)",
     "rhetorical-heading": "reads as filler under a heading (The colon habit)",
     "escalating-fragment": "state the number once (The colon habit)",
+    "negation-pivot": "a denial answered by a bare-verb fragment (The colon habit)",
+    "uncontracted": "contract it unless the long form is the emphasis (Style)",
     "filler-opener": "banned opener (The colon habit)",
     "flat-structure": "rewrite around what a reader does with it (Commas)",
     "diagram-echo": "don't describe the diagram again (ASCII diagrams)",

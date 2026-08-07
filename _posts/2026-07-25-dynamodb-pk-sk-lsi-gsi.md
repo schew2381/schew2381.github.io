@@ -16,7 +16,7 @@ DynamoDB has no query planner. A SQL database lets you filter or sort on any col
 3. A local secondary index keeps that machine and re-sorts what's on it.
 4. A global secondary index picks a different machine entirely.
 
-The first two are free, because they are the table. The other two are second copies of your data that DynamoDB keeps in sync on every write, and most of this post is about what that costs and which of the two costs less.
+The first two are free, because they're the table. The other two are second copies of your data that DynamoDB keeps in sync on every write, and most of this post is about what that costs and which of the two costs less.
 
 ## Partition key and sort key
 
@@ -115,7 +115,7 @@ AWS says it straight: "If you perform heavy write activity on the table, but a g
 
 A GSI inherits its capacity mode from the base table, so on-demand takes away the number you can get wrong and leaves the coupling in place. The docs are blunt about the rule underneath: for a table write to succeed, the table and all of its GSIs need enough write capacity for it, or the write to the table is throttled. On-demand removes the provisioning mistake, not the dependency.
 
-Getting that number right means counting index writes rather than item writes, and one `UpdateItem` is not one index write. What a single update costs the status GSI depends on which attribute you touched:
+Getting that number right means counting index writes rather than item writes, and one `UpdateItem` isn't one index write. What a single update costs the status GSI depends on which attribute you touched:
 
 - Changing `Status` costs two, a delete of the old entry and a put of the new one, because an indexed key attribute moving means the entry moves with it.
 - Changing an attribute the index projects but doesn't key on costs one.
@@ -125,7 +125,7 @@ Getting that number right means counting index writes rather than item writes, a
 
 Since what you project decides which of those three costs you pay, the projection list is a throughput decision wearing the costume of a storage decision. `KEYS_ONLY` stores the base table's key plus the index key, `INCLUDE` adds the attributes you name, and `ALL` copies the whole item. Each index entry also carries [100 bytes of overhead](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GSI.html) on top of that, which disappears against a large item and dominates a small one. Project `ALL` on three GSIs and every write to that table is four writes to four copies of the data.
 
-Projecting less has a hard edge on a GSI that it doesn't have on an LSI, though. A GSI query cannot fetch attributes from the base table, at any price. If the attribute isn't projected, the index cannot return it, so the application has to go `GetItem` the base table itself for every result it got back. Under-project a GSI and you've built an index that hands you a list of keys to look up one at a time.
+Projecting less has a hard edge on a GSI that it doesn't have on an LSI, though. A GSI query can't fetch attributes from the base table, at any price. Anything you didn't project is something the index can't return, so the application has to go `GetItem` the base table itself for every result it got back. Under-project a GSI and you've built an index that hands you a list of keys to look up one at a time.
 
 The flip side of an index only seeing attributes it projects is the sparse index, and it's the best deal DynamoDB offers. An item that doesn't have the index's key attribute at all never gets propagated into the index. So don't write `Status = SHIPPED`, delete the `Status` attribute when the order ships, and the index holds exactly the open orders no matter how large the table grows. The queue's cost stops tracking table size and starts tracking backlog size, which is what you wanted it to cost in the first place.
 
