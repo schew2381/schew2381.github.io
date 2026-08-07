@@ -12,11 +12,9 @@ tags: [e2b, firecracker, nbd, block-storage, s3, copy-on-write]
 > 4. [Optimizing startup performance](/posts/sandbox-blockstore-performance/)
 {: .prompt-info }
 
-Say you're handing out Linux boxes to strangers. Not literal strangers, but close enough, since an agent is doing the typing and nobody has read the code it's about to run. Each box wants its own disk, and it wants to be ready before whoever asked gets bored.
+An agent sandbox needs a disk of its own, and the obvious way to give it one is a copy of a VM image per sandbox. Pausing one to resume next week then means storing another whole image, and starting one means waiting on a multi-gigabyte download before any code runs.
 
-Start with a VM image and a copy per sandbox. Then someone asks to pause one for a week and resume it where it left off, and asks for a thousand of them, and asks why starting one takes thirty seconds. Every answer seems to mean storing data you'd rather not store or waiting on a network you'd rather not wait on.
-
-[E2B](https://e2b.dev) runs this in production, giving each sandbox a Firecracker microVM with its own kernel, and its infrastructure is on GitHub as [e2b-dev/infra](https://github.com/e2b-dev/infra) for anyone wanting to self-host. What they do about the disk is the part worth reading.
+[E2B](https://e2b.dev) gives each sandbox a Firecracker microVM with its own kernel and pays neither cost, and its infrastructure is on GitHub as [e2b-dev/infra](https://github.com/e2b-dev/infra) for anyone wanting to self-host.
 
 So let's follow one read down from the guest kernel to S3 and back, then pause the sandbox and watch what it uploads.
 
