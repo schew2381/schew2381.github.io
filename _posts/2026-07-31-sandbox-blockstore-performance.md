@@ -12,7 +12,7 @@ tags: [csi, performance, caching, prefetch, s3, mincore]
 > 4. Optimizing startup performance (this post)
 {: .prompt-info }
 
-[Part 3](/posts/sandbox-blockstore-csi-driver/)'s mount finishes in under a second because it reads one header and nothing else. So what does the first real request against that Pod cost? On a warm-pool Pod that had already passed its readiness probe, 56.8 seconds.
+[Part 3](/posts/sandbox-blockstore-csi-driver/)'s mount finishes in under a second because it reads one header and nothing else. So what does the first real request against that Pod cost? On a warm-pool Pod that had already passed its readiness probe, a bit under a minute.
 
 Nothing was broken, and lazy block fetch was doing exactly what Part 1 promised, moving the cost out of the mount and into the first read. That's a great trade until the first read is the one a user is watching a spinner for.
 

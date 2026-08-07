@@ -12,13 +12,13 @@ tags: [e2b, firecracker, nbd, block-storage, s3, copy-on-write]
 > 4. [Optimizing startup performance](/posts/sandbox-blockstore-performance/)
 {: .prompt-info }
 
-An agent clones a repo into a throwaway Linux box, runs `pip install`, and executes whatever it just wrote. None of that is allowed to reach anything you care about, and there's a user at the other end watching a spinner, so it has to be ready now.
+Firecracker will boot a microVM and hand control to `/sbin/init` in under [125 ms](https://github.com/firecracker-microvm/firecracker/blob/054b647d47745ab1ef945238d06a2112040eda1b/SPECIFICATION.md). The rootfs that VM boots from is 8 GiB of ext4 sitting in S3, and downloading that first turns 125 ms into tens of seconds of network.
 
-[E2B](https://github.com/e2b-dev/infra) runs each of those sandboxes as a Firecracker microVM, which covers both halves. Every sandbox gets its own kernel, so the isolation is a hardware boundary rather than a namespace, and Firecracker's [spec](https://github.com/firecracker-microvm/firecracker/blob/054b647d47745ab1ef945238d06a2112040eda1b/SPECIFICATION.md) puts at most 125 ms between the start API call and the guest reaching `/sbin/init`.
+[E2B](https://github.com/e2b-dev/infra) gives every agent sandbox its own kernel, because a hardware boundary is the honest answer when nobody has read the code you're about to run. Its sandboxes still start in about a second, which rules the download out.
 
-The disk it boots from is where the time actually goes. E2B's rootfs is a few gigabytes of ext4 with a guest memory snapshot of similar size behind it, and both of them sit in S3. Downloading that before boot turns 125 ms into thirty seconds of network, so E2B never downloads it.
+What the guest kernel gets instead is a block device that claims all 8 GiB and holds almost none of it, filling in 4 MiB at a time from S3 as the guest reads. A snapshot of that sandbox is a few megabytes of whatever it dirtied, and it still reads back as a whole filesystem.
 
-Instead the guest kernel gets a block device that claims to be the whole image and fills the pieces in as the guest reads them. Let's follow one read down from the guest kernel to S3 and back, then pause the sandbox and watch what it uploads.
+So let's follow one read down from the guest kernel to S3 and back, then pause the sandbox and watch what it uploads.
 
 ## Overview
 
