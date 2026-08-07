@@ -12,11 +12,11 @@ tags: [e2b, firecracker, nbd, block-storage, s3, copy-on-write]
 > 4. [Optimizing startup performance](/posts/sandbox-blockstore-performance/)
 {: .prompt-info }
 
-Firecracker will boot a microVM and hand control to `/sbin/init` in under [125 ms](https://github.com/firecracker-microvm/firecracker/blob/054b647d47745ab1ef945238d06a2112040eda1b/SPECIFICATION.md). The rootfs that VM boots from is 8 GiB of ext4 sitting in S3, and downloading that first turns 125 ms into tens of seconds of network.
+Say you're handing out Linux boxes to strangers. Not literal strangers, but close enough, since an agent is doing the typing and nobody has read the code it's about to run. Each box wants its own disk, and it wants to be ready before whoever asked gets bored.
 
-[E2B](https://github.com/e2b-dev/infra) gives every agent sandbox its own kernel, because a hardware boundary is the honest answer when nobody has read the code you're about to run. Its sandboxes still start in about a second, which rules the download out.
+Start with a VM image and a copy per sandbox. Then someone asks to pause one for a week and resume it where it left off, and asks for a thousand of them, and asks why starting one takes thirty seconds. Every answer seems to mean storing data you'd rather not store or waiting on a network you'd rather not wait on.
 
-What the guest kernel gets instead is a block device that claims all 8 GiB and holds almost none of it, filling in 4 MiB at a time from S3 as the guest reads. A snapshot of that sandbox is a few megabytes of whatever it dirtied, and it still reads back as a whole filesystem.
+[E2B](https://e2b.dev) runs this in production, giving each sandbox a Firecracker microVM with its own kernel, and its infrastructure is on GitHub as [e2b-dev/infra](https://github.com/e2b-dev/infra) for anyone wanting to self-host. What they do about the disk is the part worth reading.
 
 So let's follow one read down from the guest kernel to S3 and back, then pause the sandbox and watch what it uploads.
 
@@ -81,7 +81,7 @@ Everything below is written in terms of a build, so start there. A build is a UU
 - `rootfs.ext4.header`, metadata plus the block mapping.
 - `memfile`, the packed guest-memory chunks.
 - `memfile.header`, its own metadata and mapping.
-- `snapfile`, Firecracker's VM state.
+- `snapfile`, [Firecracker's VM state](https://github.com/firecracker-microvm/firecracker/blob/054b647d47745ab1ef945238d06a2112040eda1b/SPECIFICATION.md).
 
 The interesting one is `rootfs.ext4`, because it isn't an image. It holds only the blocks that this particular build contains, packed end to end with no gaps. A base template happens to contain all of them. A snapshot contains whatever the sandbox dirtied before someone paused it, which is usually a few megabytes against a multi-gigabyte parent.
 
