@@ -12,7 +12,7 @@ tags: [e2b, firecracker, nbd, block-storage, s3, copy-on-write]
 > 4. [Optimizing startup performance](/posts/sandbox-blockstore-performance/)
 {: .prompt-info }
 
-An agent sandbox needs a disk of its own, and the obvious way to give it one is a copy of a VM image per sandbox. Pausing one to resume next week then means storing another whole image, and starting one means waiting on a multi-gigabyte download before any code runs.
+An agent sandbox needs a disk of its own, and a copy of a VM image per sandbox is the answer that works until you count them. Every paused sandbox is a few more gigabytes held for someone who may never come back, and every fresh one downloads the whole image before it runs a line of code.
 
 [E2B](https://e2b.dev) gives each sandbox a Firecracker microVM with its own kernel and pays neither cost, and its infrastructure is on GitHub as [e2b-dev/infra](https://github.com/e2b-dev/infra) for anyone wanting to self-host.
 
