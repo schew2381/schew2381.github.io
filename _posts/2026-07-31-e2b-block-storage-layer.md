@@ -201,15 +201,25 @@ It happens twice here, once per dirty block. Take them one at a time, starting w
 ```text
 step 1, one base entry covering everything
 
-  entry:   └──────────────────── base, blocks 0..8 ────────────────────────┘
+  block:       0       1       2       3       4       5       6       7
+           ┌───────┬───────┬───────┬───────┬───────┬───────┬───────┬───────┐
+           │   A   │   B   │   C   │   D   │   E   │   F   │   G   │   H   │
+           └───────┴───────┴───────┴───────┴───────┴───────┴───────┴───────┘
+  owner:   └─────────────────────────────base──────────────────────────────┘
+  entry:   └───────────────────────────────0───────────────────────────────┘
 
 step 2, diff-a's block 3 lands inside it and splits it
 
-  entry:   └───────base 0..3───────┴─diff──┴──────── base 4..8 ────────────┘
-                                                     ▲
-                                                     │  physical offset
-                                                     │  advanced to 4, not
-                                                     │  left at 0
+  block:       0       1       2       3       4       5       6       7
+           ┌───────┬───────┬───────┬───────┬───────┬───────┬───────┬───────┐
+           │   A   │   B   │   C   │  D'   │   E   │   F   │   G   │   H   │
+           └───────┴───────┴───────┴───────┴───────┴───────┴───────┴───────┘
+  owner:   └─────────base──────────┴─diff──┴─────────────base──────────────┘
+  entry:   └───────────0───────────┴───1───┴───────────────2───────────────┘
+                                               ▲
+                                               │  physical offset
+                                               │  advanced to 4,
+                                               │  not left at 0
 
 step 3, diff-a's block 5 splits the right piece again
 
