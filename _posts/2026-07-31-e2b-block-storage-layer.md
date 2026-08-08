@@ -20,7 +20,9 @@ So let's follow one read down from the guest kernel to S3 and back, then pause t
 
 ## Overview
 
-A single running sandbox reaches from the guest kernel all the way down to object storage, and the double lines below are the address space boundaries it crosses on the way. Those boundaries are where most of the difficulty in this series lives.
+Here's an overview of one running E2B sandbox, from the guest kernel down to object storage. The double lines mark boundaries, where the first separates the guest kernel from the host and the second separates the machine from the object storage below it.
+
+In this post we'll walk through the whole diagram step by step to see how the E2B storage layer works.
 
 ```text
 ONE RUNNING SANDBOX
@@ -69,8 +71,6 @@ ONE RUNNING SANDBOX
 
 Writes stop at the left branch under `block.Overlay` and never travel any further. So the right branch stays byte-identical to what's in S3 for as long as the sandbox lives, and the last two posts spend their time exploiting that.
 
-Both branches are the same structure, a sparse mmap'd file with a bitmap over it, and the bitmap flips meaning depending on which one you're standing in. A set bit on the left says the sandbox wrote this block, and on the right it says S3 already gave it to us.
-
 ## A build in object storage
 
 Every address in this system is relative to a build, and a build is just a UUID. Hand that UUID to S3 and you get back the prefix `s3://templates/<build-id>/` with five objects under it.
@@ -81,9 +81,9 @@ Every address in this system is relative to a build, and a build is just a UUID.
 4. `memfile.header`, its own metadata and mapping.
 5. `snapfile`, [Firecracker's VM state](https://github.com/firecracker-microvm/firecracker/blob/054b647d47745ab1ef945238d06a2112040eda1b/SPECIFICATION.md).
 
-The interesting one is `rootfs.ext4` because it isn't an image. It holds only the blocks that this particular build contains, packed end to end with no gaps. A base template happens to contain all of them. A snapshot contains whatever the sandbox dirtied before someone paused it, which is usually a few megabytes against a multi-gigabyte parent.
+The interesting one is `rootfs.ext4` because it isn't an image. It holds only the blocks that this particular build contains, packed end to end with no gaps. A build is either the base of its own chain, holding every block, or it chains onto a parent and stores only what changed since. That chaining is what makes this a copy-on-write system.
 
-So a snapshot's `rootfs.ext4` might be 4 MiB of scattered blocks. How does anything read that as an 8 GiB filesystem?
+So a chained build's `rootfs.ext4` might be 4 MiB of scattered blocks. How does anything read that as an 8 GiB filesystem?
 
 ## The header is a virtual address space
 
@@ -104,7 +104,7 @@ rootfs.ext4.header
 └──────────────────────────────────────────┘
 ```
 
-Each of those entries makes one claim, which is that some run of the virtual image lives in some build's data file at some offset:
+Each entry makes one claim. Some run of the virtual image lives in some build's data file at some offset:
 
 ```go
 type BuildMap struct {
@@ -117,7 +117,7 @@ type BuildMap struct {
 ```
 [mapping.go:14](https://github.com/e2b-dev/infra/blob/da099cf305df080abd16b964ff8b664736ee6d34/packages/shared/pkg/storage/header/mapping.go#L14)
 
-Read an entry and you're standing in two different address spaces at once, which is why mixing up its two offsets is the classic way to corrupt an image. The guest addresses its bytes by `Offset` while they actually live at `BuildStorageOffset`, inside whichever data file `BuildId` names:
+The guest addresses its bytes by `Offset` while they actually live at `BuildStorageOffset`, inside whichever data file `BuildId` names:
 
 ```text
 ONE ENTRY, TWO ADDRESS SPACES
@@ -135,13 +135,11 @@ ONE ENTRY, TWO ADDRESS SPACES
            └── BuildStorageOffset
 ```
 
-That's the entire format, and it's easier to believe once you've watched one get built.
-
 ### Eight blocks
 
 A real image has far too many digits to follow by hand, so let's shrink one down to eight blocks and count in blocks instead of bytes. The struct really does store byte offsets, but each one is a multiple of the block size. Dividing through costs us nothing, so block 3 just means the fourth block.
 
-So let's run that image through a build and then a snapshot, watching the mapping change underneath it at each step. Here's the base template fresh out of a build, eight blocks called A through H:
+So let's run that image through a build and then a snapshot, watching the mapping change underneath it at each step. Here we have a fresh base build made up of eight blocks, A through H:
 
 ```text
 virtual image, what the guest sees
@@ -161,7 +159,7 @@ s3://templates/base/rootfs.ext4, 8 blocks on disk
   header:  {Offset: 0, Length: 8, BuildId: base, BuildStorageOffset: 0}
 ```
 
-One entry covers the whole image with both offsets at zero, since virtual and physical mean the same thing in a base template. That's also why a base template teaches you nothing about the format, and it only gets interesting after a snapshot.
+Since we only have a single entry where the virtual and physical offsets are the same, a base build isn't a very interesting case. So let's take a look at what happens after one snapshot instead.
 
 ### One snapshot
 
@@ -340,7 +338,7 @@ Resume the paused sandbox, let it write to block 7, and pause it again. `diff-b`
   owner:   └─────────base──────────┴─diff-a┴─base──┴─diff-a┴─base──┴─diff-b┘
 ```
 
-Reading block 3 opens `diff-a`, block 7 opens `diff-b`, and the other six come from the base template. The guest sees one flat filesystem and has no idea it's a view stitched from three objects, none of which were rewritten to make it happen.
+Reading block 3 opens `diff-a`, block 7 opens `diff-b`, and the other six come from the base build. The guest sees one flat filesystem and has no idea it's a view stitched from three objects, none of which were rewritten to make it happen.
 
 Each pause bumps `Generation`, mints a new `BuildID`, and leaves `BaseBuildID` pointing at the root. Any header therefore knows both who it is and where its chain started, which is what a rebase pass would need to flatten a long chain back into one object.
 

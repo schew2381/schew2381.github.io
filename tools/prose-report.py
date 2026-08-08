@@ -318,7 +318,10 @@ BANNED_STRUCTURES = [
 ]
 
 SIGNPOSTS = [
-    r"let's (explore|examine|take a look|dive)", r"now let's turn",
+    r"let's (explore|dive)", r"now let's turn",
+    # `let's take a look at what happens after one snapshot` names the work, so
+    # only the topic-shaped object is a signpost: `at how the mapping works`.
+    r"let's (take a look at|examine|look at) (how|the way)\b[^.]{0,48}\bworks?\b",
     r"consider a scenario", r"in this section", r"we'll (look at|explore|cover)",
     r"as (we|you) (can see|mentioned earlier)", r"first, let's",
 ]

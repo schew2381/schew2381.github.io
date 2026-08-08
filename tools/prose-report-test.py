@@ -35,6 +35,16 @@ SPLITS: list[tuple[str, bool]] = [
     ("XFS supports that. ext4 doesn't, so the call does a real copy.", False),
 ]
 
+SIGNPOST: list[tuple[str, bool]] = [
+    ("Let's explore how updates work.", True),
+    ("Let's take a look at how the mapping works.", True),
+    ("In this section we cover the header.", True),
+    # A `let's` naming the actual work tells the reader what happens next.
+    ("So let's take a look at what happens after one snapshot instead.", False),
+    ("So let's walk both engines through the table below.", False),
+    ("So let's run that image through a build and then a snapshot.", False),
+]
+
 READING: list[tuple[str, bool]] = [
     ("Read on for the rest of the header.", True),
     ("It's worth going slowly here.", True),
@@ -273,6 +283,11 @@ def main() -> int:
         if (len(parts) == 1) != expected:
             failures.append(f"sentences({text!r}) split into {len(parts)}, want one={expected}")
 
+    for text, expected in SIGNPOST:
+        flagged = any(re.search(p, text.lower()) for p in report.SIGNPOSTS)
+        if flagged != expected:
+            failures.append(f"signpost {text!r} is {flagged}, want {expected}")
+
     for text, expected in READING:
         flagged = any(re.search(p, text.lower()) for p in report.READING_INSTRUCTIONS)
         if flagged != expected:
@@ -370,7 +385,7 @@ def main() -> int:
     for failure in failures:
         print(f"FAIL  {failure}")
     checks = (
-        len(SPLITS) + len(READING) + len(ANNOUNCES) + len(SPEC_SHEET) + len(COLON)
+        len(SPLITS) + len(SIGNPOST) + len(READING) + len(ANNOUNCES) + len(SPEC_SHEET) + len(COLON)
         + len(SEAM_OPENER) + len(ECHO) + len(PIVOT) + len(CONTRACT) + len(PINNED)
         + len(PILEUP) + len(SPLICE) + len(DEFINITION) + len(SELF_REF) + len(STATED)
         + len(CONDITIONAL) + len(COUNTED) + 2 + len(posts)
