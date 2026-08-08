@@ -20,7 +20,7 @@ So let's follow one read down from the guest kernel to S3 and back, then pause t
 
 ## Overview
 
-Everything one running sandbox touches, from the guest kernel down to object storage. The double lines are address space boundaries, and they're where most of the difficulty in this series lives.
+A single running sandbox reaches from the guest kernel all the way down to object storage, and the double lines below are the address space boundaries it crosses on the way. Those boundaries are where most of the difficulty in this series lives.
 
 ```text
 ONE RUNNING SANDBOX
@@ -69,19 +69,19 @@ ONE RUNNING SANDBOX
 
 Writes stop at the left branch under `block.Overlay` and never travel any further. So the right branch stays byte-identical to what's in S3 for as long as the sandbox lives, and the last two posts spend their time exploiting that.
 
-Both branches are the same structure, a sparse mmap'd file with a bitmap over it, and the bitmap flips meaning depending on which one you're standing in. A set bit on the left says the sandbox wrote this block, and on the right it says S3 already gave it to us. That's the whole vocabulary for the rest of the post.
+Both branches are the same structure, a sparse mmap'd file with a bitmap over it, and the bitmap flips meaning depending on which one you're standing in. A set bit on the left says the sandbox wrote this block, and on the right it says S3 already gave it to us.
 
 ## A build in object storage
 
-Everything below is written in terms of a build, so start there. A build is a UUID, and what you get for it is the prefix `s3://templates/<build-id>/` holding five objects.
+Every address in this system is relative to a build, and a build is just a UUID. Hand that UUID to S3 and you get back the prefix `s3://templates/<build-id>/` with five objects under it.
 
-- `rootfs.ext4`, the packed rootfs blocks for this build.
-- `rootfs.ext4.header`, metadata plus the block mapping.
-- `memfile`, the packed guest-memory chunks.
-- `memfile.header`, its own metadata and mapping.
-- `snapfile`, [Firecracker's VM state](https://github.com/firecracker-microvm/firecracker/blob/054b647d47745ab1ef945238d06a2112040eda1b/SPECIFICATION.md).
+1. `rootfs.ext4`, the packed rootfs blocks for this build.
+2. `rootfs.ext4.header`, metadata plus the block mapping.
+3. `memfile`, the packed guest-memory chunks.
+4. `memfile.header`, its own metadata and mapping.
+5. `snapfile`, [Firecracker's VM state](https://github.com/firecracker-microvm/firecracker/blob/054b647d47745ab1ef945238d06a2112040eda1b/SPECIFICATION.md).
 
-The interesting one is `rootfs.ext4`, because it isn't an image. It holds only the blocks that this particular build contains, packed end to end with no gaps. A base template happens to contain all of them. A snapshot contains whatever the sandbox dirtied before someone paused it, which is usually a few megabytes against a multi-gigabyte parent.
+The interesting one is `rootfs.ext4` because it isn't an image. It holds only the blocks that this particular build contains, packed end to end with no gaps. A base template happens to contain all of them. A snapshot contains whatever the sandbox dirtied before someone paused it, which is usually a few megabytes against a multi-gigabyte parent.
 
 So a snapshot's `rootfs.ext4` might be 4 MiB of scattered blocks. How does anything read that as an 8 GiB filesystem?
 
@@ -117,7 +117,7 @@ type BuildMap struct {
 ```
 [mapping.go:14](https://github.com/e2b-dev/infra/blob/da099cf305df080abd16b964ff8b664736ee6d34/packages/shared/pkg/storage/header/mapping.go#L14)
 
-Read an entry and you're standing in two different address spaces at once, which is why mixing up its two offsets is the classic way to corrupt an image. `Offset` is where the guest thinks the bytes are. `BuildStorageOffset` is where they actually are, inside whichever data file `BuildId` names:
+Read an entry and you're standing in two different address spaces at once, which is why mixing up its two offsets is the classic way to corrupt an image. The guest addresses its bytes by `Offset` while they actually live at `BuildStorageOffset`, inside whichever data file `BuildId` names:
 
 ```text
 ONE ENTRY, TWO ADDRESS SPACES
@@ -139,9 +139,9 @@ That's the entire format, and it's easier to believe once you've watched one get
 
 ### Eight blocks
 
-Real images have too many digits to follow, so shrink one down to eight blocks and count in blocks rather than bytes. The struct stores byte offsets, but every one of them is a multiple of the block size, so dividing through loses nothing. Block 3 means the fourth block.
+A real image has far too many digits to follow by hand, so let's shrink one down to eight blocks and count in blocks instead of bytes. The struct really does store byte offsets, but each one is a multiple of the block size. Dividing through costs us nothing, so block 3 just means the fourth block.
 
-So take one through a build and then a snapshot, and watch the mapping change under it. A base template fresh out of a build, eight blocks called A through H:
+So let's run that image through a build and then a snapshot, watching the mapping change underneath it at each step. Here's the base template fresh out of a build, eight blocks called A through H:
 
 ```text
 virtual image, what the guest sees
@@ -161,13 +161,13 @@ s3://templates/base/rootfs.ext4, 8 blocks on disk
   header:  {Offset: 0, Length: 8, BuildId: base, BuildStorageOffset: 0}
 ```
 
-One entry covers the whole image, and both of its offsets are zero, because virtual and physical are the same thing in a base template. Which is exactly why a base template teaches you nothing about the format, and why it only gets interesting after a snapshot.
+One entry covers the whole image with both offsets at zero, since virtual and physical mean the same thing in a base template. That's also why a base template teaches you nothing about the format, and it only gets interesting after a snapshot.
 
 ### One snapshot
 
-Boot the sandbox, write to blocks 3 and 5, then pause it. Neither write ever reached S3, since both of them stopped at the write cache, so pausing is when they finally get uploaded.
+Now boot the sandbox and write to blocks 3 and 5. Those writes land in the write cache and don't go anywhere near S3, and it's only when the sandbox actually stops that we take the write cache contents and upload them.
 
-Two dirty blocks, so `diff-a`'s data file is two blocks long. Packed end to end, which is where the two offsets stop agreeing:
+Two dirty blocks means `diff-a`'s data file is two blocks long, packed end to end, and that packing is where the two offsets stop agreeing:
 
 ```text
 s3://templates/diff-a/rootfs.ext4, 2 blocks on disk (not 8)
@@ -181,16 +181,16 @@ s3://templates/diff-a/rootfs.ext4, 2 blocks on disk (not 8)
                └────────── new contents of virtual block 3
 ```
 
-`D'` is virtual block 3 living at physical block 0, and `F'` is virtual block 5 living at physical block 1. The data file records neither fact. It's two blocks with no structure and no idea where its contents belong. Recording that is the header's job.
+`D'` is virtual block 3 living at physical block 0, and `F'` is virtual block 5 living at physical block 1. The data file records neither fact. It's two blocks with no structure and no idea where its contents belong, which leaves the recording to the header.
 
-`diff-a`'s own mapping states where its two blocks go, virtual on the left, physical on the right:
+Here's `diff-a`'s own mapping, with the virtual offset on the left and the physical one on the right:
 
 ```text
 BuildMap[0] = {Offset: 3, Length: 1, BuildId: diff-a, BuildStorageOffset: 0}
 BuildMap[1] = {Offset: 5, Length: 1, BuildId: diff-a, BuildStorageOffset: 1}
 ```
 
-That covers two blocks out of eight. Ask this mapping about block 2 and it has nothing to say, so it can't serve a read on its own.
+That covers two blocks out of eight. If you ask this mapping about block 2 it has nothing to say, which is why it can't serve a read on its own.
 
 ### Merging
 
@@ -241,9 +241,9 @@ Five entries, both offsets spelled out:
 | 3 | 5 | 1 | diff-a | 1 |
 | 4 | 6 | 2 | base | 6 |
 
-Entry 4 is where a bug would live. It starts at virtual block 6, and its physical block has to be 6 as well, because block 6 is where `G` actually sits inside the base data file. Copy the original entry's physical 0 into the right-hand piece instead and reads of blocks 6 and 7 quietly come back as `A` and `B`.
+Entry 4 is where a bug would live. It starts at virtual block 6, and its physical block has to be 6 as well. That's where `G` actually sits inside the base data file. Copy the original entry's physical 0 into the right-hand piece instead and reads of blocks 6 and 7 quietly come back as `A` and `B`.
 
-So the split advances the physical offset by exactly as much virtual space it skipped over:
+So the split has to advance the physical offset by exactly as much virtual space as it skipped over:
 
 ```go
 rightBaseShift := int64(diff.Offset) + int64(diff.Length) - int64(base.Offset)
@@ -260,11 +260,11 @@ if rightBaseLength > 0 {
 ```
 [mapping.go:163](https://github.com/e2b-dev/infra/blob/da099cf305df080abd16b964ff8b664736ee6d34/packages/shared/pkg/storage/header/mapping.go#L163)
 
-Both offsets move by the same `rightBaseShift`, which is the invariant the whole format rests on. Break it and nothing throws. Reads return other data, which is a worse outcome than a crash.
+Both offsets move by the same `rightBaseShift`, which is the invariant the whole format rests on. If it breaks, reads silently start returning other people's data without raising any errors.
 
 ### Reading one block
 
-Five entries, sorted, covering the image with no gaps, so exactly one of them owns any block you name. Finding it is the whole read path, and it comes down to asking which entry is the last one that starts at or before the block we want.
+Those five entries are sorted and cover the image with no gaps between them, so any block you name is owned by exactly one of them. Finding that one entry is the whole read path, and it comes down to asking which entry is the last one starting at or before the block we want.
 
 That's a binary search over the entry start offsets, which for our five entries are `[0, 3, 4, 5, 6]`. Say the guest asks for block 5, one of the two the sandbox dirtied:
 
@@ -294,7 +294,7 @@ shift := offset - int64(mapping.Offset)
 ```
 [header.go:239](https://github.com/e2b-dev/infra/blob/da099cf305df080abd16b964ff8b664736ee6d34/packages/shared/pkg/storage/header/header.go#L239)
 
-An index of 0 would mean the address sits below the first entry, which can't happen in a gapless mapping, so it's an error instead of an index of -1.
+An index of 0 would mean the address sits below the first entry, which can't happen in a gapless mapping. So it's an error rather than an index of -1.
 
 Entry 3 is `diff-a` at physical block 1, and our request starts exactly where the entry does, so `shift` is 0. `GetShiftedMapping` wraps all of that up and hands the caller three things:
 
@@ -324,7 +324,7 @@ if mp.BuildId == current.BuildId && storageContiguous {
 
 Sitting next to each other in the virtual image says nothing about sitting next to each other in a packed data file. Picture one `base` entry covering virtual blocks 0 through 2 from physical 0, and the next covering virtual block 3 from physical 9. Adjacent virtually, six blocks apart physically, so a joined entry would send that last read to physical 3 and hand back the wrong contents. Same failure as a bad split, and just as silent.
 
-A metadata record, a sorted array, and a binary search with a `- 1` on the end. That's the whole mechanism, and it buys considerably more than the eight blocks it took to explain.
+So the format comes down to a metadata record, a sorted array, and a binary search with a `- 1` on the end, and it buys considerably more than the eight blocks it took to explain.
 
 ## Diff chains
 
@@ -388,10 +388,10 @@ The fetch loop reads in batches of `max(blockSize, 16 KiB)`, advances `bytesRead
 
 Two orderings in there only bite under load, and each one is a way for a correct-looking fetch to waste a round trip or lose one.
 
-- The fetch goroutine runs on `context.WithoutCancel(ctx)`, since otherwise the first caller giving up cancels a fetch four other waiters are depending on.
-- `runFetch` marks the chunk cached *before* deleting its session from `fetchMap`. The other order leaves a window where a late caller finds no in-flight session and no cached chunk, so it starts a second fetch for bytes already sitting there.
+1. The fetch goroutine runs on `context.WithoutCancel(ctx)`, since otherwise the first caller giving up cancels a fetch four other waiters are depending on.
+2. `runFetch` marks the chunk cached *before* deleting its session from `fetchMap`. The other order leaves a window where a late caller finds no in-flight session and no cached chunk, so it starts a second fetch for bytes already sitting there.
 
-Sitting where, though. Both of those hazards are about a chunk being "cached," and that word has been doing a lot of unexamined work.
+Both of those hazards turn on a chunk being cached, so let's dig into where a cached chunk actually lives.
 
 ## The cache
 
@@ -480,7 +480,7 @@ Part 3 adds a third consumer that E2B doesn't have: the host kernel's own ext4 d
 
 A paused sandbox has to become two S3 objects, a data file holding only what changed and a header describing where the changes go, and the bitmap already knows which blocks those are.
 
-Steps 1, 2, and 5 are bookkeeping. Steps 3 and 4 are Linux behaving in ways that lose your data if you assume the obvious thing.
+Steps 1, 2, and 5 are bookkeeping, while steps 3 and 4 are Linux behaving in ways that lose your data if you assume the obvious thing.
 
 1. `EjectCache` takes the write cache out of the overlay.
 2. Destroying the sandbox lets in-flight NBD and UFFD requests drain.
@@ -505,7 +505,7 @@ Which is a problem for a snapshot, because step 4 reads that file through an ord
   cache file on disk      <-- what an fd read would see
 ```
 
-Read the fd before writeback runs and the diff is missing the block. So step 3 calls [`sync_file_range(2)`](https://man7.org/linux/man-pages/man2/sync_file_range.2.html) with `SYNC_FILE_RANGE_WRITE`, which asks the kernel to start writing out the dirty pages in a range. Not a full `fsync`, and it doesn't wait for the disk to confirm, it just kicks writeback into starting.
+Read the fd before writeback runs and the diff is missing the block. So step 3 calls [`sync_file_range(2)`](https://man7.org/linux/man-pages/man2/sync_file_range.2.html) with `SYNC_FILE_RANGE_WRITE`, which asks the kernel to start writing out the dirty pages in a range. That's weaker than an `fsync`, because it kicks writeback into starting without waiting for the disk to confirm anything.
 
 That looseness would be alarming if the call mattered, and it doesn't. E2B treats it as an optimization, logging a warning on failure rather than aborting. The copy in step 4 goes through the page cache anyway and sees the dirty pages whether or not they've reached the platter. The sync just means fewer of them are still in flight when the copy starts.
 
@@ -529,9 +529,9 @@ The obvious way to build a diff file is to read each dirty range into a buffer a
 
 Three error codes get special handling, and each one is a filesystem declining for a different reason.
 
-- `EXDEV`, the two files are on different filesystems, which the syscall used to refuse outright.
-- `EOPNOTSUPP`, this filesystem doesn't implement the call.
-- `ENOSYS`, the kernel is older than 4.5, when the call was added.
+1. `EXDEV`, the two files are on different filesystems, which the syscall used to refuse outright.
+2. `EOPNOTSUPP`, this filesystem doesn't implement the call.
+3. `ENOSYS`, the kernel is older than 4.5, when the call was added.
 
 Any of the three flips a `fallback` flag and the export finishes with `io.Copy`, so a node on an unusual filesystem gets slower snapshots rather than no snapshots.
 

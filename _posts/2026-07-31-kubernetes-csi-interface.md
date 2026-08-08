@@ -78,10 +78,10 @@ PersistentVolumeClaim
 
 The sidecars are four separate binaries from [kubernetes-csi](https://github.com/kubernetes-csi), none of them yours to write.
 
-- `external-provisioner` watches PVCs and calls `CreateVolume`.
-- `external-attacher` calls `ControllerPublishVolume`.
-- `external-resizer` handles expansion.
-- `node-driver-registrar` runs beside the Node service to tell kubelet the driver exists.
+1. `external-provisioner` watches PVCs and calls `CreateVolume`.
+2. `external-attacher` calls `ControllerPublishVolume`.
+3. `external-resizer` handles expansion.
+4. `node-driver-registrar` runs beside the Node service to tell kubelet the driver exists.
 
 That registration is the whole discovery mechanism. The registrar opens a socket at a path kubelet watches and reports two things: the driver name and where the driver's own socket lives.
 
@@ -108,7 +108,7 @@ The node ID it returns is what lands in the `CSINode` object, so a driver that s
 
 ## The staging split
 
-Two mount RPCs looks redundant until you consider a volume that several Pods on one node legitimately share.
+Having two mount RPCs looks redundant right up until you picture a volume that several Pods on one node legitimately share.
 
 ```text
 with staging (a shared network disk)
@@ -123,9 +123,9 @@ without staging (one volume, one Pod)
   NodePublishVolume  ──> mount straight into pod-A's path
 ```
 
-The division is about cost. Staging is the expensive half that should happen once per node, formatting the disk and running `fsck` and mounting it. Publishing is a bind mount that costs almost nothing, once per Pod.
+The division is really about cost. Staging is the expensive half that formats the disk and runs `fsck` and mounts it, so it should only happen once per node. Publishing is then a bind mount that costs almost nothing, once per Pod.
 
-Opting out is a matter of leaving `STAGE_UNSTAGE_VOLUME` out of `NodeGetCapabilities`, after which kubelet skips both staging calls. Part 3's driver leaves it out, and not because it shares nothing. Twenty Pods on one template read from one cache file on the node.
+Opting out is a matter of leaving `STAGE_UNSTAGE_VOLUME` out of `NodeGetCapabilities`, after which kubelet skips both staging calls. Part 3's driver leaves it out even though it shares plenty, since twenty Pods on one template all read from a single cache file on the node.
 
 Staging can't express that sharing, though, for two separate reasons.
 
@@ -171,11 +171,11 @@ Every CSI RPC has to be safely retryable, and this is the requirement that quiet
   right answer: mount it            right answer: succeed anyway
 ```
 
-Kubelet can't tell those apart, so the driver has to make the retry correct in both. Three rules cover it in practice:
+Kubelet can't tell those apart, so the driver has to make the retry correct in both, and three rules cover that in practice:
 
-- `NodePublishVolume` called twice with the same `volume_id` and `target_path` must return success the second time, not "already mounted."
-- `NodeUnpublishVolume` on a path that isn't mounted must return success. Returning `NotFound` makes kubelet retry forever and the Pod never finishes terminating.
-- `CreateVolume` with the same name and parameters must return the existing volume. With different parameters it must return `ALREADY_EXISTS`.
+1. `NodePublishVolume` called twice with the same `volume_id` and `target_path` must return success the second time, not "already mounted."
+2. `NodeUnpublishVolume` on a path that isn't mounted must return success. Returning `NotFound` makes kubelet retry forever and the Pod never finishes terminating.
+3. `CreateVolume` with the same name and parameters must return the existing volume. With different parameters it must return `ALREADY_EXISTS`.
 
 The unpublish rule is the one that bites, and it bites specifically because the honest implementation is wrong. A driver that faithfully reports "this volume was never mounted here" is telling the truth and producing Pods wedged in `Terminating` until somebody force-deletes them, so it has to return success and move on.
 
@@ -261,7 +261,7 @@ spec:
     - Ephemeral
 ```
 
-Each of those three fields deletes a piece of machinery. `attachRequired: false` deletes the `VolumeAttachment` objects and the `external-attacher` that would create them, so kubelet goes straight to the Node service, which is right for anything that isn't a genuine network-attached disk. `podInfoOnMount: true` is how a driver finds out which Pod it's mounting for, since kubelet then stuffs `pod.name`, `pod.namespace`, `pod.uid`, and `serviceAccount.name` into the `VolumeContext`. And `volumeLifecycleModes` has to name both paths if you want both.
+Each of those three fields deletes a piece of machinery. `attachRequired: false` deletes the `VolumeAttachment` objects and the `external-attacher` that would create them, so kubelet goes straight to the Node service. That's the right call for anything that isn't a genuine network-attached disk. `podInfoOnMount: true` is how a driver finds out which Pod it's mounting for, since kubelet then stuffs `pod.name`, `pod.namespace`, `pod.uid`, and `serviceAccount.name` into the `VolumeContext`. And `volumeLifecycleModes` has to name both paths if you want both.
 
 What you give up is the one place a driver could have rejected a bad request early. Without `CreateVolume` there's no moment before scheduling where anyone validates anything, so a typo in `templateBuildID` doesn't fail fast. It shows up as a Pod wedged in `ContainerCreating` with the real error buried in kubelet's events, where a `Pending` PVC would have carried a clear message.
 

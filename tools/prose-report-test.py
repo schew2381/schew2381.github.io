@@ -183,6 +183,87 @@ CONTRACT: list[tuple[str, str | None]] = [
     ("Rows where `table_name IS NOT NULL` are the cached ones.", None),
 ]
 
+# The count of joints, where 0 means the sentence reads fine as it stands.
+PILEUP: list[tuple[str, int]] = [
+    ("Part 3 built the node-shared read cache and argued for why it's safe, but what it actually buys is a number, and getting that number meant running the same thing twice.", 2),
+    ('Both of those hazards turn on a chunk being "cached," and that word has been doing a lot of unexamined work, so it\'s worth asking where a cached chunk actually sits.', 2),
+    # `A, B, and C` is a series, so the closing `and` isn't a third statement.
+    ("Firecracker sees an ordinary block device, the guest kernel does ordinary block I/O, and every miss becomes a 4 MiB range GET.", 0),
+    ("That's the magic `SBRCST01`, then the cache key, the image size, and a boot ID.", 0),
+    # Two joints but short clauses, so there's nothing to bank between them.
+    ("Sharing only fixes the second Pod, though, and the first one still pays in full.", 0),
+    ("It returns where block 5 would be inserted, which is index 4, so the owner is the entry before it.", 0),
+    # The guide's own GOOD example for splitting a long sentence, which trips
+    # this check because chaining causally and chaining loosely look identical
+    # without a parser. Keep it here so a tightening can't quietly reflag it.
+    ("The tuple body is gone and its bytes are reclaimed, but the slot number stays reserved, so an index entry still pointing there lands on something well-defined instead of a stranger's row.", 2),
+]
+
+# The matched text, or None when the comma is doing a job a full stop wouldn't.
+SPLICE: list[tuple[str, str | None]] = [
+    ("Break it and nothing throws, reads just start returning other people's data.", ", reads just start"),
+    ("The refcount hits zero, it gets dropped on the next sweep.", ", it gets"),
+    # A denial answered by the same subject, which is a contrast the comma fits.
+    ("A GSI doesn't give you a cheap scan, it gives you a different key to be precise with.", None),
+    ("Those goroutines aren't serving the block device, they *are* the block device.", None),
+    # The comma closes a leading subordinate clause, so it's the one grammar asks for.
+    ("When the last interested transaction finishes, nothing about the tuple changes.", None),
+    ("Knowing that, it can convert the head into a redirect without consulting an index.", None),
+    # A series, where every comma is punctuating a list item.
+    ("Five entries, both offsets spelled out, and no gaps between them.", None),
+]
+
+# The wh-word both sentences reach for, or None when they aren't a matched pair.
+DEFINITION: list[tuple[str, str, str | None]] = [
+    ("Offset is where the guest thinks the bytes are.", "BuildStorageOffset is where they actually are.", "where"),
+    ("The header is what the reader parses first.", "The data file is what it seeks into.", "what"),
+    # Different wh-words, so the pair doesn't read as one template filled twice.
+    ("Offset is where the guest thinks the bytes are.", "BuildId is what names the data file.", None),
+    # Only one of them is a definition, so the second is a consequence.
+    ("Offset is where the guest thinks the bytes are.", "Dividing through by the block size loses nothing.", None),
+]
+
+SELF_REF: list[tuple[str, bool]] = [
+    ("That's the whole vocabulary for the rest of the post.", True),
+    ("Everything below is addressed relative to a build.", True),
+    ("The rest of this section is about what that costs.", True),
+    # A pointer at another post or a named part is a real cross-reference.
+    ("Part 3 covers the node-shared read cache and why it's safe.", False),
+    ("Everything below `overlay` is Part 1 unchanged.", False),
+    ("The block below the header is where the data lives.", False),
+]
+
+STATED: list[tuple[str, bool]] = [
+    ("Real images have too many digits to follow, so shrink one down to eight blocks.", True),
+    ("The mapping is hard to read cold, and picture it as a sorted array instead.", True),
+    # A consequence rather than a fix the reader is told to apply.
+    ("A real image has far too many digits to follow by hand, so let's shrink one down.", False),
+    ("Reads cluster, so the next request is probably inside the chunk you paid for.", False),
+    ("The scan takes minutes, so writes keep arriving behind it.", False),
+]
+
+CONDITIONAL: list[tuple[str, bool]] = [
+    ("Break it and nothing throws, so reads start returning other people's data.", True),
+    ("Allow writes during the scan and rows get inserted behind it, so the index is missing rows.", True),
+    # Say `if` and the sentence stops sounding like a lab procedure.
+    ("If it breaks, reads silently start returning other people's data without raising any errors.", False),
+    # Two beats and a stop, which is the shape that reads naturally.
+    ("Ask it for one block and it fetches exactly one block.", False),
+    ("Read an entry and you're standing in two address spaces, which is why mixing the offsets corrupts an image.", False),
+    # The `and` sits inside a noun phrase, so there's only one consequence.
+    ("Read that as a page and a slot on that page, and the slot is a real thing.", False),
+]
+
+# The number of bullets whose lead-in already names the count.
+COUNTED: list[tuple[str, int, bool]] = [
+    ("Hand that UUID to S3 and you get back five objects under it:", 5, True),
+    ("Three rules cover the retry case in practice:", 3, True),
+    # The number is a measurement, not an item count.
+    ("The chunker works in 4 MiB units, and each one covers this much:", 4, False),
+    ("Two things go wrong, and the second is worse:", 3, False),
+    ("The header records what the data file can't:", 4, False),
+]
+
 
 def main() -> int:
     failures: list[str] = []
@@ -228,6 +309,42 @@ def main() -> int:
         if hits != ([expected] if expected else []):
             failures.append(f"contraction_hits({text!r}) is {hits}, want {expected}")
 
+    for text, expected in PILEUP:
+        joints = report.clause_pileup(report.normalize(text))
+        if joints != expected:
+            failures.append(f"clause_pileup({text!r}) is {joints}, want {expected}")
+
+    for text, expected in SPLICE:
+        hit = report.comma_splice(report.normalize(text))
+        if hit != expected:
+            failures.append(f"comma_splice({text!r}) is {hit!r}, want {expected!r}")
+
+    for first, second, expected in DEFINITION:
+        frame = report.parallel_definition(report.normalize(first), report.normalize(second))
+        if (frame[0] if frame else None) != expected:
+            failures.append(f"parallel_definition({first!r}, {second!r}) is {frame!r}, want {expected!r}")
+
+    for text, expected in SELF_REF:
+        flagged = report.SELF_REFERENCE.search(report.normalize(text)) is not None
+        if flagged != expected:
+            failures.append(f"self-reference {text!r} is {flagged}, want {expected}")
+
+    for text, expected in STATED:
+        flagged = report.STATED_THEN_SOLVED.search(report.normalize(text)) is not None
+        if flagged != expected:
+            failures.append(f"stated-then-solved {text!r} is {flagged}, want {expected}")
+
+    for text, expected in CONDITIONAL:
+        flagged = report.IMPERATIVE_CONDITIONAL.match(report.normalize(text)) is not None
+        if flagged != expected:
+            failures.append(f"imperative-conditional {text!r} is {flagged}, want {expected}")
+
+    for lead, items, expected in COUNTED:
+        counts = {report.NUMBER_WORDS.get(m.group(1).lower(), 0) for m in report.LEAD_COUNT.finditer(report.normalize(lead))}
+        flagged = items in counts
+        if flagged != expected:
+            failures.append(f"counted-bullets {lead!r} over {items} bullets is {flagged}, want {expected}")
+
     for url, expected in PINNED:
         ref = url.split("/blob/")[1].split("/")[0]
         flagged = report.PINNED_REF.fullmatch(ref) is None
@@ -254,7 +371,9 @@ def main() -> int:
         print(f"FAIL  {failure}")
     checks = (
         len(SPLITS) + len(READING) + len(ANNOUNCES) + len(SPEC_SHEET) + len(COLON)
-        + len(SEAM_OPENER) + len(ECHO) + len(PIVOT) + len(CONTRACT) + len(PINNED) + 2 + len(posts)
+        + len(SEAM_OPENER) + len(ECHO) + len(PIVOT) + len(CONTRACT) + len(PINNED)
+        + len(PILEUP) + len(SPLICE) + len(DEFINITION) + len(SELF_REF) + len(STATED)
+        + len(CONDITIONAL) + len(COUNTED) + 2 + len(posts)
     )
     print(f"\n{checks - len(failures)}/{checks} passed over {len(posts)} posts")
     return 1 if failures else 0

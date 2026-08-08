@@ -458,6 +458,154 @@ def contraction_hits(raw: str) -> list[tuple[str, str]]:
     return out
 
 
+# `Offset is where the guest thinks the bytes are. BuildStorageOffset is where
+# they actually are.` Two definitions poured into the same mould, which spends
+# two stiff sentences on a contrast one sentence can carry.
+DEFINITION_FRAME = re.compile(r"^\W*\S+(?:\s+\S+){0,2}?\s+(?:is|are|was|were)\s+(where|what|how|why|when|the one)\b", re.I)
+
+
+def parallel_definition(first: str, second: str) -> tuple[str, str] | None:
+    """Flag back-to-back definitions built on the same `X is where ...` frame.
+
+    Both sentences have to reach for the same wh-word, since that repetition is
+    what makes the pair read as a template being filled in twice rather than as
+    a thought and its consequence.
+    """
+    a, b = DEFINITION_FRAME.match(first), DEFINITION_FRAME.match(second)
+    if a is None or b is None or a.group(1).lower() != b.group(1).lower():
+        return None
+    return a.group(1).lower(), b.group(1).lower()
+
+
+# Prose about the post's own layout rather than about the subject: `for the rest
+# of the post`, `everything below`. A pointer at another part is a real
+# cross-reference, so `Part 3 covers` and `the section below` part ways here.
+SELF_REFERENCE = re.compile(
+    r"\b(?:for|in|through(?:out)?)\s+the\s+rest\s+of\s+(?:this|the)\s+(?:post|section|series)\b"
+    r"|\bthe\s+(?:rest|remainder)\s+of\s+(?:this|the)\s+(?:post|section)\b"
+    # A bare `below` points at the page. `below the header` points at a thing.
+    r"|\beverything\s+(?:below|above)\s+(?:is|was|here|else)\b"
+    r"|\beverything\s+that\s+follows\b"
+    r"|\bthe\s+(?:section|paragraph|table|diagram|example)\s+(?:below|above)\b"
+    r"|\bthis\s+(?:post|section)\s+(?:is\s+about|covers|walks|explains)\b"
+    r"|\b(?:earlier|later)\s+in\s+(?:this|the)\s+post\b",
+    re.I,
+)
+
+# `Real images have too many digits, so shrink one down to eight blocks.` The
+# problem and its fix arrive in one clause each, with nobody in the sentence.
+BARE_IMPERATIVE = (
+    r"take|shrink|start|picture|imagine|say|call|note|consider|use|watch|read|count"
+    r"|think|drop|pick|ask|run|write|open|walk|follow|trace|swap|treat|skip|assume"
+)
+STATED_THEN_SOLVED = re.compile(rf",\s+(?:so|and)\s+(?:{BARE_IMPERATIVE})\b", re.I)
+
+# Any imperative that can open a hypothetical, which is a wider set than the ones
+# that show up as a stated-and-solved fix.
+HYPOTHETICAL_VERB = (
+    rf"{BARE_IMPERATIVE}|break|tear|allow|copy|boot|hit|miss|lose|delete|mount|set"
+    r"|add|give|forget|leave|point|move|make|get|put|push|widen|reuse"
+)
+
+# `Break it and nothing throws, so reads start returning other people's data.`
+# An imperative standing in for `if`, its result, then a second result hung off
+# the first. Two beats reads fine, and the third turns it into a lab report. Only
+# a `, so` tail counts, since `, which` and `, and` land on a noun as often as on
+# a clause: `Read that as a page and a slot, and the slot is a real thing.`
+IMPERATIVE_CONDITIONAL = re.compile(
+    rf"^(?:so\s+|then\s+|now\s+)?(?:{HYPOTHETICAL_VERB})\b[^.]*?\s+and\s+[^.]*?,\s+so\b",
+    re.I,
+)
+
+# There's no reliable `verbless` check to write here. Telling a finite verb from
+# a plural noun needs a parser, since `pairs` and `covers` inflect identically,
+# so `Four socket pairs per device, wired up over netlink` and `It wants a device
+# in /dev, with a major number` can't be separated by spelling. The rule lives in
+# the guide under Voice and tone instead.
+
+# `A, but B, and C.` Two joints, so the reader banks three statements before
+# finding out which one the sentence was about. The last one is often a clause
+# that only grades the one before it, which cuts clean. The optional quote
+# catches a joint after dialogue, where the comma sits inside the quotation.
+JOINT = re.compile(r",[\"']?\s+(but|and|or|so|which|since|because|though|while|then)\b", re.I)
+
+# `A, B, and C`, where the closing `and` is punctuating a series rather than
+# restarting the sentence: `Firecracker sees a device, the kernel does block
+# I/O, and every miss becomes a GET`. Wants a bare comma before the last joint,
+# since that first item is what makes the three parallel instead of chained.
+BARE_COMMA = re.compile(r",\s+(?!but|and|or|so|which|since|because|though|while|then\b)\w+", re.I)
+
+
+def is_series(sentence: str) -> bool:
+    """Tell `A, B, and C` from a sentence that restarts on `and`.
+
+    The tell is a bare comma earlier in the sentence, before the `and` joint.
+    Without one there are only two items, so the `and` is joining clauses
+    rather than closing a list.
+    """
+    last = None
+    for match in JOINT.finditer(sentence):
+        last = match
+    if last is None or last.group(1).lower() not in {"and", "or"}:
+        return False
+    return bool(BARE_COMMA.search(sentence[: last.start() + 1]))
+
+
+def clause_pileup(sentence: str) -> int:
+    """Count the places a sentence restarts on a new independent clause.
+
+    Length is the other half of the signal, since `A, and B, so C` reads fine
+    while the clauses are short. The shape only goes wrong once the reader is
+    banking a dozen-odd words per joint before finding out which one mattered.
+    """
+    joints = len(JOINT.findall(sentence)) - (1 if is_series(sentence) else 0)
+    if joints < 2 or len(sentence.split()) < 8 * joints + 12:
+        return 0
+    return joints
+
+
+# `nothing throws, reads just start returning other people's data`. Two finished
+# statements with a comma between them, which reads as one sentence trying to
+# hold both. Only pronouns and a couple of nouns that can't be anything but a
+# subject, because `, the cache key` opens a list item just as often as a clause,
+# and `both offsets` is a determiner before it's ever a pronoun.
+SPLICE = re.compile(
+    r",\s+(?:it|they|we|you|reads?|writes?|nothing|everything)\s+"
+    r"(?:just|only|never|always|still|quietly|then|already)?\s*\w+\b",
+    re.I,
+)
+
+# A leading subordinate or participial clause, where the comma closing it is the
+# one the grammar asks for: `When the transaction finishes, nothing changes.`
+LEADING_CLAUSE = re.compile(
+    r"^(?:so\s+)?(?:when|if|once|after|before|while|until|unless|since|because|as|although"
+    r"|though|given|assuming|whenever|now\s+that|even\s+(?:if|though)|\w+ing)\b",
+    re.I,
+)
+
+
+# `A GSI doesn't give you a cheap scan, it gives you a different key.` A denial
+# answered by a pronoun picking the same subject back up, which is a contrast
+# the comma is right for. Swapping in a fresh subject is what makes it sprawl.
+CONTRAST = re.compile(
+    r"(?:n['’]t\b|\b(?:not|never|no)\b)[^,]*,\s+(?:it|they|we|you)\b",
+    re.I,
+)
+
+
+def comma_splice(sentence: str) -> str | None:
+    """Flag a comma standing in for a full stop between two finished statements.
+
+    A series is punctuated the same way, so `A, B, and C` is exempt, and so are
+    a leading subordinate clause and a denial answered by the same subject.
+    What's left is a new subject arriving with no conjunction to hang it off.
+    """
+    if is_series(sentence) or LEADING_CLAUSE.match(sentence) or CONTRAST.search(sentence):
+        return None
+    match = SPLICE.search(sentence)
+    return match.group(0) if match else None
+
+
 # ---------------------------------------------------------------- checks
 
 def check_mechanical(post: Post, slugs: set[str]) -> list[Finding]:
@@ -600,9 +748,22 @@ def check_judgment(post: Post) -> list[Finding]:
             tail = sentence.rsplit(",", 1)[-1] if commas else ""
             if commas >= 3 and re.match(r"\s+(which|since|because|so)\b", tail):
                 found.append(Finding(para.start, "judgment", "comma-pileup", f"{commas} commas  {short(sentence)}"))
+            joints = clause_pileup(sentence)
+            if joints >= 2:
+                found.append(Finding(para.start, "judgment", "clause-pileup", f"{joints} joints  {short(sentence)}"))
+            if splice := comma_splice(sentence):
+                found.append(Finding(para.start, "judgment", "comma-splice", f"{splice.strip()}  {short(sentence)}"))
+            if IMPERATIVE_CONDITIONAL.match(sentence):
+                found.append(Finding(para.start, "judgment", "imperative-conditional", short(sentence, 76)))
 
         for pattern, contracted in contraction_hits(para.raw):
             found.append(Finding(para.start, "judgment", "uncontracted", f"{pattern} -> {contracted}"))
+
+        if match := SELF_REFERENCE.search(para.text):
+            found.append(Finding(para.start, "judgment", "self-reference", f"{match.group(0)}  {short(para.text, 58)}"))
+
+        if parts and STATED_THEN_SOLVED.search(parts[0]):
+            found.append(Finding(para.start, "judgment", "stated-then-solved", short(parts[0], 76)))
 
         if parts and len(parts) > 1 and announces_only(parts[0]):
             found.append(Finding(para.start, "judgment", "short-opener", f"{len(parts[0].split())}w  {parts[0]}"))
@@ -616,12 +777,21 @@ def check_judgment(post: Post) -> list[Finding]:
                 found.append(Finding(para.start, "judgment", "choppy-run", short(" ".join(parts))))
 
         for a, b in zip(parts, parts[1:]):
+            if frame := parallel_definition(a, b):
+                found.append(
+                    Finding(para.start, "judgment", "parallel-definition",
+                            f"both `X is {frame[0]}`  {short(a, 34)} / {short(b, 34)}")
+                )
             if len(a.split()) <= 4:
                 continue
             if len(b.split()) <= 3 and re.match(r"^(Not|Just|Zero|None|Never)\b", b):
                 found.append(Finding(para.start, "judgment", "escalating-fragment", f"{short(a, 50)} / {b}"))
             elif negation_pivot(a, b):
                 found.append(Finding(para.start, "judgment", "negation-pivot", f"{short(a, 50)} / {b}"))
+            # A long sentence answered by a near-empty one, where the tail is
+            # too short to have earned the full stop in front of it.
+            elif len(parts) == 2 and len(a.split()) >= 14 and len(b.split()) <= 6:
+                found.append(Finding(para.start, "judgment", "stub-tail", f"{len(b.split())}w tail  {short(a, 40)} / {b}"))
 
         flat = [s for s in parts if is_spec_sheet(s)]
         if len(flat) >= 3 and len(flat) >= len(parts) - 1:
@@ -656,6 +826,7 @@ def check_judgment(post: Post) -> list[Finding]:
 
     found.extend(check_colons(post))
     found.extend(check_paragraph_seams(post))
+    found.extend(check_counted_lists(post))
 
     if len(para_words) >= 8:
         spread = statistics.pstdev(para_words) / statistics.fmean(para_words)
@@ -759,6 +930,43 @@ def following_paragraph(post: Post, fence: Fence) -> Paragraph | None:
         if para.end == fence.start - 2:
             return para
     return None
+
+
+NUMBER_WORDS = {"two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+
+# A count in the lead-in, ignoring the ones that are measurements rather than
+# item counts, so `4 MiB chunks` above a four-item list doesn't match.
+LEAD_COUNT = re.compile(
+    r"\b(two|three|four|five|six|seven|eight|nine|ten|\d{1,2})\b"
+    r"(?!\s*(?:[KMGT]i?B|bytes?|bits?|blocks?|ms|s\b|%|-byte))",
+    re.I,
+)
+
+
+def check_counted_lists(post: Post) -> list[Finding]:
+    """Flag a bulleted list whose lead-in already told the reader how many.
+
+    Naming the count is a promise the reader will be tracking against, and
+    dashes make them do that counting themselves. It also means the items are
+    an inventory rather than unordered peers, which is what numbers are for.
+    """
+    found: list[Finding] = []
+    for run in post.lists:
+        if run.numbered or run.items < 2:
+            continue
+        lead = next((p for p in post.paragraphs if p.end == run.start - 2), None)
+        if lead is None:
+            continue
+        counts = set()
+        for match in LEAD_COUNT.finditer(lead.text):
+            token = match.group(1).lower()
+            counts.add(NUMBER_WORDS.get(token) or (int(token) if token.isdigit() else 0))
+        if run.items in counts:
+            found.append(
+                Finding(run.start, "judgment", "counted-bullets",
+                        f"{run.items} bullets, lead names it  {short(lead.text, 52)}")
+            )
+    return found
 
 
 STOPWORDS = set(
@@ -884,6 +1092,14 @@ GUIDE = {
     "escalating-fragment": "state the number once (The colon habit)",
     "negation-pivot": "a denial answered by a bare-verb fragment (The colon habit)",
     "uncontracted": "contract it unless the long form is the emphasis (Style)",
+    "clause-pileup": "the sentence restarts twice, so it's a list of statements (Sentence length)",
+    "comma-splice": "a comma standing in for a full stop (Commas)",
+    "parallel-definition": "one sentence carries the contrast (Commas)",
+    "self-reference": "write about the subject, not about the post (Walking versus stating)",
+    "stated-then-solved": "walk the reader through it, don't state and fix (Narrative flow)",
+    "imperative-conditional": "say `if` and stop at one consequence (Voice and tone)",
+    "stub-tail": "a tail too short to have earned the stop in front of it (Voice and tone)",
+    "counted-bullets": "prose names the count, so number them (The colon habit)",
     "filler-opener": "banned opener (The colon habit)",
     "flat-structure": "rewrite around what a reader does with it (Commas)",
     "diagram-echo": "don't describe the diagram again (ASCII diagrams)",

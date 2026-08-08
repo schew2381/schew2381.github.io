@@ -22,7 +22,7 @@ So let's price the sharing by bringing the same environment up twice on one cold
 
 ## Where the time went
 
-Readiness is the trap. A Pod passes its probe as soon as the volume is mounted and the container is up. Part 3's mount is one header read plus local setup, so that lands in well under a second:
+Readiness is the trap here, because a Pod passes its probe as soon as the volume is mounted and the container is up. Part 3's mount is one header read plus local setup, so that lands in well under a second:
 
 ```text
   WHAT READY MEANS                       WHAT'S ACTUALLY ON THE NODE
@@ -35,7 +35,7 @@ Readiness is the trap. A Pod passes its probe as soon as the volume is mounted a
   kubelet: Ready                         the next read is an S3 round trip
 ```
 
-Nothing in the readiness signal has an opinion about file content, because from kubelet's side the volume is mounted and the filesystem is there. Then a real request arrives:
+Nothing in the readiness signal has an opinion about file content, because from kubelet's side the volume is mounted and the filesystem is there. Then a real request shows up and starts asking for bytes:
 
 ```text
 git status over 62,115 index entries
@@ -51,7 +51,7 @@ Each of those entries is a `stat` and usually a read, scattered across an 8 GiB 
 
 ## Sharing the cache across Pods
 
-Part 3 built the node-shared read cache and argued for why it's safe. What it bought is a number, and getting it meant running the same thing twice.
+Part 3 built the node-shared read cache and argued for why it's safe. Putting a number on what it buys meant running the same thing twice.
 
 The workload is a full development environment coming up, in four steps that line up with the four rows below.
 
@@ -74,13 +74,13 @@ The sentinel is a file the image ships with, which the entrypoint reads to find 
 
 Nothing about the workload changed between the two columns, so 21 of those 52 seconds were one Pod refetching what another Pod on the same machine already had sitting on local disk.
 
-We shipped it default-off behind `--shared-read-cache`. Cross-Pod sharing of an mmap'd file is the kind of change where the failure mode is subtle and the blast radius is every Pod on the node.
+We shipped it default-off behind `--shared-read-cache`, since cross-Pod sharing of an mmap'd file is the kind of change where the failure mode is subtle and the blast radius is every Pod on the node.
 
 ## Prefetching the startup set
 
-Sharing fixes the second Pod. The first one still pays in full, and on a freshly scaled-up node every Pod is the first one, which is exactly when a burst of them arrives.
+Sharing only fixes the second Pod, though, and the first one still pays in full. On a freshly scaled-up node every Pod is the first one, which is exactly when a burst of them arrives.
 
-The second change starts from noticing who the read set actually belongs to. What `git status` touches isn't a fact about this Pod or this request. It's a fact about the template's contents, fixed at build time, identical for every Pod that ever boots from it. So record it once, and prefetch it during the mount:
+The second change starts from noticing who the read set actually belongs to. What `git status` touches isn't a fact about this Pod or this request at all, it's a fact about the template's contents, fixed at build time and identical for every Pod that ever boots from it. So we can record it once and prefetch it during the mount:
 
 ```text
   ONCE PER TEMPLATE, AT BUILD TIME
@@ -119,7 +119,7 @@ The obvious way to record a read set is to trace the workload, with `strace` or 
   block allocator in your head
 ```
 
-So the recording pass asks the kernel instead. It runs in the build pipeline, the same pass that produces a template's objects in the first place, under `--record-startup-hotset`. Run the workload through a loop mount, then ask the page cache which pages of the backing file are resident, and whatever it says is by construction exactly what the read path touched.
+So the recording pass asks the kernel instead. It runs in the build pipeline, the same pass that produces a template's objects in the first place, under `--record-startup-hotset`. Run the workload through a loop mount, then ask the page cache which pages of the backing file are resident. Whatever it says is by construction exactly what the read path touched.
 
 ```text
 1. cp -a the source tree into the image through a loop mount
@@ -165,7 +165,7 @@ The loop device has to be opened with `losetup --direct-io=off`, because direct 
 
 The page cache being a side effect is the entire measurement, so anything that bypasses it produces a manifest that's confidently empty and a build that looks like it worked.
 
-Step 4's eviction has to actually land. `prepareColdBackingFile` retries three times and hard-errors if pages stay resident, because a file that's still half warm produces a hot set missing precisely the chunks that were already cached. Those are usually the important ones. An empty result is a hard error too. Better to fail the build than to publish a manifest that prefetches nothing and looks like it's working.
+Step 4's eviction also has to actually land, so `prepareColdBackingFile` retries three times and hard-errors if pages stay resident. A file that's still half warm produces a hot set missing precisely the chunks that were already cached, which are usually the important ones. An empty result hard-errors for the same reason, because failing the build beats publishing a manifest that prefetches nothing and looks like it's working.
 
 Going from resident pages to chunk offsets is also where the manifest gets small enough to ship:
 
@@ -236,7 +236,7 @@ coalesced into ranges, capped at maxRangeBytes
   3 chunks         4 chunks            1 chunk
 ```
 
-The step the diagram doesn't show is the skip. `prefetchRanges` drops anything already cached before it coalesces, which is where the two changes meet, because on a warm node most of the hot set is already there and the prefetch turns into almost nothing.
+The step the diagram doesn't show is the skip. `prefetchRanges` drops anything already cached before it coalesces, which is where the two changes meet. On a warm node most of the hot set is already there, so the prefetch turns into almost nothing.
 
 Each range opens one reader and still walks it a chunk at a time. Completion is recorded per 4 MiB chunk, so a range that dies halfway leaves behind the chunks it did finish rather than nothing.
 
@@ -257,7 +257,7 @@ Concurrency is a weighted semaphore where each range's weight is its chunk count
 effectiveMaxRangeBytes := min(maxRangeBytes, int64(concurrency)*storage.MemoryChunkSize)
 ```
 
-Production runs 16 permits against a 4 MiB range cap, so 64 MiB, and the plan gets logged before it executes so a slow prefetch shows up as a log line rather than a mystery.
+Production runs 16 permits against a 4 MiB range cap, so 64 MiB in flight at once. The plan gets logged before it executes, which turns a slow prefetch into a log line rather than a mystery.
 
 Two smaller behaviors make it compose with Part 3. Prefetched chunks go through `commitChunk` like any other, so they land in the state file and survive a daemon restart. And prefetch is single-flighted per device, so a second volume mounting the same template mid-prefetch waits on the one already running and reports `Reused` instead of starting a duplicate.
 
@@ -280,7 +280,7 @@ ONE 4 MiB CHUNK, ONE OPEN GetObject
 
 A demand read has no idea how much of the chunk anyone wants, so cutting the fetch into pieces is the only way to release a reader before the whole 4 MiB lands. A prefetch knows it wants all of it, because that's what being in the hot set means, so it reads straight through with `io.ReadFull`.
 
-Both paths are one GET. The reader stays open across batches and only reopens at a mapping boundary, so the batching never controlled the request count. What the prefetch skips is the eight rounds of taking the session lock and walking the waiter list to find nobody there.
+Both paths are one GET, since the reader stays open across batches and only reopens at a mapping boundary. The batching never controlled the request count either way. What the prefetch skips is the eight rounds of taking the session lock and walking the waiter list to find nobody there.
 
 ### What it bought
 
@@ -295,7 +295,7 @@ A `Ready` Pod's first agent turn went from 56.8 seconds to somewhere between 4.9
 
 The 16% on ordinary demand reads is a freebie nobody designed for. Those reads aren't in the hot set at all, and they still got faster, partly from the larger effective range size and partly from chunks the prefetch swept up on its way to something adjacent.
 
-Three things that table doesn't measure, worst last.
+There are three things that table doesn't measure, and they're listed worst last.
 
 1. A cold node with no shared cache underneath the prefetch.
 2. The aggregate drop in S3 requests.
@@ -303,7 +303,7 @@ Three things that table doesn't measure, worst last.
 
 That last one is the failure mode this change most plausibly has, and it's the one with no number next to it.
 
-So we rolled it out in three steps instead of one:
+So we rolled the change out in three steps instead of one:
 
 ```text
   step 1   driver change, prefetch code present but nothing publishes a manifest
@@ -353,9 +353,9 @@ The shared cache gets better at its job because something else decided what to p
 
 Before either change, a Pod on this driver paid three separate tolls.
 
-- It refetched bytes a neighbour on the same node already had on local disk.
-- It paid for the first read of each chunk in the middle of a user request.
-- It ended up with whatever cached set the first workload on that node happened to wander into.
+1. It refetched bytes a neighbour on the same node already had on local disk.
+2. It paid for the first read of each chunk in the middle of a user request.
+3. It ended up with whatever cached set the first workload on that node happened to wander into.
 
 Sharing kills the first one and the prefetch kills the second, and together they replace the third with something deliberate. What each buys costs something in return, and the two bills are different shapes. Sharing is tuned with watermarks and an idle TTL, and the prefetch with a concurrency limit and a range cap.
 

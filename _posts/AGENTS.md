@@ -125,6 +125,34 @@ Signs a section reads like a fact dump:
 - Prose immediately after a diagram that describes the diagram again.
 - Sentences that could be reordered without the reader noticing.
 
+### Walking versus stating
+
+Naming a problem and then naming its fix in the same breath isn't a
+walk through anything. Nobody is in the sentence, and the reader watches
+the answer arrive instead of arriving at it:
+
+```
+BAD:  Real images have too many digits to follow, so shrink one down to
+      eight blocks and count in blocks instead of bytes.
+
+GOOD: A real image has far too many digits to follow by hand, so let's
+      shrink one down to eight blocks and count in blocks instead.
+```
+
+Same two facts. The difference is `let's`, which puts somebody in the
+room doing the shrinking. A bare imperative sitting after a comma is the
+tell, and `so shrink`, `so picture`, and `so take` are all the same move.
+
+Write about the subject, not about the post. "That's the whole
+vocabulary for the rest of the post" and "everything below is addressed
+relative to a build" describe the artifact the reader is holding, which
+they can see. Say the thing itself instead: "every address in this system
+is relative to a build."
+
+Pointing at another post or a named part is different, and it's a real
+cross-reference. "Part 3 covers the read cache" tells the reader where to
+go. "The section below explains it" tells them they can scroll.
+
 ## Voice and tone
 
 Conversational, like explaining something to a sharp friend, without
@@ -162,6 +190,54 @@ paragraph needs instead of announcing that a fact is coming. A short
 line that states the paragraph's whole claim stays. "Not free, though."
 and "Nothing warns you." only announce, so they fold into the sentence
 after them.
+
+The same waste shows up at the other end, where a long sentence gets
+answered by one too short to have earned the stop in front of it:
+
+```
+BAD:  The struct stores byte offsets, but every one of them is a multiple
+      of the block size, so dividing through loses nothing. Block 3 means
+      the fourth block.
+
+GOOD: The struct really does store byte offsets, but each one is a
+      multiple of the block size. Dividing through costs us nothing, so
+      block 3 just means the fourth block.
+```
+
+Four words after a thirty-word sentence reads as an afterthought that
+missed its ride. Either it belongs in the sentence before it, or the
+sentence before it was two sentences.
+
+Don't put a full stop after a noun phrase. A caption with a modifier hung
+off it looks like a sentence in a draft and trails off when read aloud:
+
+```
+BAD:  Five entries, sorted, covering the image with no gaps.
+      Everything one running sandbox touches, from the guest kernel down
+      to object storage.
+
+GOOD: Those five entries are sorted and cover the image with no gaps.
+      A single running sandbox reaches from the guest kernel all the way
+      down to object storage.
+```
+
+The fix is a verb. The BAD versions are labels for a diagram, and putting
+one in running prose asks the reader to supply the sentence themselves.
+
+An imperative standing in for `if` is fine for two beats and turns into a
+lab procedure on the third:
+
+```
+BAD:  Break it and nothing throws at you, so reads just quietly start
+      returning other people's data.
+
+GOOD: If it breaks, reads silently start returning other people's data
+      without raising any errors.
+```
+
+"Ask it for one block and it fetches exactly one block" stops at two and
+reads fine. Once a `, so` tail arrives to carry the real consequence, say
+`if` and let the sentence flow instead.
 
 ## Sentence length
 
@@ -201,6 +277,30 @@ Split at the joint carrying the most weight and keep every fact.
 Deleting words isn't the fix, because the problem is that the reader
 has nowhere to breathe rather than that they've been told too much.
 
+A shorter version of the same failure is a sentence that restarts twice,
+where the reader banks three statements before finding out which one the
+sentence was about:
+
+```
+BAD:  Part 3 built the node-shared read cache and argued for why it's
+      safe, but what it actually buys is a number, and getting that
+      number meant running the same thing twice.
+
+GOOD: Part 3 built the node-shared read cache and argued for why it's
+      safe. Putting a number on what it buys meant running the same
+      thing twice.
+```
+
+Thirty words is nowhere near the ceiling, so length isn't what's wrong.
+Two `, and` or `, so` joints in a row is, because each one is a fresh
+independent clause and the sentence has no main idea by the end of it.
+Usually the last clause only grades the one before it and cuts clean.
+
+A series is a different thing and reads fine. "Firecracker sees an
+ordinary block device, the guest kernel does ordinary block I/O, and
+every miss becomes a 4 MiB range GET" is three parallel items, not three
+restarts, and the closing `and` is punctuation for the list.
+
 ## Commas
 
 Every comma is a small stop, so a sentence carrying several of them
@@ -222,6 +322,26 @@ Read the line out loud. If you don't pause where the comma is, drop it.
 A trailing `, since` or `, because` hung off a sentence that already
 carries two commas is the same habit in a different clause. Drop the
 comma or split the sentence.
+
+A comma can't do a full stop's job. "Nothing throws, reads just start
+returning other people's data" is two finished statements sharing one
+sentence, so give the second one its own, or a conjunction to hang off.
+Picking the same subject back up is different and reads fine: "a GSI
+doesn't give you a cheap scan, it gives you a different key."
+
+Two definitions poured into the same mould want to be one sentence:
+
+```
+BAD:  `Offset` is where the guest thinks the bytes are.
+      `BuildStorageOffset` is where they actually are.
+
+GOOD: The guest addresses its bytes by `Offset` while they actually live
+      at `BuildStorageOffset`.
+```
+
+Repeating the frame is what makes it read as a template getting filled in
+twice. One sentence carries the contrast, and it's a contrast, not two
+facts that happen to be adjacent.
 
 Describing a structure is where prose goes stiff, because a run of flat
 subject-verb-object statements about what a thing contains reads like a
@@ -271,6 +391,12 @@ all four in one sentence to find out there was no fifth.
 
 Numbered when the items carry an order (steps, a preference ranking, a
 try-this-then-that). Dashes when they're unordered peers.
+
+Numbered also when the prose above already said how many. "You get back
+five objects under it" is a promise the reader will be counting against,
+and dashes make them do that counting themselves. Naming the count also
+means the items are an inventory rather than a set of interchangeable
+peers, which is what numbers are for.
 
 Reach for a list more often than feels necessary. Every example post runs
 at least two bullet lists and most run more, so a draft with two lists
@@ -614,6 +740,22 @@ come down without losing a mechanism, the section wanted splitting.
 13. Read every paragraph that describes a structure. If it's a run of
     flat "X contains Y" statements, rewrite it around what a reader does
     with the structure.
+14. Does any sentence restart twice on `, and` or `, so`? Split it, or
+    cut the last clause if it only grades the one before it.
+15. Any comma doing a full stop's job between two finished statements?
+    Give the second one its own stop or a conjunction.
+16. Does any sentence end on a noun phrase with no verb in it? That's a
+    diagram caption, so write the sentence.
+17. Is a four-word sentence answering a thirty-word one? Fold it in, or
+    split the long one so the tail has something to answer.
+18. Does the prose above a bulleted list already name the count? Number
+    the list.
+19. Any back-to-back definitions on the same frame (`X is where ... Y is
+    where ...`)? One sentence carries the contrast.
+20. Any `problem, so <imperative>` sentence? Put somebody in the room
+    doing the work instead.
+21. Does the post talk about itself ("for the rest of the post,"
+    "everything below")? Say the thing rather than pointing at the page.
 
 ## The prose report
 
@@ -649,6 +791,13 @@ reader want the mechanism, whether a section earns its place, or whether
 two consecutive paragraphs have any reason to be consecutive. Those are
 what this guide is mostly about, and reading the post is the only way to
 check them.
+
+Some rules here have no check behind them, and that's on purpose. Telling
+a noun-phrase caption from a real sentence needs a parser, since `pairs`
+and `covers` inflect identically, so "four socket pairs, wired up over
+netlink" and "it wants a device in `/dev`, with a major number" can't be
+separated by spelling. A check that's wrong half the time trains you to
+skim the report, which is worse than not having it.
 
 Tuning the script is expected. When a check fires on a line that's
 actually fine, fix the pattern rather than the post, then add that

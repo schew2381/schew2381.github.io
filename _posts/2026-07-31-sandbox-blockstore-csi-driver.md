@@ -14,7 +14,7 @@ tags: [csi, kubernetes, nbd, block-storage, s3, e2b, ext4]
 
 [Part 1](/posts/e2b-block-storage-layer/) ended on the property that makes any of this legal, which is that the read side never changes. Then [Part 2](/posts/kubernetes-csi-interface/) came down to a build ID in a Pod spec and one `NodePublishVolume` call. Now what breaks when you bolt them together?
 
-Less than you'd think, at first. E2B serves its block device to a Firecracker guest kernel, and we serve the same device to the host kernel instead, so headers, chunker, and overlay all come over untouched. A Pod names a template build ID in its own spec and gets back a writable ext4 mount over a multi-gigabyte image nobody ever downloads.
+Less than you'd think, at first. E2B serves its block device to a Firecracker guest kernel, and we serve the same device to the host kernel instead. Headers, chunker, and overlay all come over untouched. A Pod names a template build ID in its own spec and gets back a writable ext4 mount over a multi-gigabyte image nobody ever downloads.
 
 Everything that breaks is downstream of that one swap, because the kernel doing the I/O is now the kernel the driver itself runs on.
 
@@ -181,7 +181,7 @@ Here the dirty pages outlive the thing that would clean them up. A pod's write l
   ext4 → /dev/nbd7 → NBD socket → dispatch goroutine → write cache
 ```
 
-Nothing on that path is synchronous with the write. Tear down while pages are still dirty and writeback's next flush hits a closed socket, ext4 remounts itself read-only, and those blocks are missing from a diff that uploads without reporting a single error. That's why unmount order is load-bearing, and why the ENOSPC mapping matters more than an error code usually would.
+Nothing on that path is synchronous with the write. If you tear down while pages are still dirty, writeback's next flush hits a closed socket and ext4 remounts itself read-only. Those blocks then go missing from a diff that uploads without reporting a single error. That's why unmount order is load-bearing, and why the ENOSPC mapping matters more than an error code usually would.
 
 ## NBD, because the host kernel needs a real device
 
@@ -189,7 +189,7 @@ Firecracker will take a file path. It's a userspace process emulating a machine,
 
 [NBD](https://docs.kernel.org/admin-guide/blockdev/nbd.html) is how you fake one. The kernel's `nbd` module publishes `/dev/nbdN`, accepts block requests from the filesystem above, and forwards each one over a socket to whatever userspace process is listening. The driver listens. Every read the Pod's ext4 issues arrives as bytes on a Unix socket inside the DaemonSet, gets served out of the overlay, and goes back the same way.
 
-Four socket pairs per device, wired up over netlink:
+Each device gets four socket pairs, wired up over netlink:
 
 ```go
 const connections = 4
@@ -269,7 +269,7 @@ Those four goroutines never talk to S3. Following one cold read down is the clea
     └─ mark chunk cached, release everyone
 ```
 
-The Pod asked for 4 KiB and the driver fetched 4 MiB, which is the bet from Part 1: filesystem reads cluster, so the next request is probably inside the chunk you just paid for.
+The Pod asked for 4 KiB and the driver fetched 4 MiB, which is the bet from Part 1. Filesystem reads cluster, so the next request is probably inside the chunk you just paid for.
 
 The fetch goroutine is the only thing in this picture that touches S3. Everything else either serves out of the mmap or waits. So the goroutine count doesn't scale the way you'd guess from the socket count:
 
@@ -278,7 +278,7 @@ The fetch goroutine is the only thing in this picture that touches S3. Everythin
   1 fetch goroutine per in-flight chunk  the only S3 caller
 ```
 
-Twenty Pods hammering the same chunk still produce one fetch, because the second through twentieth callers find the session already in `fetchMap` and attach to it. That's the coalescing:
+Twenty Pods hammering the same chunk still produce one fetch, because the second through twentieth callers find the session already sitting in `fetchMap` and attach to it instead:
 
 ```text
   socket 0 ─ read ─┐
@@ -434,7 +434,7 @@ The ordering isn't stylistic, and getting it backwards is the failure from the d
 
 Phase 1 also cancels any periodic checkpoint before it starts waiting. A checkpoint and a teardown both want the overlay, and an unmount that politely waits its turn can block for a full checkpoint interval.
 
-Phase 2 runs on `context.WithoutCancel`. A snapshot cancelled halfway has done all the work and produced nothing.
+Phase 2 runs on `context.WithoutCancel`, since a snapshot cancelled halfway through has done all of the work and produced nothing.
 
 If phase 2 or 3 fails, the write cache stays on disk so a retry can export it. That's the difference between a transient S3 error and permanently losing everything the Pod wrote.
 
@@ -500,7 +500,7 @@ WRITING INTO A SPARSE MMAP ON A FULL DISK
 
 So the chunker calls [`fallocate(2)`](https://man7.org/linux/man-pages/man2/fallocate.2.html) for the chunk's range before the fetch writes into it. Same failure, moved from a signal Go can't catch into a return value it can.
 
-Two syscall swaps round it out, and neither is deep. [`sendfile(2)`](https://man7.org/linux/man-pages/man2/sendfile.2.html) replaces `copy_file_range` for diff export, since it doesn't care whether the two files live on the same filesystem and Part 1's reflink optimization needs XFS, which these nodes don't run. And `unix.Mount` replaces `exec.Command("mount", ...)`, which drops a process spawn from a path that runs on every publish and turns a parsed stderr string into an actual errno.
+Two syscall swaps round it out, and neither is deep. [`sendfile(2)`](https://man7.org/linux/man-pages/man2/sendfile.2.html) replaces `copy_file_range` for diff export, since it doesn't care whether the two files live on the same filesystem. Part 1's reflink optimization needs XFS, which these nodes don't run. And `unix.Mount` replaces `exec.Command("mount", ...)`, which drops a process spawn from a path that runs on every publish and turns a parsed stderr string into an actual errno.
 
 ## The node-shared read cache
 
@@ -522,7 +522,7 @@ The waste is easy to see once you look at a real node running twenty Pods off on
 
 Every one of those redundant requests is a chunk some other Pod on the same machine already has on local disk.
 
-Nothing about that is inherent. It's just that E2B's read cache is scoped to a sandbox. Here the read side stays byte-identical to S3 for the volume's whole life, which is the property from Part 1 that makes one cache file legal to share. `SharedReadCache` refcounts one file across every volume on the node that resolves to the same build.
+None of that waste is inherent, it's just that E2B scopes its read cache to a single sandbox. Here the read side stays byte-identical to S3 for the volume's whole life, which is the property from Part 1 that makes one cache file legal to share. `SharedReadCache` refcounts one file across every volume on the node that resolves to the same build.
 
 Sharing collapses the fetch, not just the disk, because twenty Pods reading a cold chunk land on one `fetchMap` entry in one chunker.
 
@@ -535,7 +535,7 @@ type SharedReadCacheKey struct {
 }
 ```
 
-A build UUID and the SHA-256 of the serialized header, and the digest is the part that isn't obvious. A template can be rebuilt under the same ID with a different mapping. Two volumes with different mappings sharing one cache file read each other's data at offsets that mean something else entirely. That's silent corruption of exactly the kind Part 1 kept warning about. Including the digest turns it into a cache miss, which costs a refetch and nothing else.
+A build UUID and the SHA-256 of the serialized header, and the digest is the part that isn't obvious. A template can be rebuilt under the same ID with a different mapping, and two volumes with different mappings sharing one cache file would read each other's data at offsets that mean something else entirely. That's silent corruption of exactly the kind Part 1 kept warning about. Including the digest turns it into a cache miss instead, which costs a refetch and nothing else.
 
 The UUID is the *resolved* build, which is narrower than "the template" in a way worth knowing. A volume that has checkpointed resolves to the diff it wrote last time, not to the template it started from. So two Pods that began on the same template and have both checkpointed end up with different keys and share nothing. The sharing pays off exactly where it should, on the cold fan-out of many fresh Pods onto one build.
 
@@ -552,7 +552,7 @@ node
 
 ### Deciding when to throw one away
 
-`AcquireForVolume` hands back a lease and `release` drops the refcount. Hitting zero doesn't delete anything, though. The file stays on disk with an idle timestamp, because a template that just lost its last Pod is very likely to get another one, and the warm cache is worth more than the disk.
+`AcquireForVolume` hands back a lease and `release` drops the refcount. Hitting zero doesn't delete anything, though. The file stays on disk with an idle timestamp, because a template that just lost its last Pod is very likely to get another one. A warm cache is worth more than the disk it sits on.
 
 Which means something else has to reclaim the disk eventually, so a sweep runs on a timer:
 
@@ -574,7 +574,7 @@ The sweep measures usage with one `stat` call, and the obvious field is the wron
 return uint64(stat.Blocks) * 512
 ```
 
-Physical size, not logical. Every cache file claims to be the full image size, so `stat.Size` puts a node with three 8 GiB caches at 24 GiB no matter how little of it ever landed. The sweep then evicts a file holding 200 MiB of genuinely useful data, which is Part 1's sparse-file gap arriving as a bug you can ship.
+That's the physical size rather than the logical one. Every cache file claims to be the full image size, so `stat.Size` puts a node with three 8 GiB caches at 24 GiB no matter how little of it ever landed. The sweep then evicts a file holding 200 MiB of genuinely useful data, which is Part 1's sparse-file gap arriving as a bug you can ship.
 
 ### Surviving a daemon restart
 
@@ -681,10 +681,10 @@ The NBD index pool is what runs out first, long before memory does. That's why t
 
 The DaemonSet manifest carries four things a normal workload's wouldn't:
 
-- `privileged: true` for mounting, with `Bidirectional` propagation on both `/mnt/sandboxes` and `/var/lib/kubelet`. Part 2's silent-empty-directory failure lives here.
-- `hostPID: true`, so orphan recovery can look up which process owns an NBD device through `/proc/<pid>`.
-- `priorityClassName: system-node-critical`. Evict the driver and the node can't start any Pod that needs a volume, which includes whatever the replacement driver depends on.
-- `GOMEMLIMIT` set under the container limit, so Go's GC gets aggressive before the kernel OOM-killer does. An OOM kill here takes every mount on the node with it.
+1. `privileged: true` for mounting, with `Bidirectional` propagation on both `/mnt/sandboxes` and `/var/lib/kubelet`. Part 2's silent-empty-directory failure lives here.
+2. `hostPID: true`, so orphan recovery can look up which process owns an NBD device through `/proc/<pid>`.
+3. `priorityClassName: system-node-critical`. Evict the driver and the node can't start any Pod that needs a volume, which includes whatever the replacement driver depends on.
+4. `GOMEMLIMIT` set under the container limit, so Go's GC gets aggressive before the kernel OOM-killer does. An OOM kill here takes every mount on the node with it.
 
 ## Trade-offs
 
