@@ -194,61 +194,47 @@ That covers two blocks out of eight. If you ask this mapping about block 2 it ha
 
 So now we have two mappings that each describe part of the image, and neither one can serve a read by itself. Pausing the sandbox is where they get combined: [`MergeMappings`](https://github.com/e2b-dev/infra/blob/da099cf305df080abd16b964ff8b664736ee6d34/packages/shared/pkg/storage/header/mapping.go#L78) takes the parent's mapping and the new diff's, and returns one mapping covering all eight blocks with no gaps. That merged result is what gets written as `diff-a`'s header.
 
-It walks the two mappings in lockstep, holding one entry from each side and asking how the two overlap. There are only six answers, since two runs on a line can either miss each other or overlap in one of four ways. The grid below is the same six blocks in every case, so the bars are directly comparable:
+It walks the two mappings in lockstep, holding one entry from each side and asking how the two overlap. There are only four answers, and the diff wins every contested block in all of them. That leaves one question per case, which is what survives of the base entry. The grid below is the same six blocks every time, so the bars are directly comparable:
 
 ```text
-A BASE ENTRY MEETING A DIFF ENTRY, ALL SIX WAYS
+A BASE ENTRY MEETING A DIFF ENTRY, ALL FOUR WAYS
 
   block:        0       1       2       3       4       5
              ┌───────┬───────┬───────┬───────┬───────┬───────┐
 
-  1  no overlap
+  Case 1: they don't overlap
   base       └──── base ─────┘
   diff                                       └──── diff ─────┘
-  merged     └──── base ─────┘
-  carried                                    └──── diff ─────┘
-             base ends before the diff begins, so nothing can overwrite it
+             ──────────────────── merge ▼ ────────────────────
+  result     └──── base ─────┘               └──── diff ─────┘
+             no contested blocks, so both entries survive untouched
 
-  2  no overlap, reversed
-  base                                       └──── base ─────┘
-  diff       └──── diff ─────┘
-  merged     └──── diff ─────┘
-  carried                                    └──── base ─────┘
-             same shape, and now it's the diff that's finished
-
-  3  base inside diff
+  Case 2: base falls inside diff
   base                       └──── base ─────┘
   diff               └──────────── diff ─────────────┘
-  merged     nothing yet
-  carried            └──────────── diff ─────────────┘
-             the diff owns every block base did, so base is dropped
+             ──────────────────── merge ▼ ────────────────────
+  result             └──────────── diff ─────────────┘
+             the diff covers every block base had, so base disappears
 
-  4  diff inside base
+  Case 3: diff falls inside base
   base       └──────────────────── base ─────────────────────┘
   diff                       └──── diff ─────┘
-  merged     └──── base ─────┴──── diff ─────┘
-  carried                                    └──── base ─────┘
-             base splits around the diff, and its right half is carried
+             ──────────────────── merge ▼ ────────────────────
+  result     └──── base ─────┴──── diff ─────┴──── base ─────┘
+             base splits in two around the diff, giving three entries
 
-  5  diff over base's left
+  Case 4: they overlap at one edge
   base                       └──────────── base ─────────────┘
   diff       └──────────── diff ─────────────┘
-  merged     └──────────── diff ─────────────┘
-  carried                                    └──── base ─────┘
-             base loses blocks 2 and 3 and keeps only what the diff missed
-
-  6  diff over base's right
-  base       └──────────── base ─────────────┘
-  diff                       └──────────── diff ─────────────┘
-  merged     └──── base ─────┘
-  carried                    └──────────── diff ─────────────┘
-             base keeps its left, and the diff isn't finished yet
+             ──────────────────── merge ▼ ────────────────────
+  result     └──────────── diff ─────────────┴──── base ─────┘
+             base gives up blocks 2 and 3 and keeps the rest
 ```
 
-Our eight blocks only ever hit case 4, once per dirty block, and it's the case worth walking through anyway because it's the one that splits an entry. So let's take them one at a time, starting with `D'` at block 3:
+Our eight blocks only ever hit case 3, once per dirty block, and it's the case worth walking through anyway because it's the one that splits an entry. So let's take them one at a time, starting with `D'` at block 3:
 
 ```text
-step 1, one base entry covering everything
+Step 1:  one base entry covering everything
 
   block:       0       1       2       3       4       5       6       7
            ┌───────┬───────┬───────┬───────┬───────┬───────┬───────┬───────┐
@@ -257,7 +243,7 @@ step 1, one base entry covering everything
   owner:   └─────────────────────────────base──────────────────────────────┘
   entry:   └───────────────────────────────0───────────────────────────────┘
 
-step 2, diff-a's block 3 lands inside it and splits it
+Step 2:  diff-a's block 3 lands inside it and splits it
 
   block:       0       1       2       3       4       5       6       7
            ┌───────┬───────┬───────┬───────┬───────┬───────┬───────┬───────┐
@@ -270,7 +256,7 @@ step 2, diff-a's block 3 lands inside it and splits it
                                                │  advanced to 4,
                                                │  not left at 0
 
-step 3, diff-a's block 5 splits the right piece again
+Step 3:  diff-a's block 5 splits the right piece again
 
   block:       0       1       2       3       4       5       6       7
            ┌───────┬───────┬───────┬───────┬───────┬───────┬───────┬───────┐
