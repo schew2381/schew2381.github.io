@@ -245,8 +245,6 @@ A BASE ENTRY MEETING A DIFF ENTRY, ALL SIX WAYS
              base keeps its left, and the diff isn't finished yet
 ```
 
-The `carried` row is what makes this work. An entry is only safe to write once nothing further right can overwrite it, so whichever side reaches further stays behind for the next comparison, trimmed down to the part still uncovered.
-
 Our eight blocks only ever hit case 4, once per dirty block, and it's the case worth walking through anyway because it's the one that splits an entry. So let's take them one at a time, starting with `D'` at block 3:
 
 ```text
