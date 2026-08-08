@@ -163,9 +163,9 @@ Since we only have a single entry where the virtual and physical offsets are the
 
 ### One snapshot
 
-Now boot the sandbox and write to blocks 3 and 5. Those writes land in the write cache and don't go anywhere near S3, and it's only when the sandbox actually stops that we take the write cache contents and upload them.
+Now let's boot the sandbox and write to blocks 3 and 5. Those writes land in the write cache initially and are only written to S3 when the sandbox actually stops.
 
-Two dirty blocks means `diff-a`'s data file is two blocks long, packed end to end, and that packing is where the two offsets stop agreeing:
+Now that we have two dirty blocks, the snapshot `diff-a` contains those two blocks packed together:
 
 ```text
 s3://templates/diff-a/rootfs.ext4, 2 blocks on disk (not 8)
@@ -192,9 +192,59 @@ That covers two blocks out of eight. If you ask this mapping about block 2 it ha
 
 ### Merging
 
-`MergeMappings` walks the base mapping and the diff mapping in lockstep and produces one mapping that covers all eight blocks with no gaps. Six overlap cases show up in the code, which is five more than the interesting one. The one worth looking at is a diff entry landing strictly inside a base entry, because it splits the base in two.
+So now we have two mappings that each describe part of the image, and neither one can serve a read by itself. Pausing the sandbox is where they get combined: [`MergeMappings`](https://github.com/e2b-dev/infra/blob/da099cf305df080abd16b964ff8b664736ee6d34/packages/shared/pkg/storage/header/mapping.go#L78) takes the parent's mapping and the new diff's, and returns one mapping covering all eight blocks with no gaps. That merged result is what gets written as `diff-a`'s header.
 
-It happens twice here, once per dirty block. Take them one at a time, starting with `D'` at block 3:
+It walks the two mappings in lockstep, and at each step it's holding one entry from each side and asking how they overlap. There are only six answers, since two entries on a line can either miss each other or overlap in one of four ways:
+
+```text
+ONE DIFF ENTRY MEETING ONE BASE ENTRY, ALL SIX WAYS
+
+  1  no overlap, base ends first
+  base    ├────────────┤
+  diff                         ├────────────┤
+  done    ├────────────┤
+  held                         ├────────────┤   (diff)
+          nothing later can touch base, so it's done
+
+  2  no overlap, diff ends first
+  base                         ├────────────┤
+  diff    ├────────────┤
+  done    ├────────────┤
+  held                         ├────────────┤   (base)
+          same thing from the other side
+
+  3  base sits inside diff
+  base                ├─────────┤
+  diff          ├────────────────────────┤
+  done    nothing
+  held          ├────────────────────────┤   (diff)
+          the diff overwrote all of base, so base is dropped entirely
+
+  4  diff sits inside base
+  base    ├─────────────────────────────────┤
+  diff                ├──────┤
+  done    ├─────────┤ ├──────┤
+  held                         ├────────────┤   (base)
+          base splits in two, and only its left half is done
+
+  5  diff hangs off base's left
+  base                ├─────────────────────┤
+  diff    ├──────────────────┤
+  done    ├──────────────────┤
+  held                         ├────────────┤   (base)
+          base's left is overwritten, and its right waits for the next diff
+
+  6  diff hangs off base's right
+  base    ├─────────────────────┤
+  diff                ├─────────────────────┤
+  done    ├─────────┤
+  held                ├─────────────────────┤   (diff)
+          base's left is done, and the diff waits for the next base entry
+```
+
+The `held` row is what makes this work. An entry only gets written out once nothing further along can overwrite it, so whichever side reaches further right stays behind for the next comparison, sometimes trimmed down to the part that's still uncovered.
+
+Our eight blocks only ever hit case 4, once per dirty block, and it's the case worth walking through anyway because it's the one that splits an entry. So let's take them one at a time, starting with `D'` at block 3:
 
 ```text
 step 1, one base entry covering everything
