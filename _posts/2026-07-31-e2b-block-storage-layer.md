@@ -205,28 +205,28 @@ A BASE ENTRY MEETING A DIFF ENTRY, ALL FOUR WAYS
   Case 1: they don't overlap
   base       └──── base ─────┘
   diff                                       └──── diff ─────┘
-             ──────────────────── merge ▼ ────────────────────
+                                  merge ▼
   result     └──── base ─────┘               └──── diff ─────┘
              no contested blocks, so both entries survive untouched
 
   Case 2: base falls inside diff
   base                       └──── base ─────┘
   diff               └──────────── diff ─────────────┘
-             ──────────────────── merge ▼ ────────────────────
+                                  merge ▼
   result             └──────────── diff ─────────────┘
              the diff covers every block base had, so base disappears
 
   Case 3: diff falls inside base
   base       └──────────────────── base ─────────────────────┘
   diff                       └──── diff ─────┘
-             ──────────────────── merge ▼ ────────────────────
+                                  merge ▼
   result     └──── base ─────┴──── diff ─────┴──── base ─────┘
              base splits in two around the diff, giving three entries
 
   Case 4: they overlap at one edge
   base                       └──────────── base ─────────────┘
   diff       └──────────── diff ─────────────┘
-             ──────────────────── merge ▼ ────────────────────
+                                  merge ▼
   result     └──────────── diff ─────────────┴──── base ─────┘
              base gives up blocks 2 and 3 and keeps the rest
 ```
