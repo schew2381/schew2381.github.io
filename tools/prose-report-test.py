@@ -45,6 +45,17 @@ SIGNPOST: list[tuple[str, bool]] = [
     ("So let's run that image through a build and then a snapshot.", False),
 ]
 
+# True means the question is filler under a heading rather than a real hook.
+HEADING_Q: list[tuple[str, bool]] = [
+    ("How does the header work?", True),
+    ("So what is a build map?", True),
+    ("Why does any of this matter?", True),
+    # A question naming a specific case the section goes on to trace.
+    ("What happens when you create a new build off another diff instead of the base?", False),
+    ("What happens if the sandbox dies before writeback runs?", False),
+    ("How many round trips does a `git status` cost?", False),
+]
+
 READING: list[tuple[str, bool]] = [
     ("Read on for the rest of the header.", True),
     ("It's worth going slowly here.", True),
@@ -292,6 +303,11 @@ def main() -> int:
         if flagged != expected:
             failures.append(f"signpost {text!r} is {flagged}, want {expected}")
 
+    for text, expected in HEADING_Q:
+        flagged = report.TRACEABLE_QUESTION.search(text) is None
+        if flagged != expected:
+            failures.append(f"rhetorical-heading {text!r} is {flagged}, want {expected}")
+
     for text, expected in READING:
         flagged = any(re.search(p, text.lower()) for p in report.READING_INSTRUCTIONS)
         if flagged != expected:
@@ -389,7 +405,7 @@ def main() -> int:
     for failure in failures:
         print(f"FAIL  {failure}")
     checks = (
-        len(SPLITS) + len(SIGNPOST) + len(READING) + len(ANNOUNCES) + len(SPEC_SHEET) + len(COLON)
+        len(SPLITS) + len(SIGNPOST) + len(HEADING_Q) + len(READING) + len(ANNOUNCES) + len(SPEC_SHEET) + len(COLON)
         + len(SEAM_OPENER) + len(ECHO) + len(PIVOT) + len(CONTRACT) + len(PINNED)
         + len(PILEUP) + len(SPLICE) + len(DEFINITION) + len(SELF_REF) + len(STATED)
         + len(CONDITIONAL) + len(COUNTED) + 2 + len(posts)

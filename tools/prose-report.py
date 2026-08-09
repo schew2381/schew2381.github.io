@@ -326,6 +326,15 @@ SIGNPOSTS = [
     r"as (we|you) (can see|mentioned earlier)", r"first, let's",
 ]
 
+# `What happens when you build off a diff instead of the base?` names a specific
+# case the section then traces, which is a hook. `How does merging work?` names
+# the heading again, which is the filler the check is looking for.
+TRACEABLE_QUESTION = re.compile(
+    r"\b(?:instead\s+of|rather\s+than|when\s+(?:you|we|it|a|the)|if\s+(?:you|we|it|a|the)"
+    r"|what\s+happens\s+(?:to|when|if)|how\s+(?:many|much|often|long)|which\s+one)\b",
+    re.I,
+)
+
 READING_INSTRUCTIONS = [
     r"worth going slowly", r"bear with me", r"stay with me",
     r"it's worth noting", r"as we'll see",
@@ -820,7 +829,7 @@ def check_judgment(post: Post) -> list[Finding]:
     for section in post.sections:
         if section.words > 400:
             found.append(Finding(section.line, "judgment", "long-section", f"{section.words}w  {section.title}"))
-        if section.opener.endswith("?"):
+        if section.opener.endswith("?") and not TRACEABLE_QUESTION.search(section.opener):
             found.append(Finding(section.line, "judgment", "rhetorical-heading", short(section.opener)))
 
     for fence in post.fences:

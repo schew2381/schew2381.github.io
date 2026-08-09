@@ -412,6 +412,12 @@ Things to avoid, on top of the banned lists below:
 - Rhetorical questions as section openers ("How does X work?"). A
   question in the post's opening hook is fine and often better than an
   assertion. Under a heading, it reads as filler.
+
+  The exception is a question naming a specific case the section then
+  traces. "What happens when you build off a diff instead of the base?"
+  sets up a walkthrough, so it earns its place the same way a "let's"
+  naming the actual work does. "How does merging work?" only says the
+  heading again.
 - Tutorial voice ("Let's explore...", "Consider a scenario where..."). A
   "let's" naming the actual work is fine, because "let's follow one
   update through both engines" tells the reader what happens next. "Let's

@@ -288,8 +288,6 @@ Those five entries are what gets uploaded as `diff-a`'s header. `Offset` is the 
 | 5 | 1 | diff-a | 1 |
 | 6 | 2 | base | 6 |
 
-That last row is where a bug would live. It starts at virtual block 6, and its `BuildStorageOffset` has to be 6 as well. That's where `G` actually sits inside the base data file. Copy the original entry's physical 0 into the right-hand piece instead and reads of blocks 6 and 7 quietly come back as `A` and `B`.
-
 ### Reading one block
 
 To read a specific block, you have to find which entry your block lives inside. We can do that with a binary search over the `Offset` column, which gives us the header entry containing that block. So taking the example from before, let's search for block 5:
@@ -297,39 +295,64 @@ To read a specific block, you have to find which entry your block lives inside. 
 ```text
   header entry index:    0     1     2     3     4
   Offset:                0     3     4     5     6
-
-  binary search over Offsets for block 5   ->   index 3
-
-  which build        diff-a
-  physical offset    BuildStorageOffset 1
-  length available   1 block
+                                     ▲
+                                     └── block 5 lands here, index 3
 ```
 
-Read that as: open `s3://templates/diff-a/rootfs.ext4` and take one block starting at block 1. Those bytes are `F'`. Ask for block 6 instead and the search lands on index 4, giving physical block 6 of the base file, which is `G`. Same call, different object, and the caller never had to know which.
+That entry tells us everything we need to go fetch the bytes, and asking for block 6 instead lands on index 4 and resolves against a different object entirely:
+
+| block we want | which build | where in that build | how far the entry runs | bytes |
+|---|---|---|---|---|
+| 5 | `diff-a` | block 1 | 1 block | `F'` |
+| 6 | `base` | block 6 | 2 blocks | `G`, `H` |
 
 ### Keeping the entry count down
 
 Right after merging, `NormalizeMappings` runs over the result and joins any neighbouring entries it safely can. Our five come out untouched, since they alternate between `base` and `diff-a` and no two neighbours share a build.
 
-For two entries to join they have to name the same build and sit next to each other inside that build's data file, not just inside the virtual image. Two `base` entries covering virtual blocks 6 and 7 join if their bytes are at physical 6 and 7, and don't if the bytes are at physical 6 and 9. Joining that second pair would send the block 7 read to physical 7 and hand back whatever happens to live there.
+But say the sandbox had written to blocks 3 and 4 instead of 3 and 5. Then `diff-a` would hold `D'` at block 0 and `E'` at block 1, and the merge would produce two neighbouring entries that do collapse into one:
+
+```text
+  before                                    after
+
+  Offset  Length  BuildId  Storage          Offset  Length  BuildId  Storage
+       3       1   diff-a        0               3       2   diff-a        0
+       4       1   diff-a        1
+```
+
+Two entries join when both of these hold:
+
+1. They name the same `BuildId`.
+2. Their bytes sit next to each other inside that build's data file, so the second one's `BuildStorageOffset` is exactly where the first one ends.
+
+Rule 2 is the one that's easy to lose, since being neighbours in the virtual image says nothing about being neighbours in a packed data file. Move `E'` to block 5 of the data file and the two entries stay separate. Joining them would send the block 4 read to block 1 and hand back whatever lives there.
 
 Without this step the array only ever grows since every snapshot splits entries, and a long-lived sandbox ends up carrying thousands of them.
 
 ## Diff chains
 
-Storing a full UUID in every entry only pays off once a mapping names more than two builds, and that's exactly what happens on the second snapshot.
+What happens when you create a new build off another diff instead of off the original base build?
 
-So let's resume the paused sandbox, write to block 7, and pause it again. `diff-b` uploads that one block, and its mapping merges over `diff-a`'s the same way `diff-a`'s merged over the base:
+Let's walk through the same example by resuming the paused sandbox, writing to block 7, and pausing again to upload a new build to S3:
 
 ```text
-  block:       0       1       2       3       4       5       6       7
+  diff-b  s3://templates/diff-b/rootfs.ext4, 1 block on disk
+
+  blocks:      0
+           ┌───────┐
+           │  H'   │
+           └───────┘
+
+  the virtual image after diff-b's mapping merges over diff-a's
+
+  blocks:      0       1       2       3       4       5       6       7
            ┌───────┬───────┬───────┬───────┬───────┬───────┬───────┬───────┐
            │   A   │   B   │   C   │  D'   │   E   │  F'   │   G   │  H'   │
            └───────┴───────┴───────┴───────┴───────┴───────┴───────┴───────┘
   owner:   └─────────base──────────┴─diff-a┴─base──┴─diff-a┴─base──┴─diff-b┘
 ```
 
-Now three builds back one filesystem. Reading block 3 opens `diff-a`, block 7 opens `diff-b`, and the other six come from `base`. The guest sees one flat filesystem the whole time, and none of the three objects had to be rewritten to make it happen.
+Now three builds back one filesystem. Reading blocks 3 and 5 opens `diff-a`, block 7 opens `diff-b`, and the other five come from `base`. The guest sees one flat filesystem the whole time.
 
 ## The chunker
 
