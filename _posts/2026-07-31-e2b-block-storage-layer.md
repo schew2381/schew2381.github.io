@@ -181,20 +181,20 @@ s3://templates/diff-a/rootfs.ext4, 2 blocks on disk (not 8)
 
 `D'` is virtual block 3 living at physical block 0, and `F'` is virtual block 5 living at physical block 1. The data file records neither fact. It's two blocks with no structure and no idea where its contents belong, which leaves the recording to the header.
 
-Here's `diff-a`'s own mapping, with the virtual offset on the left and the physical one on the right:
+Turning that bitmap into entries gives two of them, one per dirty block:
 
 ```text
 BuildMap[0] = {Offset: 3, Length: 1, BuildId: diff-a, BuildStorageOffset: 0}
 BuildMap[1] = {Offset: 5, Length: 1, BuildId: diff-a, BuildStorageOffset: 1}
 ```
 
-That covers two blocks out of eight. If you ask this mapping about block 2 it has nothing to say, which is why it can't serve a read on its own.
+This pair never reaches S3 as-is. It only covers two blocks out of eight, so asking it about block 2 gets you nothing. It becomes a header only once it's merged with the parent's mapping.
 
 ### Merging
 
 So now we have two mappings that each describe part of the image, and neither one can serve a read by itself. Pausing the sandbox is where they get combined: [`MergeMappings`](https://github.com/e2b-dev/infra/blob/da099cf305df080abd16b964ff8b664736ee6d34/packages/shared/pkg/storage/header/mapping.go#L78) takes the parent's mapping and the new diff's, and returns one mapping covering all eight blocks with no gaps. That merged result is what gets written as `diff-a`'s header.
 
-It walks the two mappings in lockstep, holding one entry from each side and asking how the two overlap. There are only four answers, and the diff wins every contested block in all of them. That leaves one question per case, which is what survives of the base entry. The grid below is the same six blocks every time, so the bars are directly comparable:
+The diagram below shows the four cases of how a base entry and a diff entry might overlap. In all of them, the diff overwrites the base:
 
 ```text
 A BASE ENTRY MEETING A DIFF ENTRY, ALL FOUR WAYS
@@ -231,7 +231,7 @@ A BASE ENTRY MEETING A DIFF ENTRY, ALL FOUR WAYS
              base gives up blocks 2 and 3 and keeps the rest
 ```
 
-Our eight blocks only ever hit case 3, once per dirty block, and it's the case worth walking through anyway because it's the one that splits an entry. So let's take them one at a time, starting with `D'` at block 3:
+Taking a closer look at case 3, let's walk through our example where `diff-a` overwrites blocks `D` and `F`:
 
 ```text
 Step 1:  one base entry covering everything
@@ -251,10 +251,6 @@ Step 2:  diff-a's block 3 lands inside it and splits it
            └───────┴───────┴───────┴───────┴───────┴───────┴───────┴───────┘
   owner:   └─────────base──────────┴─diff──┴─────────────base──────────────┘
   entry:   └───────────0───────────┴───1───┴───────────────2───────────────┘
-                                               ▲
-                                               │  physical offset
-                                               │  advanced to 4,
-                                               │  not left at 0
 
 Step 3:  diff-a's block 5 splits the right piece again
 
@@ -264,19 +260,35 @@ Step 3:  diff-a's block 5 splits the right piece again
            └───────┴───────┴───────┴───────┴───────┴───────┴───────┴───────┘
   owner:   └─────────base──────────┴─diff──┴─base──┴─diff──┴─────base──────┘
   entry:   └───────────0───────────┴───1───┴───2───┴───3───┴───────4───────┘
+
+Step 4:  the two builds those entries point into
+
+  s3://templates/base/rootfs.ext4, 8 blocks on disk
+
+  block:       0       1       2       3       4       5       6       7
+           ┌───────┬───────┬───────┬───────┬───────┬───────┬───────┬───────┐
+           │   A   │   B   │   C   │   D   │   E   │   F   │   G   │   H   │
+           └───────┴───────┴───────┴───────┴───────┴───────┴───────┴───────┘
+
+  s3://templates/diff-a/rootfs.ext4, 2 blocks on disk
+
+  block:       0       1
+           ┌───────┬───────┐
+           │  D'   │  F'   │
+           └───────┴───────┘
 ```
 
-Five entries, both offsets spelled out:
+Those five entries are what gets uploaded as `diff-a`'s header. `Offset` is the reader's view of the filesystem, and `BuildStorageOffset` is the source of truth for where that block actually sits inside `BuildId`'s data file in S3:
 
-| entry | starts at block | blocks | build | physical block |
-|---|---|---|---|---|
-| 0 | 0 | 3 | base | 0 |
-| 1 | 3 | 1 | diff-a | 0 |
-| 2 | 4 | 1 | base | 4 |
-| 3 | 5 | 1 | diff-a | 1 |
-| 4 | 6 | 2 | base | 6 |
+| Offset | Length | BuildId | BuildStorageOffset |
+|---|---|---|---|
+| 0 | 3 | base | 0 |
+| 3 | 1 | diff-a | 0 |
+| 4 | 1 | base | 4 |
+| 5 | 1 | diff-a | 1 |
+| 6 | 2 | base | 6 |
 
-Entry 4 is where a bug would live. It starts at virtual block 6, and its physical block has to be 6 as well. That's where `G` actually sits inside the base data file. Copy the original entry's physical 0 into the right-hand piece instead and reads of blocks 6 and 7 quietly come back as `A` and `B`.
+That last row is where a bug would live. It starts at virtual block 6, and its `BuildStorageOffset` has to be 6 as well. That's where `G` actually sits inside the base data file. Copy the original entry's physical 0 into the right-hand piece instead and reads of blocks 6 and 7 quietly come back as `A` and `B`.
 
 So the split has to advance the physical offset by exactly as much virtual space as it skipped over:
 

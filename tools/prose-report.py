@@ -489,7 +489,9 @@ SELF_REFERENCE = re.compile(
     # A bare `below` points at the page. `below the header` points at a thing.
     r"|\beverything\s+(?:below|above)\s+(?:is|was|here|else)\b"
     r"|\beverything\s+that\s+follows\b"
-    r"|\bthe\s+(?:section|paragraph|table|diagram|example)\s+(?:below|above)\b"
+    # A section or paragraph is the post's own furniture. A diagram or table is
+    # a thing on the page, so pointing at one is ordinary deixis.
+    r"|\bthe\s+(?:section|paragraph)\s+(?:below|above)\b"
     r"|\bthis\s+(?:post|section)\s+(?:is\s+about|covers|walks|explains)\b"
     r"|\b(?:earlier|later)\s+in\s+(?:this|the)\s+post\b",
     re.I,

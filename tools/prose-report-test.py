@@ -241,6 +241,9 @@ SELF_REF: list[tuple[str, bool]] = [
     ("Part 3 covers the node-shared read cache and why it's safe.", False),
     ("Everything below `overlay` is Part 1 unchanged.", False),
     ("The block below the header is where the data lives.", False),
+    # A diagram or table is an artifact on the page, not the post's furniture.
+    ("The diagram below shows the four cases of how they might overlap.", False),
+    ("The table above spells both offsets out.", False),
 ]
 
 STATED: list[tuple[str, bool]] = [
