@@ -584,7 +584,10 @@ SPLICE = re.compile(
 # one the grammar asks for: `When the transaction finishes, nothing changes.`
 LEADING_CLAUSE = re.compile(
     r"^(?:so\s+)?(?:when|if|once|after|before|while|until|unless|since|because|as|although"
-    r"|though|given|assuming|whenever|now\s+that|even\s+(?:if|though)|\w+ing)\b",
+    r"|though|given|assuming|whenever|now\s+that|even\s+(?:if|though)|\w+ing"
+    # `To read a block, you have to find its entry.` A purpose clause, where the
+    # comma closing it is the one the grammar asks for.
+    r"|to\s+\w+)\b",
     re.I,
 )
 

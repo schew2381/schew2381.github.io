@@ -261,18 +261,18 @@ Step 3:  diff-a's block 5 splits the right piece again
   owner:   └─────────base──────────┴─diff──┴─base──┴─diff──┴─────base──────┘
   entry:   └───────────0───────────┴───1───┴───2───┴───3───┴───────4───────┘
 
-Step 4:  the two builds those entries point into
+Step 4:  the new diff-a build is uploaded to S3, alongside the base
 
-  s3://templates/base/rootfs.ext4, 8 blocks on disk
+  base    s3://templates/base/rootfs.ext4, 8 blocks on disk
 
-  block:       0       1       2       3       4       5       6       7
+  blocks:      0       1       2       3       4       5       6       7
            ┌───────┬───────┬───────┬───────┬───────┬───────┬───────┬───────┐
            │   A   │   B   │   C   │   D   │   E   │   F   │   G   │   H   │
            └───────┴───────┴───────┴───────┴───────┴───────┴───────┴───────┘
 
-  s3://templates/diff-a/rootfs.ext4, 2 blocks on disk
+  diff-a  s3://templates/diff-a/rootfs.ext4, 2 blocks on disk
 
-  block:       0       1
+  blocks:      0       1
            ┌───────┬───────┐
            │  D'   │  F'   │
            └───────┴───────┘
@@ -290,94 +290,36 @@ Those five entries are what gets uploaded as `diff-a`'s header. `Offset` is the 
 
 That last row is where a bug would live. It starts at virtual block 6, and its `BuildStorageOffset` has to be 6 as well. That's where `G` actually sits inside the base data file. Copy the original entry's physical 0 into the right-hand piece instead and reads of blocks 6 and 7 quietly come back as `A` and `B`.
 
-So the split has to advance the physical offset by exactly as much virtual space as it skipped over:
-
-```go
-rightBaseShift := int64(diff.Offset) + int64(diff.Length) - int64(base.Offset)
-rightBaseLength := int64(base.Length) - rightBaseShift
-
-if rightBaseLength > 0 {
-	baseMapping[baseIdx] = BuildMap{
-		Offset:             base.Offset + uint64(rightBaseShift),
-		Length:             uint64(rightBaseLength),
-		BuildId:            base.BuildId,
-		BuildStorageOffset: base.BuildStorageOffset + uint64(rightBaseShift),
-	}
-}
-```
-[mapping.go:163](https://github.com/e2b-dev/infra/blob/da099cf305df080abd16b964ff8b664736ee6d34/packages/shared/pkg/storage/header/mapping.go#L163)
-
-Both offsets move by the same `rightBaseShift`, which is the invariant the whole format rests on. If it breaks, reads silently start returning other people's data without raising any errors.
-
 ### Reading one block
 
-Those five entries are sorted and cover the image with no gaps between them, so any block you name is owned by exactly one of them. Finding that one entry is the whole read path, and it comes down to asking which entry is the last one starting at or before the block we want.
-
-That's a binary search over the entry start offsets, which for our five entries are `[0, 3, 4, 5, 6]`. Say the guest asks for block 5, one of the two the sandbox dirtied:
+To read a specific block, you have to find which entry your block lives inside. We can do that with a binary search over the `Offset` column, which gives us the header entry containing that block. So taking the example from before, let's search for block 5:
 
 ```text
-  index:      0    1    2    3    4
-  starts at:  0    3    4    5    6
-                             ▲
-                             │  block 5 is in here
+  header entry index:    0     1     2     3     4
+  Offset:                0     3     4     5     6
 
-  step 1   lo=0  hi=5   mid=2   starts[2]=4 > 5 ?   no    lo = 3
-  step 2   lo=3  hi=5   mid=4   starts[4]=6 > 5 ?   yes   hi = 4
-  step 3   lo=3  hi=4   mid=3   starts[3]=5 > 5 ?   no    lo = 4
+  binary search over Offsets for block 5   ->   index 3
 
-  answer: index 4
-```
-
-`SearchOffset` answers a slightly different question than the one we asked. It returns where block 5 *would be inserted*, which is index 4, so the entry that owns block 5 is the one before it:
-
-```go
-i := t.Mapping.SearchOffset(offset)
-if i == 0 {
-	return BuildMap{}, 0, fmt.Errorf("no source found for offset %d", offset)
-}
-
-mapping := t.Mapping.At(i - 1)
-shift := offset - int64(mapping.Offset)
-```
-[header.go:239](https://github.com/e2b-dev/infra/blob/da099cf305df080abd16b964ff8b664736ee6d34/packages/shared/pkg/storage/header/header.go#L239)
-
-An index of 0 would mean the address sits below the first entry, which can't happen in a gapless mapping. So it's an error rather than an index of -1.
-
-Entry 3 is `diff-a` at physical block 1, and our request starts exactly where the entry does, so `shift` is 0. `GetShiftedMapping` wraps all of that up and hands the caller three things:
-
-```text
   which build        diff-a
-  physical offset    block 1 + shift 0   =   block 1
-  length available   1 block - shift 0   =   1 block
+  physical offset    BuildStorageOffset 1
+  length available   1 block
 ```
 
-Read that as: open `s3://templates/diff-a/rootfs.ext4` and take one block starting at block 1. Those bytes are `F'`. Ask for block 6 instead and the same search lands on entry 4, giving physical block 6 of the base file, which is `G`. Same call, different object, and the caller never had to know which.
-
-That third value is the one that's easy to ignore and expensive to get wrong. A caller asking for four blocks starting at block 5 gets told one block is available, because block 6 lives in a different S3 object entirely. It has to stop at the boundary, resolve again, and fetch the rest from the base file. Every layer above this one loops for that reason, and Part 3 gets to skip the loop by indexing its cache differently.
+Read that as: open `s3://templates/diff-a/rootfs.ext4` and take one block starting at block 1. Those bytes are `F'`. Ask for block 6 instead and the search lands on index 4, giving physical block 6 of the base file, which is `G`. Same call, different object, and the caller never had to know which.
 
 ### Keeping the entry count down
 
-A build ID of `uuid.Nil` is the cheap case, meaning the range is all zeros with no object to open, so the reader zero-fills the buffer and moves on. A sandbox that wiped a gigabyte of scratch space uploads one mapping entry and no bytes at all for it, and it still reads back as zeros.
+Right after merging, `NormalizeMappings` runs over the result and joins any neighbouring entries it safely can. Our five come out untouched, since they alternate between `base` and `diff-a` and no two neighbours share a build.
 
-Everything else accumulates. That entry array grows by a few entries per snapshot until a long-lived sandbox is carrying thousands of them. `NormalizeMappings` joins neighbours to keep the count down, on a condition stricter than sharing a build ID. Their physical offsets have to line up too:
+For two entries to join they have to name the same build and sit next to each other inside that build's data file, not just inside the virtual image. Two `base` entries covering virtual blocks 6 and 7 join if their bytes are at physical 6 and 7, and don't if the bytes are at physical 6 and 9. Joining that second pair would send the block 7 read to physical 7 and hand back whatever happens to live there.
 
-```go
-storageContiguous := mp.BuildId == ignoreBuildID ||
-	mp.BuildStorageOffset == current.BuildStorageOffset+current.Length
-if mp.BuildId == current.BuildId && storageContiguous {
-	current.Length += mp.Length
-```
-[mapping.go:256](https://github.com/e2b-dev/infra/blob/da099cf305df080abd16b964ff8b664736ee6d34/packages/shared/pkg/storage/header/mapping.go#L256)
-
-Sitting next to each other in the virtual image says nothing about sitting next to each other in a packed data file. Picture one `base` entry covering virtual blocks 0 through 2 from physical 0, and the next covering virtual block 3 from physical 9. Adjacent virtually, six blocks apart physically, so a joined entry would send that last read to physical 3 and hand back the wrong contents. Same failure as a bad split, and just as silent.
-
-So the format comes down to a metadata record, a sorted array, and a binary search with a `- 1` on the end, and it buys considerably more than the eight blocks it took to explain.
+Without this step the array only ever grows since every snapshot splits entries, and a long-lived sandbox ends up carrying thousands of them.
 
 ## Diff chains
 
-Nothing in the example so far justifies storing a build ID in every entry, since two builds could have been a boolean. It's a UUID because one mapping can name as many builds as it likes, and that's what makes the second snapshot as cheap as the first.
+Storing a full UUID in every entry only pays off once a mapping names more than two builds, and that's exactly what happens on the second snapshot.
 
-Resume the paused sandbox, let it write to block 7, and pause it again. `diff-b` uploads one block, its mapping merges over the previous generation's mapping exactly the way `diff-a`'s merged over the base, and now three objects back one filesystem:
+So let's resume the paused sandbox, write to block 7, and pause it again. `diff-b` uploads that one block, and its mapping merges over `diff-a`'s the same way `diff-a`'s merged over the base:
 
 ```text
   block:       0       1       2       3       4       5       6       7
@@ -387,9 +329,7 @@ Resume the paused sandbox, let it write to block 7, and pause it again. `diff-b`
   owner:   └─────────base──────────┴─diff-a┴─base──┴─diff-a┴─base──┴─diff-b┘
 ```
 
-Reading block 3 opens `diff-a`, block 7 opens `diff-b`, and the other six come from the base build. The guest sees one flat filesystem and has no idea it's a view stitched from three objects, none of which were rewritten to make it happen.
-
-Each pause bumps `Generation`, mints a new `BuildID`, and leaves `BaseBuildID` pointing at the root. Any header therefore knows both who it is and where its chain started, which is what a rebase pass would need to flatten a long chain back into one object.
+Now three builds back one filesystem. Reading block 3 opens `diff-a`, block 7 opens `diff-b`, and the other six come from `base`. The guest sees one flat filesystem the whole time, and none of the three objects had to be rewritten to make it happen.
 
 ## The chunker
 
@@ -586,7 +526,7 @@ Any of the three flips a `fallback` flag and the export finishes with `io.Copy`,
 
 Step 5 turns the bitmap back into mapping entries. Every contiguous run of set bits becomes one `BuildMap` whose `BuildStorageOffset` counts up through the diff file in the order the ranges were written, which is precisely the packed layout from the worked example. Those entries merge onto the parent's mapping, normalize, and the generation goes up by one.
 
-Zero blocks take the `uuid.Nil` path from earlier. A sandbox that filled 2 GiB of scratch space and then deleted it uploads nothing for that range. The mapping entry says "this range is zeros" instead of object storage holding 2 GiB of them.
+Zero blocks get a `BuildId` of `uuid.Nil`, which tells the reader to zero-fill the buffer without opening any object at all. So a sandbox that filled 2 GiB of scratch space and then deleted it uploads one mapping entry and no bytes, rather than 2 GiB of zeros.
 
 ## Trade-offs
 

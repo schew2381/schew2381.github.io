@@ -219,6 +219,7 @@ SPLICE: list[tuple[str, str | None]] = [
     # The comma closes a leading subordinate clause, so it's the one grammar asks for.
     ("When the last interested transaction finishes, nothing about the tuple changes.", None),
     ("Knowing that, it can convert the head into a redirect without consulting an index.", None),
+    ("To read a specific block, you have to find which entry it lives inside.", None),
     # A series, where every comma is punctuating a list item.
     ("Five entries, both offsets spelled out, and no gaps between them.", None),
 ]
