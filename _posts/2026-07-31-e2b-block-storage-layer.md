@@ -325,8 +325,6 @@ Two entries join when both of these hold:
 1. They name the same `BuildId`.
 2. Their bytes sit next to each other inside that build's data file, so the second one's `BuildStorageOffset` is exactly where the first one ends.
 
-Rule 2 is the one that's easy to lose, since being neighbours in the virtual image says nothing about being neighbours in a packed data file. Move `E'` to block 5 of the data file and the two entries stay separate. Joining them would send the block 4 read to block 1 and hand back whatever lives there.
-
 Without this step the array only ever grows since every snapshot splits entries, and a long-lived sandbox ends up carrying thousands of them.
 
 ## Diff chains
@@ -356,7 +354,7 @@ Now three builds back one filesystem. Reading blocks 3 and 5 opens `diff-a`, blo
 
 ## The chunker
 
-`build.File` can resolve any virtual offset to a build and a physical offset, which is enough to serve a read and nowhere near enough to serve a filesystem. Ask it for one block and it fetches exactly one block. So a `git status` walking a source tree turns into thousands of independent HTTPS round trips, each paying full S3 latency to move 4 KiB:
+`build.File` can resolve any virtual offset to a build and a physical offset, which is enough to serve a read and nowhere near enough to serve a filesystem. Fetching each block individually would turn a few mebibytes of reading into thousands of separate round trips to S3:
 
 ```text
   per block                              per 4 MiB chunk
@@ -369,7 +367,7 @@ Now three builds back one filesystem. Reading blocks 3 and 5 opens `diff-a`, blo
   1024 round trips                       1 round trip
 ```
 
-The bet is that filesystem reads cluster, so the chunker refuses to think in blocks at all and works in 4 MiB units:
+Filesystem reads tend to cluster, so the chunker refuses to think in blocks and instead works in 4 MiB units:
 
 ```go
 // MemoryChunkSize must always be bigger or equal to the block size.
@@ -377,31 +375,24 @@ MemoryChunkSize = 4 * 1024 * 1024 // 4 MB
 ```
 [storage.go:42](https://github.com/e2b-dev/infra/blob/da099cf305df080abd16b964ff8b664736ee6d34/packages/shared/pkg/storage/storage.go#L42)
 
-Ten readers can want the same chunk at once, though, and the obvious fix makes things worse. Collapse them into one fetch, wake everybody when it lands, and the reader who only wanted the first 4 KiB waits on all 4 MiB.
+That trade only works if a reader wanting 4 KiB doesn't have to wait for all 4 MiB to land. So instead of waking everyone when the fetch completes, the chunker tracks how far it's got in an atomic `bytesReady` and releases each reader the moment its own block is written.
 
-So the chunker releases readers as their bytes arrive instead. Each in-flight chunk gets a `fetchSession` holding waiters sorted by the offset they need, plus an atomic `bytesReady` counter:
+Say three readers ask for the same chunk at once, wanting blocks near the start, a third of the way in, and near the end. The fetch reads from S3 in 16 KiB batches, bumping `bytesReady` after each one:
 
 ```text
-one 4 MiB chunk fetch
+ONE 4 MiB CHUNK, FETCHED 16 KiB AT A TIME
 
-  bytesReady ─────────────>
-  ┌────────────────────────┬───────────────────────────┐
-  │ written to mmap        │ not fetched yet           │
-  └────────────────────────┴───────────────────────────┘
-        ▲         ▲                ▲
-        │         │                │
-    waiter A  waiter B         waiter C
-    released  released       still blocked
+  batch:          0       1       2       3       4       5       6       7
+               ┌───────┬───────┬───────┬───────┬───────┬───────┬───────┬───────┐
+               │ done  │ done  │ done  │       │       │       │       │       │
+               └───────┴───────┴───────┴───────┴───────┴───────┴───────┴───────┘
+                                       ▲  bytesReady = 48 KiB
+  waiting on:      A               B                               C
 ```
 
-The fetch loop reads in batches of `max(blockSize, 16 KiB)`, advances `bytesReady` at block granularity, and pops satisfied waiters off the front of the list. A reader waiting on the first block of a chunk gets released after about 16 KiB rather than 4 MiB. On a cold `git status` that's the difference between usable and not.
+Three batches in, `A` and `B` have their bytes and are already gone, while `C` is still parked. Each bump wakes all three readers to compare `bytesReady` against the end of the single block they asked for, so `C` goes straight back to sleep until batch 6 lands.
 
-Two orderings in there only bite under load, and each one is a way for a correct-looking fetch to waste a round trip or lose one.
-
-1. The fetch goroutine runs on `context.WithoutCancel(ctx)`, since otherwise the first caller giving up cancels a fetch four other waiters are depending on.
-2. `runFetch` marks the chunk cached *before* deleting its session from `fetchMap`. The other order leaves a window where a late caller finds no in-flight session and no cached chunk, so it starts a second fetch for bytes already sitting there.
-
-Both of those hazards turn on a chunk being cached, so let's dig into where a cached chunk actually lives.
+The payoff is in that first batch, where a reader wanting the very start of a chunk gets released after roughly 16 KiB instead of 4 MiB. On a cold `git status` that's the difference between usable and not.
 
 ## The cache
 
