@@ -377,7 +377,11 @@ MemoryChunkSize = 4 * 1024 * 1024 // 4 MB
 
 That trade only works if a reader wanting 4 KiB doesn't have to wait for all 4 MiB to land. So instead of waking everyone when the fetch completes, the chunker tracks how far it's got in an atomic `bytesReady` and releases each reader the moment its own block is written.
 
-Say three readers ask for the same chunk at once, wanting blocks near the start, a third of the way in, and near the end. The fetch reads from S3 in 16 KiB batches, bumping `bytesReady` after each one:
+Say three readers ask for the same chunk at once, and the fetch reads it from S3 in 16 KiB batches, bumping `bytesReady` after each one:
+
+1. Reader `A` wants a block in batch 0.
+2. Reader `B` wants a block in batch 2.
+3. Reader `C` wants a block in batch 6.
 
 ```text
 ONE 4 MiB CHUNK, FETCHED 16 KiB AT A TIME
@@ -387,21 +391,19 @@ ONE 4 MiB CHUNK, FETCHED 16 KiB AT A TIME
                │ done  │ done  │ done  │       │       │       │       │       │
                └───────┴───────┴───────┴───────┴───────┴───────┴───────┴───────┘
                                        ▲  bytesReady = 48 KiB
-  waiting on:      A               B                               C
+  reader:          A               B                               C
 ```
 
 Three batches in, `A` and `B` have their bytes and are already gone, while `C` is still parked. Each bump wakes all three readers to compare `bytesReady` against the end of the single block they asked for, so `C` goes straight back to sleep until batch 6 lands.
 
-The payoff is in that first batch, where a reader wanting the very start of a chunk gets released after roughly 16 KiB instead of 4 MiB. On a cold `git status` that's the difference between usable and not.
+## The read cache
 
-## The cache
-
-A cached chunk lives in one file per device, and that file is the same size as the whole image. An 8 GiB image gets an 8 GiB cache file on day one. It's a sparse file, though, so the size is a claim rather than a reservation, and it takes up nothing on disk until something actually writes to it.
+A cached chunk lives in one file per device, the same size as the whole image. It's a sparse file so that size is only a claim, and nothing gets allocated on disk until something writes to it.
 
 Next to it sits a bitmap with one bit per block, saying whether that block has been fetched yet:
 
 ```text
-  the cache file for an 8 GiB image, three blocks in
+  the read cache for an 8 GiB image, three blocks in
 
   block:       0       1       2       3       4       5    ...
            ┌───────┬───────┬───────┬───────┬───────┬───────┐
@@ -410,13 +412,11 @@ Next to it sits a bitmap with one bit per block, saying whether that block has b
   on disk:   4 KiB    ---    4 KiB   4 KiB    ---     ---     = 12 KiB allocated
 ```
 
-Asking the cache for a block whose bit is 0 gets you a `BytesNotAvailableError` rather than a buffer of zeros, which is how the reader above finds out it has to go fetch something.
+That bitmap is how a reader finds out it has to go fetch something, since asking for a block whose bit is 0 returns a `BytesNotAvailableError` rather than a buffer of zeros. The file is also memory-mapped, so the chunker hands S3 a slice of the mapping and the bytes land straight in the cache with no copy in between.
 
-The file is memory-mapped, so the chunker doesn't fetch bytes into a buffer and then copy them into the cache. It hands S3 a slice of the mapping and lets the bytes land directly in the page that already is the cache. Filling the cache and serving a read are the same operation.
+## Copy-on-write using the write cache
 
-## Copy-on-write
-
-None of this is writable yet. The chunker and cache serve reads out of immutable objects, and a sandbox that can't write to its own filesystem isn't much of a sandbox. `block.Overlay` closes that gap by pairing the read-only device with a second cache that only this sandbox can see:
+None of this is writable yet. The chunker and read cache serve reads out of immutable objects, and a sandbox that can't write to its own filesystem isn't much of a sandbox. `block.Overlay` closes that gap by putting a second cache in front of the read side, this one private to a single sandbox:
 
 ```go
 type Overlay struct {
@@ -428,19 +428,19 @@ type Overlay struct {
 ```
 [overlay.go:14](https://github.com/e2b-dev/infra/blob/da099cf305df080abd16b964ff8b664736ee6d34/packages/orchestrator/pkg/sandbox/block/overlay.go#L14)
 
-A read checks that private write cache one block at a time, taking `BytesNotAvailableError` as permission to fall through to the read device underneath. A write doesn't fall through at all, since it just puts the bytes in the cache and stops.
+A read checks the write cache one block at a time, taking `BytesNotAvailableError` as permission to fall through to the read cache underneath. A write doesn't fall through at all, since it just puts the bytes in the write cache and stops:
 
 ```text
-read  block 3 ──> write cache dirty?  ──yes──> serve from write cache
+read  block 3 ──> in the write cache?  ──yes──> serve it from there
                         │
                         no
                         ▼
-                  read device (chunker) ──> object storage
+                  read cache ──> chunker ──> object storage
 
-write block 3 ──> write cache only, mark dirty
+write block 3 ──> write cache only, mark the block dirty
 ```
 
-Notice that the write arrow never touches the read device. Nothing the sandbox does can change it, so it stays byte-identical to S3 for the sandbox's whole life. That means two sandboxes booted from the same build could share one read device and still stay isolated, since everything they write goes to their own private caches. E2B never does this, and it becomes the headline feature in Part 4.
+So writes never reach the read cache, which means it stays byte-identical to S3 for the sandbox's whole life. Two sandboxes on the same build could therefore share one read cache and stay perfectly isolated, since each one's writes land in its own private cache. E2B keeps them separate anyway, and Part 3 is where we stop doing that.
 
 ## The two consumers
 
