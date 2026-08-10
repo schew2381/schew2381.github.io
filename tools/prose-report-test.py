@@ -267,6 +267,9 @@ STATED: list[tuple[str, bool]] = [
     ("A real image has far too many digits to follow by hand, so let's shrink one down.", False),
     ("Reads cluster, so the next request is probably inside the chunk you paid for.", False),
     ("The scan takes minutes, so writes keep arriving behind it.", False),
+    # A `let's` already put somebody in the room, so the second verb is the same
+    # invitation continuing rather than a fix with nobody attached to it.
+    ("So let's take one Pod, and follow it down to a mount on a node.", False),
 ]
 
 CONDITIONAL: list[tuple[str, bool]] = [
@@ -367,7 +370,11 @@ def main() -> int:
             failures.append(f"self-reference {text!r} is {flagged}, want {expected}")
 
     for text, expected in STATED:
-        flagged = report.STATED_THEN_SOLVED.search(report.normalize(text)) is not None
+        norm = report.normalize(text)
+        flagged = (
+            report.STATED_THEN_SOLVED.search(norm) is not None
+            and report.INVITED.search(norm) is None
+        )
         if flagged != expected:
             failures.append(f"stated-then-solved {text!r} is {flagged}, want {expected}")
 

@@ -514,6 +514,11 @@ BARE_IMPERATIVE = (
 )
 STATED_THEN_SOLVED = re.compile(rf",\s+(?:so|and)\s+(?:{BARE_IMPERATIVE})\b", re.I)
 
+# `So let's take one Pod, and follow it down to a mount.` A sentence already
+# built on `let's` has somebody in the room, so the verb after the comma is that
+# same invitation continuing rather than a fix arriving with nobody attached.
+INVITED = re.compile(r"\b(?:let'?s|we'?ll|we\s+can|you\s+can|our)\b", re.I)
+
 # Any imperative that can open a hypothetical, which is a wider set than the ones
 # that show up as a stated-and-solved fix.
 HYPOTHETICAL_VERB = (
@@ -784,7 +789,7 @@ def check_judgment(post: Post) -> list[Finding]:
         if match := SELF_REFERENCE.search(para.text):
             found.append(Finding(para.start, "judgment", "self-reference", f"{match.group(0)}  {short(para.text, 58)}"))
 
-        if parts and STATED_THEN_SOLVED.search(parts[0]):
+        if parts and STATED_THEN_SOLVED.search(parts[0]) and not INVITED.search(parts[0]):
             found.append(Finding(para.start, "judgment", "stated-then-solved", short(parts[0], 76)))
 
         if parts and len(parts) > 1 and announces_only(parts[0]):
