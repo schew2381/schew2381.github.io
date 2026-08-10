@@ -596,7 +596,12 @@ LEADING_CLAUSE = re.compile(
     r"|though|given|assuming|whenever|now\s+that|even\s+(?:if|though)|\w+ing"
     # `To read a block, you have to find its entry.` A purpose clause, where the
     # comma closing it is the one the grammar asks for.
-    r"|to\s+\w+)\b",
+    r"|to\s+\w+"
+    # `For the disk, we run a small server.` A leading prepositional phrase,
+    # which takes the same comma for the same reason. Bounded to a short phrase
+    # so a comma deep into a long sentence still counts as a splice.
+    r"|(?:for|in|on|with|without|by|at|from|under|across|during|after|before)\s+"
+    r"(?:the|a|an|this|that|those|these|our|its|their|both|each|every)\s+(?:\w+\s+){0,2}\w+,)",
     re.I,
 )
 

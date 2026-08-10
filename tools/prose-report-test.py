@@ -231,6 +231,8 @@ SPLICE: list[tuple[str, str | None]] = [
     ("When the last interested transaction finishes, nothing about the tuple changes.", None),
     ("Knowing that, it can convert the head into a redirect without consulting an index.", None),
     ("To read a specific block, you have to find which entry it lives inside.", None),
+    ("For the disk, we run a small server speaking the NBD protocol.", None),
+    ("On a warm node, they only pay for what the hot set missed.", None),
     # A series, where every comma is punctuating a list item.
     ("Five entries, both offsets spelled out, and no gaps between them.", None),
 ]

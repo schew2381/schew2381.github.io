@@ -396,22 +396,27 @@ The payoff is in that first batch, where a reader wanting the very start of a ch
 
 ## The cache
 
-`block.Cache` is one sparse file per device, truncated to the full image size and mmap'd:
+A cached chunk lives in one file per device, and that file is the same size as the whole image. An 8 GiB image gets an 8 GiB cache file on day one. It's a sparse file, though, so the size is a claim rather than a reservation, and it takes up nothing on disk until something actually writes to it.
 
-```go
-cache, err := NewCache(size, blockSize, cachePath, false)
+Next to it sits a bitmap with one bit per block, saying whether that block has been fetched yet:
+
+```text
+  the cache file for an 8 GiB image, three blocks in
+
+  block:       0       1       2       3       4       5    ...
+           ┌───────┬───────┬───────┬───────┬───────┬───────┐
+  bitmap:  │   1   │   0   │   1   │   1   │   0   │   0   │
+           └───────┴───────┴───────┴───────┴───────┴───────┘
+  on disk:   4 KiB    ---    4 KiB   4 KiB    ---     ---     = 12 KiB allocated
 ```
-[cache.go:62](https://github.com/e2b-dev/infra/blob/da099cf305df080abd16b964ff8b664736ee6d34/packages/orchestrator/pkg/sandbox/block/cache.go#L62)
 
-The file claims to be 8 GiB while occupying only what the filesystem has actually allocated, and for a fresh cache that's nothing. That gap between claimed and real size is why `FileSize` reports `stat.Blocks * 512`, in the 512-byte units POSIX always uses, instead of trusting the stat size. In Part 3 the same gap turns into a sweep evicting the one cache worth keeping.
+Asking the cache for a block whose bit is 0 gets you a `BytesNotAvailableError` rather than a buffer of zeros, which is how the reader above finds out it has to go fetch something.
 
-Alongside the mapping sits a bitmap with one bit per block. Ask it for a range that isn't fully set and you get a `BytesNotAvailableError` rather than zeros, which is how a caller finds out it has to go fetch something. Snapshotting is built entirely on the write cache's reading of that bit.
-
-`addressBytes` hands out a slice of the mmap plus a closure that drops a read lock. The chunker fetches directly into that slice, so bytes go from the S3 socket into a page that already is the cache, with no intermediate buffer. Filling the cache and serving a read are the same operation.
+The file is memory-mapped, so the chunker doesn't fetch bytes into a buffer and then copy them into the cache. It hands S3 a slice of the mapping and lets the bytes land directly in the page that already is the cache. Filling the cache and serving a read are the same operation.
 
 ## Copy-on-write
 
-None of this is writable yet. The chunker and cache serve reads out of immutable objects, and a sandbox that can't write to its own filesystem isn't much of a sandbox. `block.Overlay` closes that gap:
+None of this is writable yet. The chunker and cache serve reads out of immutable objects, and a sandbox that can't write to its own filesystem isn't much of a sandbox. `block.Overlay` closes that gap by pairing the read-only device with a second cache that only this sandbox can see:
 
 ```go
 type Overlay struct {
@@ -423,7 +428,7 @@ type Overlay struct {
 ```
 [overlay.go:14](https://github.com/e2b-dev/infra/blob/da099cf305df080abd16b964ff8b664736ee6d34/packages/orchestrator/pkg/sandbox/block/overlay.go#L14)
 
-A read walks its request one block at a time and asks the private write cache first, taking `BytesNotAvailableError` as permission to fall through to the read device. A write doesn't walk anywhere, since `WriteAt` puts the bytes in the cache and stops.
+A read checks that private write cache one block at a time, taking `BytesNotAvailableError` as permission to fall through to the read device underneath. A write doesn't fall through at all, since it just puts the bytes in the cache and stops.
 
 ```text
 read  block 3 ──> write cache dirty?  ──yes──> serve from write cache
@@ -435,25 +440,26 @@ read  block 3 ──> write cache dirty?  ──yes──> serve from write cach
 write block 3 ──> write cache only, mark dirty
 ```
 
-The write arrow never reaches the read device, so the read device holds bytes identical to what's in S3 for as long as the sandbox lives. Two sandboxes booted from the same template can therefore point at one read device and diverge only in their private write caches. That's a footnote in E2B, and it turns into the headline feature by Part 4.
-
-There's a subtle ordering problem at teardown, too. Snapshotting needs the write cache, and closing the overlay wants to destroy it. `EjectCache` settles it with a compare-and-swap on `cacheEjected` that hands the cache over exactly once, after which the overlay refuses I/O and `Close` becomes a no-op. A snapshot in progress can't lose its data to a concurrent teardown.
+Notice that the write arrow never touches the read device. Nothing the sandbox does can change it, so it stays byte-identical to S3 for the sandbox's whole life. That means two sandboxes booted from the same build could share one read device and still stay isolated, since everything they write goes to their own private caches. E2B never does this, and it becomes the headline feature in Part 4.
 
 ## The two consumers
 
-The overlay gets served two different ways, and it doesn't know the difference:
+So far this has all been about one file, the sandbox's disk. But a sandbox actually needs two multi-gigabyte files out of S3, and that's why the S3 prefix back at the start had both a `rootfs.ext4` and a `memfile`.
+
+`rootfs.ext4` is the disk, holding the OS and everything the user's code reads or writes. `memfile` is the guest's RAM, which exists because a sandbox doesn't boot from scratch. It resumes from a snapshot of a VM that already finished booting, and that snapshot includes whatever was in memory at the time. Skipping the boot is what makes a sandbox start in a second.
+
+Firecracker is the hypervisor running the microVM, and it expects both of these to be ordinary local things. It wants a disk it can do block I/O against and a file it can map into the guest's memory, but neither one is actually on the machine. So in both cases something has to sit underneath and turn the guest's access into a fetch:
 
 ```text
-  ROOTFS                                 GUEST MEMORY
+  THE DISK                               GUEST MEMORY
 
-  guest does block I/O                   guest touches a page
+  guest reads a file                     guest touches a page of RAM
     │                                      │
-    ▼  virtio-blk                          ▼  page fault
-  /dev/vda                               userfaultfd
+    ▼  looks like a normal disk            ▼  page isn't really there yet
+  /dev/vda                               the kernel raises a page fault
     │                                      │
-    ▼  NBD over Unix sockets               ▼  UFFD handler calls Prefault
-  /dev/nbdN                              writes into the guest's address space
-    │                                      │
+    ▼  which is really a network           ▼  our handler catches the fault
+    │  block device we serve               │  and fills the page in
     └──────────────┬───────────────────────┘
                    ▼
              block.Overlay
@@ -462,18 +468,11 @@ The overlay gets served two different ways, and it doesn't know the difference:
   4 KiB blocks                           2 MiB blocks (hugepages)
 ```
 
-The rootfs goes out over NBD. `NewNBDProvider` builds the cache, wraps the read device in an overlay, and hands it to a direct-path mount speaking the NBD protocol over Unix sockets to `/dev/nbdN`. Firecracker sees an ordinary block device, the guest kernel does ordinary block I/O, and every miss quietly becomes a 4 MiB range GET.
+For the disk, we run a small server speaking the NBD protocol, which is how Linux exposes a network block device as a local one. Firecracker sees `/dev/vda` and does perfectly ordinary block I/O against it, never knowing that a miss becomes a 4 MiB GET against S3.
 
-Guest memory goes out over userfaultfd instead. Firecracker maps the memory file, the UFFD handler catches page faults, and `Prefault` writes resolved bytes into the guest's address space. Same headers, same chunker, same cache, different fault mechanism. Block size is per device for exactly that reason, since guest memory sits on hugepages and works in 2 MiB units while a rootfs uses 4 KiB:
+For memory the trick is userfaultfd, a Linux feature that lets a normal program handle page faults itself. Firecracker maps the memory file, and the first time the guest touches a page that isn't there, our handler wakes up, fetches the bytes, and writes them into the guest's address space.
 
-```go
-const (
-	PageSize        = 4 << 10 // 4 KiB
-	HugepageSize    = 2 << 20 // 2 MiB
-	RootfsBlockSize = 4 << 10 // 4 KiB
-)
-```
-[diff.go:10](https://github.com/e2b-dev/infra/blob/da099cf305df080abd16b964ff8b664736ee6d34/packages/shared/pkg/storage/header/diff.go#L10)
+Two entirely different mechanisms, both landing on the same overlay underneath. The only thing that changes is the block size, since memory sits on hugepages and works in 2 MiB units while the disk uses 4 KiB.
 
 Part 3 adds a third consumer that E2B doesn't have: the host kernel's own ext4 driver.
 
