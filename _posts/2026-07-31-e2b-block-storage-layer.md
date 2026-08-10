@@ -530,8 +530,10 @@ The copy itself uses [`copy_file_range(2)`](https://man7.org/linux/man-pages/man
 | Failure mode | Object storage outage stalls live I/O | Fails before boot |
 | Snapshot cost | Dirty blocks only | Full image copy |
 
-Downloading the image puts all the waiting up front where you expect it, while lazy fetching spreads that waiting across the sandbox's whole life. A miss is an S3 round trip the guest experiences as a very slow disk, and it can land on the user's first keystroke or six hours in. It's still the better deal, since a sandbox that starts in a second and occasionally stalls for 40 ms beats one that always takes thirty seconds to start. That flips if the workload reads most of the image every time, at which point you've paid for the whole download anyway and made it slower.
+So we followed one read down from the guest kernel to S3 and one pause back up again. Along the way our eight-block image became a base build, two diffs, and a mapping stitching them together. The two pauses uploaded three blocks between them instead of rewriting all eight, and the sandbox started without waiting on any of it.
 
-Diff chains are the cost that creeps up on you. Our example only got two builds deep, but every pause adds another object a read might have to resolve through. Nothing here ever flattens that chain back down, and Part 3 checkpoints on a timer rather than on a pause, which shows how quickly it adds up.
+Downloading the image first would have put that waiting up front, where at least you expect it. This puts it wherever the guest happens to read, so a miss turns into an S3 round trip that the guest feels as a very slow disk. That's a good trade for a sandbox starting in a second and occasionally stalling for 40 ms. It's a bad one for a workload that reads most of the image anyway, since then you've paid for the download and made it slower.
+
+The chain we built is the other cost. Two builds deep is free, but every pause adds another object a read might resolve through, and nothing here flattens it back down. Part 3 checkpoints on a timer rather than on a pause, which is where that gets expensive.
 
 All of this rests on one thing, which is that the read side never changes. That's what makes it safe to hand a chunk one sandbox fetched to a completely unrelated one, and it's the property that lets the whole thing sit behind a Kubernetes volume. [Part 2](/posts/kubernetes-csi-interface/) covers that interface, and it's much less clever than this.
