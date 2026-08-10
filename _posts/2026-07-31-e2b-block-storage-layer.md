@@ -446,7 +446,9 @@ So writes never reach the read cache, which means it stays byte-identical to S3 
 
 So far this has all been about one file, the sandbox's disk. But a sandbox actually needs two multi-gigabyte files out of S3, and that's why the S3 prefix back at the start had both a `rootfs.ext4` and a `memfile`.
 
-`rootfs.ext4` is the disk, holding the OS and everything the user's code reads or writes. `memfile` is the guest's RAM, which exists because a sandbox doesn't boot from scratch. It resumes from a snapshot of a VM that already finished booting, and that snapshot includes whatever was in memory at the time. Skipping the boot is what makes a sandbox start in a second.
+`rootfs.ext4` is the disk, holding the OS and everything the user's code reads or writes. `memfile` is the guest's RAM, and it exists because a sandbox never boots from scratch. It resumes a VM that already finished booting, which means the file holds a running kernel, every process that was alive, and Linux's own page cache of the disk it had already read.
+
+So the split is that `rootfs.ext4` is what's on disk while `memfile` is the state of a machine that has read that disk and finished booting. A disk on its own only gets you something that still has to boot, which is the thirty-second path. Resuming in a second means the CPU picks up mid-stride, and that only works if RAM looks exactly like it did at the moment of the pause.
 
 Firecracker is the hypervisor running the microVM, and it expects both of these to be ordinary local things. It wants a disk it can do block I/O against and a file it can map into the guest's memory, but neither one is actually on the machine. So in both cases something has to sit underneath and turn the guest's access into a fetch:
 
@@ -468,78 +470,57 @@ Firecracker is the hypervisor running the microVM, and it expects both of these 
   4 KiB blocks                           2 MiB blocks (hugepages)
 ```
 
-For the disk, we run a small server speaking the NBD protocol, which is how Linux exposes a network block device as a local one. Firecracker sees `/dev/vda` and does perfectly ordinary block I/O against it, never knowing that a miss becomes a 4 MiB GET against S3.
-
-For memory the trick is userfaultfd, a Linux feature that lets a normal program handle page faults itself. Firecracker maps the memory file, and the first time the guest touches a page that isn't there, our handler wakes up, fetches the bytes, and writes them into the guest's address space.
-
-Two entirely different mechanisms, both landing on the same overlay underneath. The only thing that changes is the block size, since memory sits on hugepages and works in 2 MiB units while the disk uses 4 KiB.
+The disk gets served over NBD, which is Linux's protocol for making a network block device look local. Memory gets served over userfaultfd, a Linux feature that lets a normal program handle page faults itself. Two unrelated mechanisms landing on the same overlay, where the only difference underneath is the block size. Memory sits on hugepages and works in 2 MiB units while the disk uses 4 KiB.
 
 Part 3 adds a third consumer that E2B doesn't have: the host kernel's own ext4 driver.
 
 ## Snapshotting
 
-A paused sandbox has to become two S3 objects, a data file holding only what changed and a header describing where the changes go, and the bitmap already knows which blocks those are.
+We've been assuming a pause produces `diff-a`, so let's actually do it. Back at the write cache, the sandbox has written to blocks 3 and 5, and the dirty bitmap knows exactly that:
 
-Steps 1, 2, and 5 are bookkeeping, while steps 3 and 4 are Linux behaving in ways that lose your data if you assume the obvious thing.
+```text
+PACKING THE DIRTY BLOCKS INTO A DIFF FILE
 
-1. `EjectCache` takes the write cache out of the overlay.
-2. Destroying the sandbox lets in-flight NBD and UFFD requests drain.
-3. `SyncFileRange` pushes the mmap's dirty pages down to the filesystem.
-4. `ExportToDiff` copies each dirty range into the diff file with `copy_file_range`.
-5. `ToDiffHeader` turns the bitmap into `BuildMap` entries, then merges and normalizes.
+  virtual:       0       1       2       3       4       5       6       7
+              ┌───────┬───────┬───────┬───────┬───────┬───────┬───────┬───────┐
+  dirty bit:  │   0   │   0   │   0   │   1   │   0   │   1   │   0   │   0   │
+              └───────┴───────┴───────┴───────┴───────┴───────┴───────┴───────┘
+  contents:   │       │       │       │  D'   │       │  F'   │       │       │
+                                          │               │
+                                          └─> block 0     └─> block 1
 
-### Why step 3 exists
+  diff file:  ┌───────┬───────┐
+              │  D'   │  F'   │
+              └───────┴───────┘
+  physical:      0       1
+```
 
-The write cache is one file that's been [mmap'd](https://man7.org/linux/man-pages/man2/mmap.2.html), which means the process treats a region of its own address space as if it were the file. A write into that memory doesn't call `write(2)` and doesn't immediately touch the disk. It dirties a page of the kernel's page cache, and the kernel flushes it whenever writeback gets around to it.
+Walking the bitmap in order and copying each dirty block into a fresh file gives us the diff, and it's that walk order that decides the physical offsets. Block 3 goes first so it lands at 0, block 5 goes second so it lands at 1. Those are exactly the `BuildStorageOffset` values from the worked example, and they come out that way because the copy happened in that order.
 
-Which is a problem for a snapshot, because step 4 reads that file through an ordinary file descriptor:
+The bitmap gives us the header too. Each run of set bits becomes one `BuildMap` entry, and the runs get merged onto the parent's mapping and normalized the way we walked through earlier. Upload the diff file and the header, and `diff-a` exists.
+
+One free case falls out of this. A block the sandbox zeroed gets a `BuildId` of `uuid.Nil`, which tells the reader to zero-fill without opening any object at all. So a sandbox that filled 2 GiB of scratch space and deleted it again uploads one mapping entry and no bytes.
+
+### Where the dirty pages actually are
+
+The write cache is [mmap'd](https://man7.org/linux/man-pages/man2/mmap.2.html), which means the sandbox writes to it by writing to memory rather than by calling `write(2)`. Those writes dirty a page of the kernel's page cache, and the kernel pushes them down to the file whenever writeback feels like getting to it.
+
+Copying the diff out reads that file through an ordinary file descriptor, so the timing matters:
 
 ```text
   sandbox writes block 5
     │
     ▼
-  mmap'd page in memory   <-- dirty, real data lives here
+  mmap'd page in memory   <-- dirty, the real data is here
     │
     │  kernel writeback, whenever it feels like it
     ▼
-  cache file on disk      <-- what an fd read would see
+  cache file on disk      <-- what a file descriptor sees
 ```
 
-Read the fd before writeback runs and the diff is missing the block. So step 3 calls [`sync_file_range(2)`](https://man7.org/linux/man-pages/man2/sync_file_range.2.html) with `SYNC_FILE_RANGE_WRITE`, which asks the kernel to start writing out the dirty pages in a range. That's weaker than an `fsync`, because it kicks writeback into starting without waiting for the disk to confirm anything.
+So E2B nudges writeback along with [`sync_file_range(2)`](https://man7.org/linux/man-pages/man2/sync_file_range.2.html) before the copy, which starts flushing the dirty pages without waiting for the disk to confirm anything. It's treated as an optimization rather than a correctness step, since the copy reads through the page cache anyway and sees dirty pages whether or not they've reached the platter. Failing it logs a warning and carries on.
 
-That looseness would be alarming if the call mattered, and it doesn't. E2B treats it as an optimization, logging a warning on failure rather than aborting. The copy in step 4 goes through the page cache anyway and sees the dirty pages whether or not they've reached the platter. The sync just means fewer of them are still in flight when the copy starts.
-
-### Why step 4 is fast
-
-The obvious way to build a diff file is to read each dirty range into a buffer and write it back out. That's two copies through userspace for data nobody inspects, and for a 500 MiB diff it's 500 MiB of pointless memory traffic.
-
-[`copy_file_range(2)`](https://man7.org/linux/man-pages/man2/copy_file_range.2.html) skips it. The kernel copies between two file descriptors without the bytes ever entering the calling process. On a filesystem that supports it the copy becomes a reflink, so two inodes end up pointing at the same copy-on-write blocks and no data moves at all. XFS supports that. ext4 doesn't, so the same call there does a real in-kernel copy. Format the snapshot disk XFS if you get the choice, because on ext4 a 500 MiB diff is 500 MiB the kernel actually moves.
-
-```text
-  read + write                        copy_file_range
-
-  cache file                          cache file
-      │  read(2)                          │
-      ▼                                   │  kernel-internal,
-  userspace buffer                        │  reflink where the fs allows
-      │  write(2)                         ▼
-      ▼                               diff file
-  diff file
-```
-
-Three error codes get special handling, and each one is a filesystem declining for a different reason.
-
-1. `EXDEV`, the two files are on different filesystems, which the syscall used to refuse outright.
-2. `EOPNOTSUPP`, this filesystem doesn't implement the call.
-3. `ENOSYS`, the kernel is older than 4.5, when the call was added.
-
-Any of the three flips a `fallback` flag and the export finishes with `io.Copy`, so a node on an unusual filesystem gets slower snapshots rather than no snapshots.
-
-### What ends up in S3
-
-Step 5 turns the bitmap back into mapping entries. Every contiguous run of set bits becomes one `BuildMap` whose `BuildStorageOffset` counts up through the diff file in the order the ranges were written, which is precisely the packed layout from the worked example. Those entries merge onto the parent's mapping, normalize, and the generation goes up by one.
-
-Zero blocks get a `BuildId` of `uuid.Nil`, which tells the reader to zero-fill the buffer without opening any object at all. So a sandbox that filled 2 GiB of scratch space and then deleted it uploads one mapping entry and no bytes, rather than 2 GiB of zeros.
+The copy itself uses [`copy_file_range(2)`](https://man7.org/linux/man-pages/man2/copy_file_range.2.html), which moves bytes between two file descriptors entirely inside the kernel rather than reading them into the process and writing them back out. On XFS it goes further and makes the two files share the same blocks, so a 500 MiB diff moves no data at all. ext4 can't do that, so there the kernel really does copy 500 MiB. Either way it beats two trips through userspace for bytes nobody looks at.
 
 ## Trade-offs
 
