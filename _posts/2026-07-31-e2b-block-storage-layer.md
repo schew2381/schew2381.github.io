@@ -476,7 +476,7 @@ Part 3 adds a third consumer that E2B doesn't have: the host kernel's own ext4 d
 
 ## Snapshotting
 
-We've been assuming a pause produces `diff-a`, so let's actually do it. Back at the write cache, the sandbox has written to blocks 3 and 5, and the dirty bitmap knows exactly that:
+We've been assuming a pause produces `diff-a`, so let's actually do it. Back at the write cache, the sandbox has written to blocks 3 and 5 which is tracked by the dirty bitmap:
 
 ```text
 PACKING THE DIRTY BLOCKS INTO A DIFF FILE
@@ -495,11 +495,9 @@ PACKING THE DIRTY BLOCKS INTO A DIFF FILE
   physical:      0       1
 ```
 
-Walking the bitmap in order and copying each dirty block into a fresh file gives us the diff, and it's that walk order that decides the physical offsets. Block 3 goes first so it lands at 0, block 5 goes second so it lands at 1. Those are exactly the `BuildStorageOffset` values from the worked example, and they come out that way because the copy happened in that order.
+We then walk over the bitmap in order and copy each dirty block into a fresh file to produce the diff. In the example block 3 goes first and lands at 0 while block 5 goes second and lands at 1.
 
-The bitmap gives us the header too. Each run of set bits becomes one `BuildMap` entry, and the runs get merged onto the parent's mapping and normalized the way we walked through earlier. Upload the diff file and the header, and `diff-a` exists.
-
-One free case falls out of this. A block the sandbox zeroed gets a `BuildId` of `uuid.Nil`, which tells the reader to zero-fill without opening any object at all. So a sandbox that filled 2 GiB of scratch space and deleted it again uploads one mapping entry and no bytes.
+The bitmap also gives us the header. Each run of set bits becomes one `BuildMap` entry, and the runs get merged onto the parent's mapping and normalized the way we walked through earlier. Uploading the diff file and header then produces `diff-a`.
 
 ### Where the dirty pages actually are
 
@@ -532,8 +530,8 @@ The copy itself uses [`copy_file_range(2)`](https://man7.org/linux/man-pages/man
 | Failure mode | Object storage outage stalls live I/O | Fails before boot |
 | Snapshot cost | Dirty blocks only | Full image copy |
 
-Downloading the image front-loads all the pain into a place where you expect it, and lazy fetch spreads it across the sandbox's whole life instead. A cache miss is an S3 round trip that the guest kernel experiences as very slow block-device latency, and it can land on the user's first keystroke or on hour six. Worth it, on balance, because a sandbox that starts in a second and occasionally stalls for 40 ms beats one that starts in thirty seconds every single time. Read most of the image on every boot and the trade inverts.
+Downloading the image puts all the waiting up front where you expect it, while lazy fetching spreads that waiting across the sandbox's whole life. A miss is an S3 round trip the guest experiences as a very slow disk, and it can land on the user's first keystroke or six hours in. It's still the better deal, since a sandbox that starts in a second and occasionally stalls for 40 ms beats one that always takes thirty seconds to start. That flips if the workload reads most of the image every time, at which point you've paid for the whole download anyway and made it slower.
 
-Snapshot chains are the other slow leak. Every pause adds mapping entries and one more object that reads might fan out to, so a sandbox someone has been snapshotting for a week eventually needs a rebase pass to flatten it. Part 3 puts a number on how fast that accumulates once the snapshots are on a timer.
+Diff chains are the cost that creeps up on you. Our example only got two builds deep, but every pause adds another object a read might have to resolve through. Nothing here ever flattens that chain back down, and Part 3 checkpoints on a timer rather than on a pause, which shows how quickly it adds up.
 
-The whole thing rests on one assumption worth stating plainly: the read side never changes. That's what makes it safe for a chunk fetched by one sandbox to be handed to a completely unrelated one. It's also the property that turns this into something you can put behind a Kubernetes volume. [Part 2](/posts/kubernetes-csi-interface/) covers that interface, and it's much less clever than this.
+All of this rests on one thing, which is that the read side never changes. That's what makes it safe to hand a chunk one sandbox fetched to a completely unrelated one, and it's the property that lets the whole thing sit behind a Kubernetes volume. [Part 2](/posts/kubernetes-csi-interface/) covers that interface, and it's much less clever than this.
