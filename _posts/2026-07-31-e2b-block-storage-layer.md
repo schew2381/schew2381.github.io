@@ -530,10 +530,10 @@ The copy itself uses [`copy_file_range(2)`](https://man7.org/linux/man-pages/man
 | Failure mode | Object storage outage stalls live I/O | Fails before boot |
 | Snapshot cost | Dirty blocks only | Full image copy |
 
-So we followed one read down from the guest kernel to S3 and one pause back up again. Along the way our eight-block image became a base build, two diffs, and a mapping stitching them together. The two pauses uploaded three blocks between them instead of rewriting all eight, and the sandbox started without waiting on any of it.
+In this post we followed one read down from the guest kernel to S3 and one pause back up again. Along the way our eight-block image became a base build, two diffs, and a mapping stitching them together. The two pauses uploaded three blocks between them instead of rewriting all eight, and the sandbox started without waiting on any of it.
 
 Downloading the image first would have put that waiting up front, where at least you expect it. This puts it wherever the guest happens to read, so a miss turns into an S3 round trip that the guest feels as a very slow disk. That's a good trade for a sandbox starting in a second and occasionally stalling for 40 ms. It's a bad one for a workload that reads most of the image anyway, since then you've paid for the download and made it slower.
 
-The chain we built is the other cost. Two builds deep is free, but every pause adds another object a read might resolve through, and nothing here flattens it back down. Part 3 checkpoints on a timer rather than on a pause, which is where that gets expensive.
+The chain we built is the other cost. Two builds deep is free, but every pause adds another object a read might resolve through, and nothing here flattens it back down.
 
 All of this rests on one thing, which is that the read side never changes. That's what makes it safe to hand a chunk one sandbox fetched to a completely unrelated one, and it's the property that lets the whole thing sit behind a Kubernetes volume. [Part 2](/posts/kubernetes-csi-interface/) covers that interface, and it's much less clever than this.
