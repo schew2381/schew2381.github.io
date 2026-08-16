@@ -68,8 +68,6 @@ ONE RUNNING SANDBOX
             └───────────────────────┘
 ```
 
-Writes stop at the write cache and never travel any further, so everything below it stays byte-identical to what's in S3 for as long as the sandbox lives. The last two posts spend their time exploiting that.
-
 ## A build in object storage
 
 Every address in this system is relative to a build, and a build is just a UUID. Hand that UUID to S3 and you get back the prefix `s3://templates/<build-id>/` with five objects under it.
@@ -82,11 +80,11 @@ Every address in this system is relative to a build, and a build is just a UUID.
 
 The interesting one is `rootfs.ext4` because it isn't an image. It holds only the blocks that this particular build contains, packed end to end with no gaps. A build is either the base of its own chain, holding every block, or it chains onto a parent and stores only what changed since. That chaining is what makes this a copy-on-write system.
 
-So a chained build's `rootfs.ext4` might be 4 MiB of scattered blocks. How does anything read that as an 8 GiB filesystem?
+So a chained build's `rootfs.ext4` might be 4 MiB of scattered blocks. How does anything read that as a whole filesystem?
 
 ## The header is a virtual address space
 
-The header sitting next to the data file is what lets the guest read those scattered blocks like an ordinary filesystem. It's a 64-byte metadata record followed by an array of 40-byte entries, all little-endian:
+The header sitting next to the data file is what lets the guest read those scattered blocks like an ordinary filesystem. It's a 64-byte metadata record followed by an array of 40-byte entries:
 
 ```text
 rootfs.ext4.header
@@ -136,7 +134,7 @@ ONE ENTRY, TWO ADDRESS SPACES
 
 ### Eight blocks
 
-A real image has far too many digits to follow by hand, so let's shrink one down to eight blocks and count in blocks instead of bytes. The struct really does store byte offsets, but each one is a multiple of the block size. Dividing through costs us nothing, so block 3 just means the fourth block.
+A real image has far too many digits to follow by hand, so let's shrink one down to eight blocks and count in blocks instead of bytes. The struct really does store byte offsets, but each one is a multiple of the block size.
 
 So let's run that image through a build and then a snapshot, watching the mapping change underneath it at each step. Here we have a fresh base build made up of eight blocks, A through H:
 
@@ -527,22 +525,38 @@ Everything we've built so far gets used twice, once per file, with its own heade
 
   guest reads a file                     guest touches a page of RAM
     │                                      │
-    ▼  block I/O to /dev/vda               ▼  the page isn't there,
-    │  which is really NBD,                │  so the CPU faults and
-    │  served by our process               │  userfaultfd hands us the
-    │                                      │  fault to satisfy
+    ▼  block I/O over NBD                  ▼  a page fault over userfaultfd
+    │                                      │
     ▼                                      ▼
   header, chunker, read cache            header, chunker, read cache
   4 KiB blocks                           2 MiB hugepages
 ```
 
-The disk goes out over NBD, which is how Linux serves a block device from a normal process. The guest sees `/dev/vda` and never knows the difference. Memory uses userfaultfd, which lets us handle the guest's page faults ourselves and fill each page in before the guest notices anything was missing.
+The disk goes out over NBD, which is how Linux serves a block device from a normal process. The guest sees `/dev/vda` and never knows the difference.
+
+Memory is worth being precise about, since the guest's RAM was never separate from the host's to begin with. Firecracker takes a region of its own memory and tells the CPU that region is the guest's physical RAM. What makes it lazy is that the region starts out empty, with the mapping in place and no actual memory behind it:
+
+```text
+  guest reads address 0x4000
+    │
+    ▼  no memory behind that address yet, so the CPU faults
+  the host kernel would normally fill the page itself
+    │
+    ▼  but the region is registered with userfaultfd,
+    │  so the kernel hands us the fault instead
+  we resolve it through header, chunker, and read cache
+    │
+    ▼  and write those bytes into the region
+  the guest retries the instruction and the page is there
+```
+
+After that the page is ordinary resident memory. The guest reads and writes it at full speed with us nowhere in the path.
 
 ### Only the disk gets a write cache
 
-Writes are where the two genuinely part ways. A disk write is block I/O, so it travels out to our process where we can catch it, which is exactly what the write cache does.
+That last point is what splits the two apart. A disk write is block I/O, so it travels out to our process where we can catch it, which is exactly what the write cache does. A memory write travels nowhere, so there's nothing for us to intercept and no write cache to put it in.
 
-A memory write doesn't travel anywhere. Once userfaultfd has filled a page in, that page is ordinary RAM and the guest writes to it at full speed with us nowhere near it. So there's no write cache for memory, and at pause time we just ask Firecracker which pages it dirtied.
+Which leaves the question of how a memory snapshot knows what changed. The disk reads its own dirty bitmap, since every write came through us. For memory we ask Firecracker over its API and it hands back a bitmap of the pages the guest touched, because tracking that is the hypervisor's job rather than ours.
 
 ## Trade-offs
 
@@ -558,6 +572,6 @@ In Part 1 of this series we traced one read down from the guest kernel to S3, th
 
 If the sandboxes downloaded images on startup instead, it would have taken a lot longer for them to spin up. Reads on the other hand incur a slight S3 round-trip delay, which is a good trade for sandboxes starting in sub-second time. If you have a workload that reads most of the image anyway then the trade goes the other way, since you've paid for the whole download and made it slower on top.
 
-The chain we built is the other cost. Two builds deep is free, but every pause adds another object a read might resolve through, and nothing here flattens it back down.
+The copy-on-write chaining is the other cost. Our example ended at three builds, so a read consults at most three objects to find a block. Pause a hundred times and it's a hundred, since every pause adds another link and nothing here ever flattens the chain back down.
 
 All of this rests on one thing, which is that the read side never changes. That's what makes it safe to hand a chunk one sandbox fetched to a completely unrelated one, and it's the property that lets the whole thing sit behind a Kubernetes volume. [Part 2](/posts/kubernetes-csi-interface/) covers that interface, and it's much less clever than this.
