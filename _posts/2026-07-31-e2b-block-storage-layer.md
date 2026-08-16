@@ -537,26 +537,33 @@ The disk goes out over NBD, which is how Linux serves a block device from a norm
 Memory is worth being precise about, since the guest's RAM was never separate from the host's to begin with. Firecracker takes a region of its own memory and tells the CPU that region is the guest's physical RAM. What makes it lazy is that the region starts out empty, with the mapping in place and no actual memory behind it:
 
 ```text
-  guest reads address 0x4000
-    │
-    ▼  no memory behind that address yet, so the CPU faults
-  the host kernel would normally fill the page itself
-    │
-    ▼  but the region is registered with userfaultfd,
-    │  so the kernel hands us the fault instead
-  we resolve it through header, chunker, and read cache
-    │
-    ▼  and write those bytes into the region
-  the guest retries the instruction and the page is there
+  FILLING ONE PAGE OF GUEST RAM
+
+  1  the guest reads an address in its own RAM
+     │
+     ▼
+  2  no memory is behind that address yet, so the CPU faults
+     │
+     ▼
+  3  the kernel would normally resolve the fault itself, but the
+     region is registered with userfaultfd, so it hands it to us
+     │
+     ▼
+  4  we resolve the offset through the header, chunker, and read
+     cache, fetching from S3 if it isn't cached yet
+     │
+     ▼
+  5  we write those bytes into the region and the guest, which
+     never knew anything was missing, retries the read
 ```
 
 After that the page is ordinary resident memory. The guest reads and writes it at full speed with us nowhere in the path.
 
 ### Only the disk gets a write cache
 
-That last point is what splits the two apart. A disk write is block I/O, so it travels out to our process where we can catch it, which is exactly what the write cache does. A memory write travels nowhere, so there's nothing for us to intercept and no write cache to put it in.
+That last point is what splits the two apart. A disk write is block I/O so it travels out to our process where we can store it in the write cache. A memory write travels nowhere so there's nothing for us to intercept and no write cache to put it in.
 
-Which leaves the question of how a memory snapshot knows what changed. The disk reads its own dirty bitmap, since every write came through us. For memory we ask Firecracker over its API and it hands back a bitmap of the pages the guest touched, because tracking that is the hypervisor's job rather than ours.
+This leaves the question of how a memory snapshot knows what's changed. The disk simply reads its own dirty bitmap, but again we have no memory write cache. Instead we ask Firecracker over [its API](https://github.com/e2b-dev/infra/blob/da099cf305df080abd16b964ff8b664736ee6d34/packages/shared/pkg/fc/firecracker.yml#L818) and it hands back a bitmap of the pages the guest touched, because the hypervisor automatically tracks it for us.
 
 ## Trade-offs
 

@@ -12,19 +12,19 @@ tags: [csi, kubernetes, kubelet, grpc, volumes, storage]
 > 4. [Optimizing startup performance](/posts/sandbox-blockstore-performance/)
 {: .prompt-info }
 
-[Part 1](/posts/e2b-block-storage-layer/) ended on one property, which is that the read side never changes, so a chunk one sandbox fetched is safe to hand to a stranger. Now what does Kubernetes need to hear before it'll mount that as a volume?
+[Part 1](/posts/e2b-block-storage-layer/) ended on one property which is that the read side never changes, so a chunk one sandbox fetched is safe to hand to a stranger. Now what does Kubernetes need to hear before it'll mount that as a volume?
 
 The [Container Storage Interface](https://github.com/container-storage-interface/spec/blob/cd4eba751417ddeddb7d5f41656baa61c1a0cb67/spec.md) is a big specification, with more than thirty RPCs spread across five services. A driver for a node-local, per-Pod volume ends up implementing seven of them. Working out *which* seven is the hard part, since the spec calls plenty of RPCs optional that kubelet turns out to require anyway.
 
-So let's take one Pod that wants a sandbox from template build `9f3c1a20`, and follow it from a few lines of YAML down to a mounted filesystem on whichever node it lands on.
+So let's take one Pod that wants a sandbox from template build `foobar3`, and follow it from a few lines of YAML down to a mounted filesystem on whichever node it lands on.
 
 ## The three services
 
-A CSI driver is a gRPC server, and the spec groups what it can serve into five services. Two of them handle volume groups and snapshot metadata, which nothing here needs, so that leaves three.
+A CSI driver is a gRPC server and the spec groups what it can serve into five services. Two of them handle volume groups and snapshot metadata, which we don't need so that just leaves three services.
 
 ### Identity
 
-Every driver implements this one, and it's the only one that's never optional. Three RPCs that answer who the driver is and whether it's alive:
+Every driver implements this mandatory service which answers who the driver is and whether it's alive:
 
 ```text
 ┌────────────────────────────────────────────────────────────┐
@@ -129,13 +129,13 @@ The node ID it returns is what lands in the `CSINode` object, so a driver that s
 With registration done, our Pod's volume finally has a path to travel:
 
 ```text
-  Pod asks for build 9f3c1a20
+  Pod asks for build foobar3
         │
         ▼
   scheduler puts the Pod on node-7
         │
         ▼
-  kubelet on node-7  ──gRPC──> NodePublishVolume("9f3c1a20", targetPath)
+  kubelet on node-7  ──gRPC──> NodePublishVolume("foobar3", targetPath)
         │
         ▼
   a mounted filesystem at
@@ -168,7 +168,7 @@ Part 3's driver opts out, which looks like the wrong call at first. Twenty Pods 
   what kubelet keys staging on     what actually makes them shareable
 
   vol-a1b2 ──> stage once          vol-a1b2 ──┐
-  vol-c3d4 ──> stage once          vol-c3d4 ──┼──> all build 9f3c1a20,
+  vol-c3d4 ──> stage once          vol-c3d4 ──┼──> all build foobar3,
   vol-e5f6 ──> stage once          vol-e5f6 ──┘    so one set of bytes
   ... 20 distinct IDs
   20 stages, 0 deduped             the IDs have nothing to do with it
@@ -200,7 +200,7 @@ Say our Pod's mount succeeds, and then the reply never makes it back to kubelet.
           ◄───error───────┘                     ✗ ◄─────────┘
   kubelet retries                   kubelet retries
 
-  nothing is mounted                build 9f3c1a20 is mounted
+  nothing is mounted                build foobar3 is mounted
 ```
 
 Kubelet sees the same thing either way, which is a call that didn't come back, so it retries. The driver has to be right in both cases without knowing which one happened.
@@ -211,7 +211,7 @@ Anything on the Controller side follows the same rule. `CreateVolume` called twi
 
 ## Getting the build ID to the driver
 
-Our driver needs one piece of information to do its job, which is that the Pod wants build `9f3c1a20`. There are two ways to get it there, and they're genuinely different paths through Kubernetes rather than two spellings of the same thing.
+Our driver needs one piece of information to do its job, which is that the Pod wants build `foobar3`. There are two ways to get it there, and they're genuinely different paths through Kubernetes rather than two spellings of the same thing.
 
 ### The PVC path
 
@@ -224,7 +224,7 @@ metadata:
   name: sandbox-template
 provisioner: my-driver.csi.dev
 parameters:
-  templateBuildID: "9f3c1a20-..."
+  templateBuildID: "foobar3"
 volumeBindingMode: WaitForFirstConsumer
 reclaimPolicy: Delete
 ```
@@ -261,7 +261,7 @@ volumes:
     csi:
       driver: my-driver.csi.dev
       volumeAttributes:
-        templateBuildID: "9f3c1a20-..."
+        templateBuildID: "foobar3"
 ```
 
 Kubelet invents a volume ID on the spot, passes `volumeAttributes` straight through as the `VolumeContext`, and calls `NodePublishVolume`. There's no PVC, no PersistentVolume, no `CreateVolume`, and no provisioner Deployment to keep leader-elected. The volume lives exactly as long as the Pod:
@@ -373,7 +373,7 @@ So use csi-sanity to prove the contract, then deploy to a real cluster and watch
 | Parameters set by | Pod author | Cluster administrator |
 | Sidecars needed | Only `node-driver-registrar` | Also `external-provisioner` |
 
-In this post we followed one Pod asking for build `9f3c1a20` and ended up with a driver that answers seven RPCs. Three say who it is, two mount and unmount, and two describe what it can do. Every other RPC in the spec turned out to be about a volume outliving the Pod that asked for it, which ours never does.
+In this post we followed one Pod asking for build `foobar3` and ended up with a driver that answers seven RPCs. Three say who it is, two mount and unmount, and two describe what it can do. Every other RPC in the spec turned out to be about a volume outliving the Pod that asked for it, which ours never does.
 
 That's what makes the ephemeral inline path the right one here. A volume derived from something immutable that dies with its Pod has nothing to leak, no reclaim policy to reason about, and no provisioner to keep alive. The price is that a bad build ID gets caught at mount time rather than before scheduling, which is cheap when there's one parameter to get wrong.
 
