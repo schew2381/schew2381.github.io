@@ -354,7 +354,7 @@ Now three builds back one filesystem. Reading blocks 3 and 5 opens `diff-a`, blo
 
 ## The chunker
 
-`build.File` can resolve any virtual offset to a build and a physical offset, which is enough to serve a read and nowhere near enough to serve a filesystem. Fetching each block individually would turn a few mebibytes of reading into thousands of separate round trips to S3:
+Now that `build.File` can resolve any virtual offset to a build and a physical offset, we have enough to serve a single read. If we tried to serve all reads like this however, each read would turn a few mebibytes into thousands of separate round trips to S3:
 
 ```text
   per block                              per 4 MiB chunk
@@ -367,7 +367,7 @@ Now three builds back one filesystem. Reading blocks 3 and 5 opens `diff-a`, blo
   1024 round trips                       1 round trip
 ```
 
-Filesystem reads tend to cluster, so the chunker refuses to think in blocks and instead works in 4 MiB units:
+To get around this the chunker that reads from S3 thinks in 4 MiB units, which works well for filesystem reads that are typically clustered:
 
 ```go
 // MemoryChunkSize must always be bigger or equal to the block size.
@@ -398,7 +398,7 @@ Three batches in, `A` and `B` have their bytes and are already gone, while `C` i
 
 ## The read cache
 
-A cached chunk lives in one file per device, the same size as the whole image. It's a sparse file so that size is only a claim, and nothing gets allocated on disk until something writes to it.
+The data fetched from S3 is stored in a read cache. It's a sparse [memory-mapped file](#memory-mapped-files) the same size as the whole image, so nothing is actually stored on disk until it's added to the read cache.
 
 Next to it sits a bitmap with one bit per block, saying whether that block has been fetched yet:
 
@@ -412,11 +412,11 @@ Next to it sits a bitmap with one bit per block, saying whether that block has b
   on disk:   4 KiB    ---    4 KiB   4 KiB    ---     ---     = 12 KiB allocated
 ```
 
-That bitmap is how a reader finds out it has to go fetch something, since asking for a block whose bit is 0 returns a `BytesNotAvailableError` rather than a buffer of zeros. The file is also memory-mapped, so the chunker hands S3 a slice of the mapping and the bytes land straight in the cache with no copy in between.
+Readers use the bitmap to find out which blocks are available in the read cache. After a miss, the chunker hands S3 a slice of the memory-mapped file so reads land directly in the cache.
 
-## Copy-on-write using the write cache
+## The write cache
 
-None of this is writable yet. The chunker and read cache serve reads out of immutable objects, and a sandbox that can't write to its own filesystem isn't much of a sandbox. `block.Overlay` closes that gap by putting a second cache in front of the read side, this one private to a single sandbox:
+Let's now take a look at writes, which the sandbox has no ability to do yet. We close that gap with `block.Overlay`, which puts a second [memory-mapped](#memory-mapped-files) write cache in front of the read side per sandbox. It carries a bitmap of its own, this time saying which blocks have been written to.
 
 ```go
 type Overlay struct {
@@ -428,7 +428,9 @@ type Overlay struct {
 ```
 [overlay.go:14](https://github.com/e2b-dev/infra/blob/da099cf305df080abd16b964ff8b664736ee6d34/packages/orchestrator/pkg/sandbox/block/overlay.go#L14)
 
-A read checks the write cache one block at a time, taking `BytesNotAvailableError` as permission to fall through to the read cache underneath. A write doesn't fall through at all, since it just puts the bytes in the write cache and stops:
+Writing is the simple direction. The sandbox drops the blocks into the write cache and marks them dirty in the bitmap, and that's the end of it.
+
+Reading walks down the stack. We check the write cache first and serve the block if its bit is set. Failing that we check the read cache the same way. If that's empty too then the chunker fetches from S3 and fills it in, which is what guarantees the read can always be served:
 
 ```text
 read  block 3 ──> in the write cache?  ──yes──> serve it from there
@@ -440,7 +442,7 @@ read  block 3 ──> in the write cache?  ──yes──> serve it from there
 write block 3 ──> write cache only, mark the block dirty
 ```
 
-So writes never reach the read cache, which means it stays byte-identical to S3 for the sandbox's whole life. Two sandboxes on the same build could therefore share one read cache and stay perfectly isolated, since each one's writes land in its own private cache. E2B keeps them separate anyway, and Part 3 is where we stop doing that.
+Since writes never touch the read cache, the read cache stays byte-identical to the build in S3 for the duration of the sandbox. Two sandboxes on the same build could therefore share one read cache, although E2B keeps them separate anyway. Consider that a small hint about what's coming in Part 3.
 
 ## The two consumers
 
@@ -457,22 +459,18 @@ Firecracker is the hypervisor running the microVM, and it expects both of these 
 
   guest reads a file                     guest touches a page of RAM
     │                                      │
-    ▼  looks like a normal disk            ▼  page isn't really there yet
-  /dev/vda                               the kernel raises a page fault
-    │                                      │
-    ▼  which is really a network           ▼  our handler catches the fault
-    │  block device we serve               │  and fills the page in
+    ▼  NBD                                 ▼  userfaultfd
     └──────────────┬───────────────────────┘
                    ▼
              block.Overlay
-       same headers, same chunker, same cache
+       same headers, same chunker, same caches
 
   4 KiB blocks                           2 MiB blocks (hugepages)
 ```
 
-The disk gets served over NBD, which is Linux's protocol for making a network block device look local. Memory gets served over userfaultfd, a Linux feature that lets a normal program handle page faults itself. Two unrelated mechanisms landing on the same overlay, where the only difference underneath is the block size. Memory sits on hugepages and works in 2 MiB units while the disk uses 4 KiB.
+For the disk we hand Firecracker a network block device over NBD, which lets us serve reads from our own process while the guest sees an ordinary `/dev/vda`. For memory we use userfaultfd, which lets us catch the guest's page faults ourselves and fill each page in before the guest notices anything was missing.
 
-Part 3 adds a third consumer that E2B doesn't have: the host kernel's own ext4 driver.
+Two completely different mechanisms, and neither one changes what sits underneath. The only thing the overlay cares about is block size, since memory works in 2 MiB hugepages while the disk works in 4 KiB blocks.
 
 ## Snapshotting
 
@@ -499,26 +497,47 @@ We then walk over the bitmap in order and copy each dirty block into a fresh fil
 
 The bitmap also gives us the header. Each run of set bits becomes one `BuildMap` entry, and the runs get merged onto the parent's mapping and normalized the way we walked through earlier. Uploading the diff file and header then produces `diff-a`.
 
-### Where the dirty pages actually are
+## Memory-mapped files
 
-The write cache is [mmap'd](https://man7.org/linux/man-pages/man2/mmap.2.html), which means the sandbox writes to it by writing to memory rather than by calling `write(2)`. Those writes dirty a page of the kernel's page cache, and the kernel pushes them down to the file whenever writeback feels like getting to it.
+Both caches are [memory-mapped](https://man7.org/linux/man-pages/man2/mmap.2.html), which is what lets us claim an 8 GiB file and use almost none of it. The idea is that we ask Linux for a region of our own address space and tell it that region *is* a file. From then on we read and write ordinary memory, and Linux handles everything else.
 
-Copying the diff out reads that file through an ordinary file descriptor, so the timing matters:
+That's the whole trick, and two things fall out of it:
+
+1. Nothing is allocated until we touch it. The file claims 8 GiB, but only the pages we've actually written take up disk, which is exactly the sparse behaviour the caches rely on.
+2. We never call `write(2)`. Writing to memory marks that page dirty, and Linux decides on its own schedule when to push it down to the real file. This is called writeback.
+
+Point 2 is what matters at snapshot time, because when we pause a sandbox its most recent writes are still sitting in memory with nothing on disk to show for them:
 
 ```text
   sandbox writes block 5
     │
     ▼
-  mmap'd page in memory   <-- dirty, the real data is here
+  mmap'd page in memory   <-- dirty, the newest data is here
     │
     │  kernel writeback, whenever it feels like it
     ▼
-  cache file on disk      <-- what a file descriptor sees
+  cache file on disk      <-- what's actually durable
 ```
 
-So E2B nudges writeback along with [`sync_file_range(2)`](https://man7.org/linux/man-pages/man2/sync_file_range.2.html) before the copy, which starts flushing the dirty pages without waiting for the disk to confirm anything. It's treated as an optimization rather than a correctness step, since the copy reads through the page cache anyway and sees dirty pages whether or not they've reached the platter. Failing it logs a warning and carries on.
+So before copying anything out, E2B calls [`sync_file_range(2)`](https://man7.org/linux/man-pages/man2/sync_file_range.2.html) to tell Linux to start flushing those pages now instead of later. It's a head start rather than a requirement, since the call returns without waiting for the disk and the copy would have seen those dirty pages regardless. Getting writeback moving early just leaves less of it pending once the copy starts, which is why failing this call only logs a warning.
 
-The copy itself uses [`copy_file_range(2)`](https://man7.org/linux/man-pages/man2/copy_file_range.2.html), which moves bytes between two file descriptors entirely inside the kernel rather than reading them into the process and writing them back out. On XFS it goes further and makes the two files share the same blocks, so a 500 MiB diff moves no data at all. ext4 can't do that, so there the kernel really does copy 500 MiB. Either way it beats two trips through userspace for bytes nobody looks at.
+The copy itself has up to a few hundred mebibytes to move into the diff file. The obvious way is to read it into our process and write it back out, which is two full copies of data we never even look at. So E2B uses [`copy_file_range(2)`](https://man7.org/linux/man-pages/man2/copy_file_range.2.html) instead, asking the kernel to do it without the bytes ever entering our program:
+
+```text
+  READ + WRITE                        COPY_FILE_RANGE
+
+  cache file                          cache file
+      │                                   │
+      │  read into our process            │
+      ▼                                   │  never leaves
+  a buffer we never look at               │  the kernel
+      │                                   │
+      │  write it back out                │
+      ▼                                   ▼
+  diff file                           diff file
+```
+
+On XFS it does even better and skips the copy altogether, pointing both files at the same underlying blocks so a 500 MiB diff moves no data at all. ext4 has no equivalent, so there the kernel really does copy all 500 MiB, which still beats dragging it through our process twice.
 
 ## Trade-offs
 
