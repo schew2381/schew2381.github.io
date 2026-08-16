@@ -35,41 +35,40 @@ ONE RUNNING SANDBOX
         │  page fault                   │  block request
 ════════│═══════════════════════════════│════════════  guest above, host below
         ▼                               ▼
-    page-fault handler              block-request handler
-        │                               │  /dev/vda is really the host's
-        │                               │  /dev/nbd0, which the host
-        │                               │  kernel never mounts
+    page-fault handler              block.Overlay
+        │                               │
+        │                               ├──────> write cache, private to
+        │                               │        this sandbox, dirty bitmap
+        │                               │
+        │                               │  not written by this sandbox
         └───────────────┬───────────────┘
                         ▼
-                  block.Overlay
-        ┌───────────────┴───────────────┐
-        ▼                               ▼
-┌───────────────┐           ┌───────────────────────┐
-│ write cache   │           │ read cache            │
-│ mmap'd sparse │           │ mmap'd sparse         │
-│ dirty bitmap  │           │ cached bitmap         │
-└───────────────┘           └───────────┬───────────┘
-                                        │  miss
-                                        ▼
-                            ┌───────────────────────┐
-                            │ chunker               │
-                            │ fetches 4 MiB at once │
-                            └───────────┬───────────┘
-                                        │
-                                        ▼
-                            ┌───────────────────────┐
-                            │ header mapping        │
-                            │ offset -> build UUID  │
-                            └───────────┬───────────┘
-                                        │
-════════════════════════════════════════│════════════  host above, S3 below
-                                        ▼
-                            ┌───────────────────────┐
-                            │ object storage        │
-                            └───────────────────────┘
+            ┌───────────────────────┐
+            │ read cache            │
+            │ mmap'd sparse         │
+            │ cached bitmap         │
+            └───────────┬───────────┘
+                        │  miss
+                        ▼
+            ┌───────────────────────┐
+            │ chunker               │
+            │ fetches 4 MiB at once │
+            └───────────┬───────────┘
+                        │
+                        ▼
+            ┌───────────────────────┐
+            │ header mapping        │
+            │ offset -> build UUID  │
+            └───────────┬───────────┘
+                        │
+════════════════════════│════════════  host above, S3 below
+                        ▼
+            ┌───────────────────────┐
+            │ object storage        │
+            └───────────────────────┘
 ```
 
-Writes stop at the left branch under `block.Overlay` and never travel any further. So the right branch stays byte-identical to what's in S3 for as long as the sandbox lives, and the last two posts spend their time exploiting that.
+Writes stop at the write cache and never travel any further, so everything below it stays byte-identical to what's in S3 for as long as the sandbox lives. The last two posts spend their time exploiting that.
 
 ## A build in object storage
 
@@ -354,7 +353,7 @@ Now three builds back one filesystem. Reading blocks 3 and 5 opens `diff-a`, blo
 
 ## The chunker
 
-Now that `build.File` can resolve any virtual offset to a build and a physical offset, we have enough to serve a single read. If we tried to serve all reads like this however, each read would turn a few mebibytes into thousands of separate round trips to S3:
+Now that `build.File` can resolve any virtual offset to a build and a physical offset, we have enough to serve a single read. If we tried to serve all reads like this however each read would turn a few mebibytes into thousands of separate round trips to S3:
 
 ```text
   per block                              per 4 MiB chunk
@@ -394,7 +393,7 @@ ONE 4 MiB CHUNK, FETCHED 16 KiB AT A TIME
   reader:          A               B                               C
 ```
 
-Three batches in, `A` and `B` have their bytes and are already gone, while `C` is still parked. Each bump wakes all three readers to compare `bytesReady` against the end of the single block they asked for, so `C` goes straight back to sleep until batch 6 lands.
+Three batches in `A` and `B` have their bytes and are already gone, while `C` is still parked. Each bump wakes all three readers to compare `bytesReady` against the end of the single block they asked for, so `C` goes straight back to sleep until batch 6 lands.
 
 ## The read cache
 
@@ -428,9 +427,9 @@ type Overlay struct {
 ```
 [overlay.go:14](https://github.com/e2b-dev/infra/blob/da099cf305df080abd16b964ff8b664736ee6d34/packages/orchestrator/pkg/sandbox/block/overlay.go#L14)
 
-Writing is the simple direction. The sandbox drops the blocks into the write cache and marks them dirty in the bitmap, and that's the end of it.
+Writing is the simple direction. The sandbox drops the blocks into the write cache and marks them dirty in the bitmap.
 
-Reading walks down the stack. We check the write cache first and serve the block if its bit is set. Failing that we check the read cache the same way. If that's empty too then the chunker fetches from S3 and fills it in, which is what guarantees the read can always be served:
+Reads on the other hand walk down the stack. We check the write cache first and serve the block if its bit is set. Failing that we check the read cache the same way. As a final resort the chunker then fetches from S3 and populates the read cache:
 
 ```text
 read  block 3 ──> in the write cache?  ──yes──> serve it from there
@@ -443,34 +442,6 @@ write block 3 ──> write cache only, mark the block dirty
 ```
 
 Since writes never touch the read cache, the read cache stays byte-identical to the build in S3 for the duration of the sandbox. Two sandboxes on the same build could therefore share one read cache, although E2B keeps them separate anyway. Consider that a small hint about what's coming in Part 3.
-
-## The two consumers
-
-So far this has all been about one file, the sandbox's disk. But a sandbox actually needs two multi-gigabyte files out of S3, and that's why the S3 prefix back at the start had both a `rootfs.ext4` and a `memfile`.
-
-`rootfs.ext4` is the disk, holding the OS and everything the user's code reads or writes. `memfile` is the guest's RAM, and it exists because a sandbox never boots from scratch. It resumes a VM that already finished booting, which means the file holds a running kernel, every process that was alive, and Linux's own page cache of the disk it had already read.
-
-So the split is that `rootfs.ext4` is what's on disk while `memfile` is the state of a machine that has read that disk and finished booting. A disk on its own only gets you something that still has to boot, which is the thirty-second path. Resuming in a second means the CPU picks up mid-stride, and that only works if RAM looks exactly like it did at the moment of the pause.
-
-Firecracker is the hypervisor running the microVM, and it expects both of these to be ordinary local things. It wants a disk it can do block I/O against and a file it can map into the guest's memory, but neither one is actually on the machine. So in both cases something has to sit underneath and turn the guest's access into a fetch:
-
-```text
-  THE DISK                               GUEST MEMORY
-
-  guest reads a file                     guest touches a page of RAM
-    │                                      │
-    ▼  NBD                                 ▼  userfaultfd
-    └──────────────┬───────────────────────┘
-                   ▼
-             block.Overlay
-       same headers, same chunker, same caches
-
-  4 KiB blocks                           2 MiB blocks (hugepages)
-```
-
-For the disk we hand Firecracker a network block device over NBD, which lets us serve reads from our own process while the guest sees an ordinary `/dev/vda`. For memory we use userfaultfd, which lets us catch the guest's page faults ourselves and fill each page in before the guest notices anything was missing.
-
-Two completely different mechanisms, and neither one changes what sits underneath. The only thing the overlay cares about is block size, since memory works in 2 MiB hugepages while the disk works in 4 KiB blocks.
 
 ## Snapshotting
 
@@ -499,11 +470,11 @@ The bitmap also gives us the header. Each run of set bits becomes one `BuildMap`
 
 ## Memory-mapped files
 
-Both caches are [memory-mapped](https://man7.org/linux/man-pages/man2/mmap.2.html), which is what lets us claim an 8 GiB file and use almost none of it. The idea is that we ask Linux for a region of our own address space and tell it that region *is* a file. From then on we read and write ordinary memory, and Linux handles everything else.
+Both caches are [memory-mapped](https://man7.org/linux/man-pages/man2/mmap.2.html), which means they're sparse files that don't take up the full image size on the sandbox's disk. The idea is that we ask Linux for a region of our own address space and tell it that region *is* a file. From then on we read and write ordinary memory, and Linux handles everything else.
 
-That's the whole trick, and two things fall out of it:
+Two things fall out of that:
 
-1. Nothing is allocated until we touch it. The file claims 8 GiB, but only the pages we've actually written take up disk, which is exactly the sparse behaviour the caches rely on.
+1. Nothing is allocated until we touch it. The file claims the image's full size, but only the pages we've actually written cost us any disk.
 2. We never call `write(2)`. Writing to memory marks that page dirty, and Linux decides on its own schedule when to push it down to the real file. This is called writeback.
 
 Point 2 is what matters at snapshot time, because when we pause a sandbox its most recent writes are still sitting in memory with nothing on disk to show for them:
@@ -539,6 +510,40 @@ The copy itself has up to a few hundred mebibytes to move into the diff file. Th
 
 On XFS it does even better and skips the copy altogether, pointing both files at the same underlying blocks so a 500 MiB diff moves no data at all. ext4 has no equivalent, so there the kernel really does copy all 500 MiB, which still beats dragging it through our process twice.
 
+## The two consumers
+
+So far this has all been about one file, the sandbox's disk. But a sandbox actually needs two multi-gigabyte files out of S3 which is why the S3 prefix back at the start had both a `rootfs.ext4` and a `memfile`.
+
+`rootfs.ext4` is the disk, holding the OS and everything the user's code reads or writes. `memfile` is the guest's RAM, and it exists because a sandbox never boots from scratch. It resumes a VM that already finished booting, which means the file holds a running kernel, every process that was alive, and Linux's own page cache of the disk it had already read.
+
+So the split is that `rootfs.ext4` is what's on disk while `memfile` is the state of a machine that has read that disk and finished booting. A disk on its own only gets you something that still has to boot, which is the thirty-second path. Resuming in a second means the CPU picks up mid-stride, and that only works if RAM looks exactly like it did at the moment of the pause.
+
+Firecracker, the hypervisor running the microVM, expects both of these to be ordinary local things. It wants a disk it can do block I/O against, and it wants a file it can map into the guest's RAM. Neither one is actually on the machine, so for each of them something has to catch the guest's access and turn it into a fetch.
+
+Everything we've built so far gets used twice, once per file, with its own header, chunker, and read cache. What differs is only how the guest's access reaches us:
+
+```text
+  THE DISK, rootfs.ext4                  GUEST MEMORY, memfile
+
+  guest reads a file                     guest touches a page of RAM
+    │                                      │
+    ▼  block I/O to /dev/vda               ▼  the page isn't there,
+    │  which is really NBD,                │  so the CPU faults and
+    │  served by our process               │  userfaultfd hands us the
+    │                                      │  fault to satisfy
+    ▼                                      ▼
+  header, chunker, read cache            header, chunker, read cache
+  4 KiB blocks                           2 MiB hugepages
+```
+
+The disk goes out over NBD, which is how Linux serves a block device from a normal process. The guest sees `/dev/vda` and never knows the difference. Memory uses userfaultfd, which lets us handle the guest's page faults ourselves and fill each page in before the guest notices anything was missing.
+
+### Only the disk gets a write cache
+
+Writes are where the two genuinely part ways. A disk write is block I/O, so it travels out to our process where we can catch it, which is exactly what the write cache does.
+
+A memory write doesn't travel anywhere. Once userfaultfd has filled a page in, that page is ordinary RAM and the guest writes to it at full speed with us nowhere near it. So there's no write cache for memory, and at pause time we just ask Firecracker which pages it dirtied.
+
 ## Trade-offs
 
 | | Lazy block fetch | Download the image first |
@@ -549,9 +554,9 @@ On XFS it does even better and skips the copy altogether, pointing both files at
 | Failure mode | Object storage outage stalls live I/O | Fails before boot |
 | Snapshot cost | Dirty blocks only | Full image copy |
 
-In this post we followed one read down from the guest kernel to S3 and one pause back up again. Along the way our eight-block image became a base build, two diffs, and a mapping stitching them together. The two pauses uploaded three blocks between them instead of rewriting all eight, and the sandbox started without waiting on any of it.
+In Part 1 of this series we traced one read down from the guest kernel to S3, through snapshotting, and back up again. Between the read and write caches, the header mapping of blocks, and chained builds, we ended up with a copy-on-write filesystem for our sandboxes that's backed entirely by object storage.
 
-Downloading the image first would have put that waiting up front, where at least you expect it. This puts it wherever the guest happens to read, so a miss turns into an S3 round trip that the guest feels as a very slow disk. That's a good trade for a sandbox starting in a second and occasionally stalling for 40 ms. It's a bad one for a workload that reads most of the image anyway, since then you've paid for the download and made it slower.
+If the sandboxes downloaded images on startup instead, it would have taken a lot longer for them to spin up. Reads on the other hand incur a slight S3 round-trip delay, which is a good trade for sandboxes starting in sub-second time. If you have a workload that reads most of the image anyway then the trade goes the other way, since you've paid for the whole download and made it slower on top.
 
 The chain we built is the other cost. Two builds deep is free, but every pause adds another object a read might resolve through, and nothing here flattens it back down.
 

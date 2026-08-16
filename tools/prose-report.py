@@ -512,7 +512,10 @@ BARE_IMPERATIVE = (
     r"take|shrink|start|picture|imagine|say|call|note|consider|use|watch|read|count"
     r"|think|drop|pick|ask|run|write|open|walk|follow|trace|swap|treat|skip|assume"
 )
-STATED_THEN_SOLVED = re.compile(rf",\s+(?:so|and)\s+(?:{BARE_IMPERATIVE})\b", re.I)
+# `with its own header, chunker, and read cache` is a series ending in a compound
+# noun, not an instruction, so the noun the verb modifies rules it out.
+NOT_AN_ORDER = r"(?!\s+(?:cache|caches|path|paths|side|device|devices|amplification|only|and|or)\b)"
+STATED_THEN_SOLVED = re.compile(rf",\s+(?:so|and)\s+(?:{BARE_IMPERATIVE})\b{NOT_AN_ORDER}", re.I)
 
 # `So let's take one Pod, and follow it down to a mount.` A sentence already
 # built on `let's` has somebody in the room, so the verb after the comma is that

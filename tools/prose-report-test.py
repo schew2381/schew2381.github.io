@@ -270,6 +270,8 @@ STATED: list[tuple[str, bool]] = [
     # A `let's` already put somebody in the room, so the second verb is the same
     # invitation continuing rather than a fix with nobody attached to it.
     ("So let's take one Pod, and follow it down to a mount on a node.", False),
+    # A series ending in a compound noun, where `read` modifies `cache`.
+    ("It gets used twice, with its own header, chunker, and read cache.", False),
 ]
 
 CONDITIONAL: list[tuple[str, bool]] = [
