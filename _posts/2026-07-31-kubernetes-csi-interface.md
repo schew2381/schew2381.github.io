@@ -24,7 +24,7 @@ A CSI driver is a gRPC server and the spec groups what it can serve into five se
 
 ### Identity
 
-Every driver implements this mandatory service which answers who the driver is and whether it's alive:
+Every driver implements this mandatory service comprised of three RPCs, answering who the driver is and whether it's alive:
 
 ```text
 ┌────────────────────────────────────────────────────────────┐
@@ -36,11 +36,11 @@ Every driver implements this mandatory service which answers who the driver is a
 └────────────────────────────────────────────────────────────┘
 ```
 
-`GetPluginCapabilities` is the interesting one, because it's how the driver declares which of the next two services it bothers to implement.
+`GetPluginCapabilities` is the interesting one because it's how the driver declares which of the next two services it bothers to implement.
 
 ### Controller
 
-The Controller service deals with a volume *existing*, and it runs as a Deployment somewhere in the cluster rather than on any particular node:
+The Controller service is about whether a volume *exists* at all rather than about mounting one, and it runs as a Deployment somewhere in the cluster instead of on any particular node:
 
 ```text
 ┌────────────────────────────────────────────────────────────┐
@@ -53,13 +53,13 @@ The Controller service deals with a volume *existing*, and it runs as a Deployme
 └────────────────────────────────────────────────────────────┘
 ```
 
-You need this when a volume has a life of its own. A cloud disk gets provisioned before any Pod exists, outlives the Pod that used it, and can be attached to a different machine tomorrow. Somebody has to own those decisions from outside any single node.
+You need this when a volume has a life of its own. For example AWS EBS volumes get provisioned before any Pod exists, outlive the Pod that used them, and can be attached to a different machine tomorrow. Somebody has to own those decisions from outside any single node.
 
-Our volume isn't like that. It's created when the Pod starts and thrown away when the Pod dies, so there's nothing to own from outside. Part 3's driver skips this service entirely.
+Our volume isn't like that because it's created when the Pod starts and thrown away when the Pod dies so there's nothing to own from outside. Part 3's driver skips this service entirely.
 
 ### Node
 
-The Node service deals with making a volume usable *on one machine*, so it runs as a DaemonSet with one Pod on every node:
+The Node service deals with making a volume usable *on one machine* so it runs as a DaemonSet on every node:
 
 ```text
 ┌────────────────────────────────────────────────────────────┐
@@ -73,9 +73,9 @@ The Node service deals with making a volume usable *on one machine*, so it runs 
 └────────────────────────────────────────────────────────────┘
 ```
 
-Every driver needs this one, for the unavoidable reason that mounting a filesystem has to happen on the machine that's going to use it. Nothing about a mount can be done remotely.
+Every driver needs this one because mounting a filesystem has to happen on the machine that's going to use it. Nothing about a mount can be done remotely.
 
-So our seven RPCs are all three of Identity, plus `NodePublishVolume`, `NodeUnpublishVolume`, `NodeGetInfo`, and `NodeGetCapabilities`.
+So in total we need to implement seven RPCs, all three from Identity, plus `NodePublishVolume`, `NodeUnpublishVolume`, `NodeGetInfo`, and `NodeGetCapabilities`.
 
 ## Who calls what
 
