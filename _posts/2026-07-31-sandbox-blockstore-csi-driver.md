@@ -538,7 +538,7 @@ The DaemonSet manifest carries four things a normal workload's wouldn't:
 | Blast radius of the driver dying | Every mount on the node | Volumes survive |
 | Durability of writes | Only as good as the checkpoint interval | Continuous |
 
-In this post we swapped one kernel for another, and paid for it four times over:
+In this post we swapped one kernel for another and paid for it four times over:
 
 1. An NBD server, so the host kernel would accept a device from us at all.
 2. A teardown order that gets its dirty pages to S3 before we close the socket.
