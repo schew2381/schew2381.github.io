@@ -538,7 +538,12 @@ The DaemonSet manifest carries four things a normal workload's wouldn't:
 | Blast radius of the driver dying | Every mount on the node | Volumes survive |
 | Durability of writes | Only as good as the checkpoint interval | Continuous |
 
-In this post we swapped one kernel for another and paid for it four times over. We built an NBD server so the host kernel would accept a device from us. We ordered teardown so its dirty pages reach S3 before we close the socket, shared one read cache across every Pod on the node, and put snapshots on a timer because nothing pauses a Pod.
+In this post we swapped one kernel for another, and paid for it four times over:
+
+1. An NBD server, so the host kernel would accept a device from us at all.
+2. A teardown order that gets its dirty pages to S3 before we close the socket.
+3. One read cache shared across every Pod on the node.
+4. Snapshots on a timer, because nothing ever pauses a Pod.
 
 Blast radius is the cost that actually keeps you up. Those dispatch goroutines aren't serving the block device, they *are* the block device. A dead DaemonSet Pod means every `/dev/nbdN` on the node stops answering at once and every ext4 mount above them starts throwing I/O errors. A CSI driver for a network-attached disk can crash, restart, and find its volumes where it left them. This one can't, and no amount of care inside the driver changes that.
 
