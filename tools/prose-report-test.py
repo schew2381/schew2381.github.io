@@ -106,6 +106,14 @@ SEAM_OPENER: list[tuple[str, bool]] = [
     ("So the export runs on a timer instead:", False),
 ]
 
+# True means the slug is dead, so the link is broken.
+INTERNAL: list[tuple[str, bool]] = [
+    ("/posts/no-such-post/", True),
+    ("/posts/e2b-block-storage-layer/", False),
+    # A heading anchor on a cross-post link isn't part of the slug.
+    ("/posts/e2b-block-storage-layer/#memory-mapped-files", False),
+]
+
 PINNED: list[tuple[str, bool]] = [
     ("https://github.com/e2b-dev/infra/blob/main/packages/shared/x.go", True),
     ("https://github.com/container-storage-interface/spec/blob/master/spec.md", True),
@@ -404,6 +412,12 @@ def main() -> int:
 
     posts = sorted(p for p in report.POSTS.glob("*.md") if p.name not in report.NOT_POSTS)
     slugs = {p.stem[11:] for p in posts}
+
+    for url, expected in INTERNAL:
+        dead = url.split("#")[0].strip("/").split("/")[-1] not in slugs
+        if dead != expected:
+            failures.append(f"dead-internal-link {url!r} is {dead}, want {expected}")
+
     for path in posts:
         post = report.parse(path)
         report.check_mechanical(post, slugs)
@@ -419,7 +433,7 @@ def main() -> int:
         len(SPLITS) + len(SIGNPOST) + len(HEADING_Q) + len(READING) + len(ANNOUNCES) + len(SPEC_SHEET) + len(COLON)
         + len(SEAM_OPENER) + len(ECHO) + len(PIVOT) + len(CONTRACT) + len(PINNED)
         + len(PILEUP) + len(SPLICE) + len(DEFINITION) + len(SELF_REF) + len(STATED)
-        + len(CONDITIONAL) + len(COUNTED) + 2 + len(posts)
+        + len(CONDITIONAL) + len(COUNTED) + len(INTERNAL) + 2 + len(posts)
     )
     print(f"\n{checks - len(failures)}/{checks} passed over {len(posts)} posts")
     return 1 if failures else 0

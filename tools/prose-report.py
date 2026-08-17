@@ -691,7 +691,9 @@ def check_links(post: Post, slugs: set[str]) -> list[Finding]:
         for match in LINK_RE.finditer(text):
             url = match.group(2)
             if url.startswith("/posts/"):
-                if url.strip("/").split("/")[-1] not in slugs:
+                # A link into another post can carry a heading anchor, and the
+                # slug is everything before it.
+                if url.split("#")[0].strip("/").split("/")[-1] not in slugs:
                     found.append(Finding(number, "mechanical", "dead-internal-link", url))
             elif "github.com" in url and "/blob/" in url:
                 ref = url.split("/blob/")[1].split("/")[0]
