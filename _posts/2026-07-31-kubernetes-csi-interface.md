@@ -358,21 +358,11 @@ We never get to rewrite that path, so the namespace has to make the literal stri
 
 ## How to test a CSI driver
 
-With any custom CSI driver you'll want to start with [csi-sanity](https://github.com/kubernetes-csi/csi-test), which runs the spec's conformance suite against a live socket. It checks the error codes, the idempotency rules from earlier, and whether the capabilities you declared match what you actually serve.
+With any custom CSI driver it's best to start with [csi-sanity](https://github.com/kubernetes-csi/csi-test) which runs the spec's conformance suite against a live socket. You can point it at your driver and check the error codes, idempotency rules, and whether your capability declarations match what you actually serve. It's great at catching any interface issues along with kubelet retry errors and deadlocks.
 
-The gap is that csi-sanity only knows the gRPC contract. It never sees the registrar handshake or mount propagation, and both of those live entirely outside it:
+What we can't statically test is anything outside the gRPC contract, since the tests know nothing about your storage and never see mount propagation or the registration handshake. Those are the two things most likely to be broken the first time you deploy, and we passed csi-sanity cleanly before spending the rest of the day staring at an empty directory inside a Pod.
 
-```text
-  what csi-sanity covers          what it can't reach
-
-  every RPC's error codes         the registrar's socket paths
-  idempotency on retry            Bidirectional propagation
-  capability declarations         whether the bytes are right
-```
-
-Both of the bugs from earlier hid in that right-hand column. We passed csi-sanity cleanly with the registrar flags swapped, and passed it again with propagation left off, because neither one is an RPC.
-
-So the second half of testing is just deploying to a real cluster and watching one Pod come up. If it reaches `Running` and its files are there, the parts csi-sanity can't see are working.
+So use csi-sanity to prove the contract, then deploy to a real cluster and watch a single Pod come up. Every failure worth worrying about lives in the gap between those two.
 
 ## Trade-offs
 
