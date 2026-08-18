@@ -158,11 +158,11 @@ Having both `NodeStageVolume` and `NodePublishVolume` looks redundant until you 
   ONE SHARED DISK, THREE PODS ON THE NODE
 
   NodeStageVolume     format it, fsck it, and mount it once
-                      at .../globalmount
+                      at .../globalmount                    <- expensive
                                 │
                   ┌─────────────┼─────────────┐
                   ▼             ▼             ▼
-  NodePublish     bind into     bind into     bind into
+  NodePublish     bind into     bind into     bind into      <- nearly free
                   pod-A         pod-B         pod-C
 ```
 
@@ -302,7 +302,7 @@ What we give up is early validation. Say someone typos the build ID. On the PVC 
 
 ## Mount propagation
 
-Our driver runs in a container, and it's about to mount a filesystem that a completely different container has to be able to see. That doesn't work by default, because Kubernetes gives each Pod its own mount namespace precisely so that mounts don't leak between them.
+Let's assume our driver runs in a container and it's about to mount a filesystem that a completely different container has to be able to see. That doesn't work by default because Kubernetes gives each Pod its own mount namespace precisely so that mounts don't leak between them.
 
 ```yaml
 volumeMounts:
@@ -316,7 +316,9 @@ volumeMounts:
     mountPropagation: Bidirectional
 ```
 
-`Bidirectional` makes it a shared mount in the kernel, so mounts the driver creates propagate out to the host and mounts the host creates propagate in. Leave it off and every layer reports success while the Pod gets an empty directory:
+We can get around this by setting `Bidirectional` so the mount is a shared mount in the kernel. This means mounts the driver and host create are accessible both ways.
+
+Leave it off and nothing complains, which is what makes this one worth knowing about:
 
 ```text
   without Bidirectional                  with Bidirectional
@@ -335,9 +337,9 @@ volumeMounts:
   nothing errors anywhere
 ```
 
-Nothing in that left-hand path returns an error. The mount really did succeed, just in a namespace nobody else can look into. This also needs `privileged: true`, since shared propagation is a privileged operation.
+The mount on the left really did succeed, just in a namespace nobody else can look into. This also needs `privileged: true` since shared propagation is a privileged operation.
 
-The other half of this is which directory you mount. We mounted just the Pod's own volume directory, which looks tidier and breaks every publish. Kubelet hands the driver an absolute path, and that exact string has to resolve inside the driver's container:
+Now let's look at which directory we actually mount, because we tried mounting just the Pod's own volume directory and it broke every publish. Kubelet hands us an absolute path and that exact string has to resolve inside our container:
 
 ```text
   kubelet passes: /var/lib/kubelet/pods/<uid>/volumes/…/codebase
@@ -352,15 +354,25 @@ The other half of this is which directory you mount. We mounted just the Pod's o
   doesn't exist in this namespace        will go looking for it
 ```
 
-The driver never gets to rewrite that path, so the namespace has to make the literal string valid.
+We never get to rewrite that path, so the namespace has to make the literal string valid.
 
 ## How to test a CSI driver
 
-With any custom CSI driver, start with [csi-sanity](https://github.com/kubernetes-csi/csi-test), which runs the spec's conformance suite against a live socket. Point it at your driver and it checks the error codes, the idempotency rules from earlier, and whether your capability declarations match what you actually serve. It's very good at the class of bug where a driver works perfectly when you drive it by hand and then deadlocks the first time kubelet retries something.
+With any custom CSI driver you'll want to start with [csi-sanity](https://github.com/kubernetes-csi/csi-test), which runs the spec's conformance suite against a live socket. It checks the error codes, the idempotency rules from earlier, and whether the capabilities you declared match what you actually serve.
 
-What it can't do is reach anything outside the gRPC contract. It knows nothing about your storage, and it never sees mount propagation or the registration handshake. Those are the two things most likely to be broken the first time you deploy, and we passed csi-sanity cleanly before spending the rest of the day staring at an empty directory inside a Pod.
+The gap is that csi-sanity only knows the gRPC contract. It never sees the registrar handshake or mount propagation, and both of those live entirely outside it:
 
-So use csi-sanity to prove the contract, then deploy to a real cluster and watch a single Pod come up. Every failure worth worrying about lives in the gap between those two.
+```text
+  what csi-sanity covers          what it can't reach
+
+  every RPC's error codes         the registrar's socket paths
+  idempotency on retry            Bidirectional propagation
+  capability declarations         whether the bytes are right
+```
+
+Both of the bugs from earlier hid in that right-hand column. We passed csi-sanity cleanly with the registrar flags swapped, and passed it again with propagation left off, because neither one is an RPC.
+
+So the second half of testing is just deploying to a real cluster and watching one Pod come up. If it reaches `Running` and its files are there, the parts csi-sanity can't see are working.
 
 ## Trade-offs
 
