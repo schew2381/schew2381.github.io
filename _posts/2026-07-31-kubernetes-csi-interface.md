@@ -148,7 +148,7 @@ if err != nil {
 
 The node ID it returns is what lands in the `CSINode` object, so a driver that skips the call never gets that far.
 
-That's registration done, and step 7 is now a single `NodePublishVolume` call away. Four decisions hide inside that one call, and they're what's left to work through.
+That's registration done, and step 7 is now a single `NodePublishVolume` call away.
 
 ## Why there are two mount RPCs
 
@@ -158,15 +158,15 @@ Having both `NodeStageVolume` and `NodePublishVolume` looks redundant until you 
   ONE SHARED DISK, THREE PODS ON THE NODE
 
   NodeStageVolume     format it, fsck it, and mount it once
-                      at .../globalmount                    <- expensive
+                      at .../globalmount
                                 │
                   ┌─────────────┼─────────────┐
                   ▼             ▼             ▼
-  NodePublish     bind into     bind into     bind into      <- nearly free
+  NodePublish     bind into     bind into     bind into
                   pod-A         pod-B         pod-C
 ```
 
-Staging is the expensive work done once per node, publishing is the cheap bind mount done once per Pod, and a driver opts out of both by leaving `STAGE_UNSTAGE_VOLUME` out of `NodeGetCapabilities`.
+Staging can do the expensive work once on the node, while publishing is the cheap bind mount done per Pod. A driver opts out of both by leaving `STAGE_UNSTAGE_VOLUME` out of `NodeGetCapabilities`.
 
 Our volume looks like it wants staging, since twenty Pods on the same build read identical bytes. The catch is what staging keys on:
 
@@ -192,7 +192,7 @@ if volumeLifecycleMode == storage.VolumeLifecycleEphemeral {
 
 ## Every call has to survive being repeated
 
-Kubelet retries on any error, and a lost reply looks exactly like a failure:
+Kubelet retries on any error and a lost reply looks exactly like a failure:
 
 ```text
   THE MOUNT FAILED                  THE REPLY GOT LOST
@@ -207,11 +207,11 @@ Kubelet retries on any error, and a lost reply looks exactly like a failure:
 
 So every RPC has to be idempotent. Publishing an already-mounted volume returns success instead of complaining, and so does unpublishing something that was never mounted.
 
-That second one is the trap, because the honest answer is the broken one. A driver that returns `NotFound` is telling the truth and leaving the Pod stuck in `Terminating`, since kubelet will keep asking until somebody says yes.
+Watch out for that second one. Returning `NotFound` is the accurate answer and it wedges the Pod in `Terminating`, because kubelet keeps retrying until the unmount succeeds.
 
 ## Getting the build ID to the driver
 
-Our driver needs one piece of information to do its job, which is that the Pod wants build `foobar3`. There are two ways to get it there, and they're genuinely different paths through Kubernetes rather than two spellings of the same thing.
+Our driver needs one piece of information to do its job, which is that the Pod wants build `foobar3`. There are two distinct ways in Kubernetes to get this done.
 
 ### The PVC path
 
@@ -280,7 +280,7 @@ Kubelet invents a volume ID on the spot, passes `volumeAttributes` straight thro
   4 objects, 1 sidecar, 2 RPCs           1 object, 0 sidecars, 1 RPC
 ```
 
-Three fields on the `CSIDriver` object turn this on, and each one deletes a piece of machinery:
+You can set three fields on the `CSIDriver` object to turn this on, where each one deletes a piece of machinery:
 
 ```yaml
 apiVersion: storage.k8s.io/v1
@@ -294,11 +294,11 @@ spec:
     - Ephemeral
 ```
 
-1. `attachRequired: false` deletes the `VolumeAttachment` objects and the `external-attacher` that creates them, so kubelet goes straight to the Node service. That's right for anything that isn't a real network-attached disk.
-2. `podInfoOnMount: true` makes kubelet include `pod.name`, `pod.namespace`, `pod.uid`, and `serviceAccount.name` in the `VolumeContext`, which is the only way a driver learns which Pod it's mounting for.
-3. `volumeLifecycleModes` lists the paths you support, so it has to name both if you want both.
+1. `attachRequired: false` deletes the `VolumeAttachment` objects and the `external-attacher` that creates them so kubelet goes straight to the Node service. That's right for anything that isn't a real network-attached disk.
+2. `podInfoOnMount: true` makes kubelet include `pod.name`, `pod.namespace`, `pod.uid`, and `serviceAccount.name` in the `VolumeContext` which is the only way a driver learns which Pod it's mounting for.
+3. `volumeLifecycleModes` lists the paths you support so it has to name both if you want both.
 
-The cost of this path is that nobody validates anything until the mount happens. Fat-finger the build ID on the PVC path and `CreateVolume` rejects it before the Pod is ever scheduled, leaving a `Pending` PVC with a clear message on it. Do the same thing here and the Pod sits in `ContainerCreating` with the real reason buried somewhere in kubelet's events.
+What we give up is early validation. Say someone typos the build ID. On the PVC path `CreateVolume` catches it before the Pod is ever scheduled, and the PVC sits in `Pending` with the reason printed on it. Here nothing checks the ID until we try to mount it, so the Pod hangs in `ContainerCreating` and the reason is somewhere in kubelet's events.
 
 ## Mount propagation
 
