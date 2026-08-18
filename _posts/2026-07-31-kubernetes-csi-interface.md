@@ -20,7 +20,7 @@ So let's take one Pod that wants a sandbox from template build `foobar3`, and fo
 
 ## The three services
 
-A CSI driver is a gRPC server and the spec groups what it can serve into five services. Two of them handle volume groups and snapshot metadata, which we don't need so that just leaves three services.
+A CSI driver is a gRPC server and the spec groups what it can serve into five services. Two of them handle volume groups and snapshot metadata which we don't need, so that just leaves three services.
 
 ### Identity
 
@@ -79,22 +79,44 @@ So in total we need to implement seven RPCs, all three from Identity, plus `Node
 
 ## Who calls what
 
-Now the part that surprised us, which is that nothing in Kubernetes ever calls our driver directly. There's no controller in the API server that knows what a CSI driver is. Instead two different things dial the driver's socket, and they call different services:
+Now the surprising part is that nothing in Kubernetes ever calls our driver directly since there's no controller in the API server that knows what a CSI driver is. Instead the driver gets discovered once when it starts up, and after that kubelet does the calling.
+
+So let's follow the whole thing end to end, in the two phases it actually happens in:
 
 ```text
-  WHO DIALS THE DRIVER'S SOCKET
+  ONCE PER NODE, when our driver starts up
+  ────────────────────────────────────────
+  1  our DaemonSet Pod starts and opens a gRPC socket
+     │
+     ▼
+  2  node-driver-registrar tells kubelet that socket exists
+     │
+     ▼
+  3  kubelet calls Identity and NodeGetInfo to learn who we are,
+     and from here on it knows to route our volumes to us
 
-  a PersistentVolumeClaim              the kubelet on one machine
-        │                                     │
-        ▼                                     │
-  sidecar containers                          │
-        │                                     │
-        ▼                                     ▼
-  Controller service                    Node service
-  "make a volume exist"                 "mount it here"
+  ONCE PER POD, every time one lands on this node
+  ───────────────────────────────────────────────
+  4  a Pod asks for a volume from our driver
+     │
+     ▼
+  5  the scheduler places the Pod on this node
+     │
+     ▼
+  6  if the volume has to be provisioned first, a sidecar calls
+     CreateVolume on the Controller service
+     │
+     ▼
+  7  kubelet calls NodePublishVolume on our socket
+     │
+     ▼
+  8  we mount a filesystem at the path kubelet named, and the
+     Pod's container starts and sees its files
 ```
 
-Those sidecars are prebuilt binaries from [kubernetes-csi](https://github.com/kubernetes-csi). They watch the API for objects like a PVC and turn what they find into Controller calls, and you deploy them beside your driver without writing any of them:
+Every step there happens as drawn except step 6, which our driver skips entirely for reasons we'll get to.
+
+Steps 2 and 6 are the work of sidecars, which are prebuilt binaries from [kubernetes-csi](https://github.com/kubernetes-csi) that you deploy beside your driver and never write yourself:
 
 1. `external-provisioner` watches PVCs and calls `CreateVolume`.
 2. `external-attacher` calls `ControllerPublishVolume`.
@@ -126,23 +148,7 @@ if err != nil {
 
 The node ID it returns is what lands in the `CSINode` object, so a driver that skips the call never gets that far.
 
-With registration done, our Pod's volume finally has a path to travel:
-
-```text
-  Pod asks for build foobar3
-        │
-        ▼
-  scheduler puts the Pod on node-7
-        │
-        ▼
-  kubelet on node-7  ──gRPC──> NodePublishVolume("foobar3", targetPath)
-        │
-        ▼
-  a mounted filesystem at
-  /var/lib/kubelet/pods/<uid>/volumes/kubernetes.io~csi/workspace/mount
-```
-
-One RPC, on one machine. There are four decisions hiding in that single arrow, and they're what's left to work through.
+That's registration done, and step 7 is now a single `NodePublishVolume` call away. Four decisions hide inside that one call, and they're what's left to work through.
 
 ## Why there are two mount RPCs
 
@@ -160,9 +166,9 @@ Having both `NodeStageVolume` and `NodePublishVolume` looks redundant until you 
                   pod-A         pod-B         pod-C
 ```
 
-That's the whole idea. Staging is the expensive work you only want to do once per node, and publishing is a bind mount you do once per Pod. A driver opts out by leaving `STAGE_UNSTAGE_VOLUME` out of `NodeGetCapabilities`, and kubelet then skips both staging calls.
+Staging is the expensive work done once per node, publishing is the cheap bind mount done once per Pod, and a driver opts out of both by leaving `STAGE_UNSTAGE_VOLUME` out of `NodeGetCapabilities`.
 
-Part 3's driver opts out, which looks like the wrong call at first. Twenty Pods running the same template all read the same bytes, so that's exactly the shape staging was built for. The problem is that staging keys on the volume ID, and those twenty Pods have twenty different volume IDs:
+Our volume looks like it wants staging, since twenty Pods on the same build read identical bytes. The catch is what staging keys on:
 
 ```text
   what kubelet keys staging on     what actually makes them shareable
@@ -174,9 +180,7 @@ Part 3's driver opts out, which looks like the wrong call at first. Twenty Pods 
   20 stages, 0 deduped             the IDs have nothing to do with it
 ```
 
-Kubernetes has no way to say "these volumes have the same contents," so Part 3 invents a key of its own and shares the read cache underneath CSI rather than through it.
-
-There's a second reason too, which is that kubelet wouldn't have offered the choice anyway. Staging only exists on the PVC path, and our volume takes the other path:
+Kubernetes has no way to say "these volumes hold the same bytes," so Part 3 shares the read cache underneath CSI rather than through it. Kubelet wouldn't have offered us the choice anyway, since staging only runs on the PVC path and ours is ephemeral:
 
 ```go
 if volumeLifecycleMode == storage.VolumeLifecycleEphemeral {
@@ -186,11 +190,9 @@ if volumeLifecycleMode == storage.VolumeLifecycleEphemeral {
 ```
 [csi_plugin.go:706](https://github.com/kubernetes/kubernetes/blob/v1.33.10/pkg/volume/csi/csi_plugin.go#L706)
 
-So declaring `STAGE_UNSTAGE_VOLUME` would advertise a capability to nobody.
-
 ## Every call has to survive being repeated
 
-Say our Pod's mount succeeds, and then the reply never makes it back to kubelet. Now compare that against the mount having simply failed:
+Kubelet retries on any error, and a lost reply looks exactly like a failure:
 
 ```text
   THE MOUNT FAILED                  THE REPLY GOT LOST
@@ -203,11 +205,9 @@ Say our Pod's mount succeeds, and then the reply never makes it back to kubelet.
   nothing is mounted                build foobar3 is mounted
 ```
 
-Kubelet sees the same thing either way, which is a call that didn't come back, so it retries. The driver has to be right in both cases without knowing which one happened.
+So every RPC has to be idempotent. Publishing an already-mounted volume returns success instead of complaining, and so does unpublishing something that was never mounted.
 
-For a publish that means the second call has to succeed rather than complain that the path is already mounted. For an unpublish it means the opposite trap, where a driver asked to unmount something that isn't mounted has to say yes anyway. Reporting `NotFound` is honest and it's also how you get a Pod stuck in `Terminating` forever, since kubelet will keep asking until it gets a success.
-
-Anything on the Controller side follows the same rule. `CreateVolume` called twice with the same name and parameters returns the existing volume, and only returns `ALREADY_EXISTS` if the parameters changed.
+That second one is the trap, because the honest answer is the broken one. A driver that returns `NotFound` is telling the truth and leaving the Pod stuck in `Terminating`, since kubelet will keep asking until somebody says yes.
 
 ## Getting the build ID to the driver
 
@@ -231,7 +231,7 @@ reclaimPolicy: Delete
 
 Everything under `parameters` arrives in the driver's `CreateVolume` request, gets echoed into the resulting `PersistentVolume`, and is handed to `NodePublishVolume` later as `VolumeContext`. So the Node service reads the build ID without going back to the API server.
 
-The line worth understanding here is `volumeBindingMode`, because for node-local storage the default value is actively wrong:
+The line worth understanding here is `volumeBindingMode` because for node-local storage the default value is actively wrong:
 
 ```text
   Immediate                              WaitForFirstConsumer
