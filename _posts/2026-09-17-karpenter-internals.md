@@ -14,7 +14,7 @@ tags: [karpenter, kubernetes, autoscaling, scheduling, spot]
 
 `0/8 nodes are available: 4 Insufficient nvidia.com/gpu, 8 Insufficient cpu.` The pod sits Pending and kube-scheduler will sit with it forever, because its whole job is picking among nodes that already exist and none of them fit. Two minutes later an instance is booting, a Node object appears, and the pod binds. Something in between did the scheduling work, and it wasn't kube-scheduler.
 
-That something is [Karpenter](https://github.com/kubernetes-sigs/karpenter). People describe it as an autoscaler, but it's closer to three jobs sharing one simulation. One loop watches pending pods and decides what hardware to buy, another decides which existing nodes should die, and inside both sits a scheduler that asks where a pod would land without ever binding one.
+That something is [Karpenter](https://github.com/kubernetes-sigs/karpenter). People call it an autoscaler, which is close but not quite the right shape. It's better held as one scheduling simulator driven by two control loops. A provisioning loop watches pending pods and asks what hardware would make them schedulable, then buys it. A disruption loop watches existing nodes and asks whether their pods could run elsewhere for less, then kills or replaces them. The first adds capacity, the second removes it, and pod binding stays with kube-scheduler.
 
 So let's follow one pod from Pending to a machine, and meet the objects it passes through on the way.
 
@@ -54,7 +54,7 @@ ONE PENDING POD BECOMES ONE NODE
                     kube-scheduler finally binds the pod
 ```
 
-The useful thing to notice up front is that the actual pod binding happens at the bottom, done by kube-scheduler on a node Karpenter bought. Karpenter never binds a pod in its life. Its scheduler is a simulator whose only output is a decision about hardware.
+The actual pod binding happens at the bottom of that diagram, done by kube-scheduler on a node Karpenter bought. Karpenter never binds a pod in its life. Its scheduler is a simulator whose only output is a decision about hardware.
 
 ## The vocabulary
 
@@ -78,13 +78,21 @@ A NodeClaim is where the two meet. Karpenter stamps one per piece of capacity it
 
 The pair people conflate is NodeClaim and Node: the claim is Karpenter's intent created before hardware exists, while the Node is the kubelet's presence created after boot. Everything interesting about lifecycle is the gap between them, and the gap is bridged by matching `spec.providerID` to `node.spec.providerID`.
 
-## Where the scheduler actually lives
+## One simulator, two loops
 
-A tempting model of Karpenter is scheduler plus autoscaler plus repacker as three reconcilers. The shape is right but two details matter.
+```text
+   pending pods ──▶ provisioning loop ──┐
+                                        ├──▶ scheduling simulator
+   existing nodes ─▶ disruption loop ───┘         │
+                                                  ├─▶ NodeClaims   (adds only)
+                                                  └─▶ deletions    (removes only)
+```
+
+Two consequences follow from putting the intelligence in a shared simulator rather than in either loop.
 
 First, the scheduler never places anything. kube-scheduler still binds every pod to a node, and Karpenter's [scheduling package](https://github.com/kubernetes-sigs/karpenter/blob/1b4b3e8c829dea93c8a0429e0e27aa68edc98ed7/pkg/controllers/provisioning/scheduling/scheduler.go) is a simulator answering a different question: if this pod needed a node, what would that node look like? Its outputs are NodeClaims, not bindings.
 
-Second, the three jobs aren't three reconcilers. The provisioner (scale up) and the disruption controller (scale down, repack) are the loops. The scheduler is a library both of them call, which is what lets the disruption side replay a node's pods through the same fit logic that placed them. The provisioner only ever adds capacity. It never moves a pod that already has a node, and that asymmetry is the whole reason Part 2 exists.
+Second, each loop only moves in one direction. The provisioner can add a node but never remove one, because a pod that can't schedule is never an argument for deleting capacity. The disruption loop owns every removal. What people picture as a separate repacker is the same fit simulation pointed at existing nodes instead of pending ones, which is also what lets a node's pods replay through the logic that placed them. That asymmetry is the whole reason Part 2 exists.
 
 ## The batch window
 

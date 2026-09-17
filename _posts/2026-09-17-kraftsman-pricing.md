@@ -16,7 +16,7 @@ tags: [karpenter, kraftsman, kubernetes, spot, gpu, cost]
 
 A claim priced at its worst case gets vetoed by the single most expensive zone it might land in, so a spot pool with one spiked zone kills savings available in five others. First-fit packing ignores that growing a claim can cost more than opening a cheaper one. And the 1:1 replacement rule hits the node with the most to save hardest. A fat node running half-empty can never consolidate, because its pods won't fit a single cheaper node.
 
-The [kraftsman](https://github.com/exa-labs/kraftsman) changes land in the order a request meets them, from what a claim reserves before it exists to what a pod costs to place to what a node takes to die.
+The [kraftsman](https://github.com/exa-labs/kraftsman) changes follow a request through its life: what a claim reserves before it exists, what a pod costs to place, and what a node takes to die.
 
 ## The DaemonSet tax, charged fairly
 
@@ -56,7 +56,7 @@ pod: 8 cpu.  claim-1 is a g5.2xlarge-shaped claim with room.
   marginal-cost:  pod opens claim-2, $0.17 beats $1.21
 ```
 
-Two degradations keep it honest: a placement with no priceable options falls back to binpacking rather than splitting arbitrarily, and binpack pools price every move at zero so behavior is untouched unless you opt in. On pools where instance types have big price steps (anything with accelerators), "does the pod fit" stops being the only question worth asking.
+Two degradations keep it predictable: a placement with no priceable options falls back to binpacking rather than splitting arbitrarily, and binpack pools price every move at zero so behavior is untouched unless you opt in. On pools where instance types have big price steps (anything with accelerators), "does the pod fit" stops being the only question worth asking.
 
 ## The node that couldn't die
 
@@ -95,7 +95,7 @@ All of the above treats capacity markets as something you query. There's a secon
 2. `WithUnavailableOfferingsIgnored` bypasses the insufficient-capacity cache for chosen capacity types. The ICE cache exists to stop hammering a sold-out market, but a market you stopped probing is a market you can't notice refilling. Structural incompatibilities stay unavailable regardless.
 3. `DriftReasonOnDemandLeaseExpired` is the reclaim path. When the provider falls back to on-demand under a lease, it marks the NodeClaim drifted with this reason once the lease expires. The drift controller sorts those candidates first and pins their replacements to spot, so an insufficient-capacity launch fails the command (and keeps the on-demand node) instead of falling back to another on-demand node. The lease swap is price correction, not template drift, and it gets scheduled like one.
 
-The provider that uses these is Exa-internal, but the shape matters more than the implementation. On a spot-first fleet, "temporarily on-demand" is a state the autoscaler should model rather than a fact it should accept.
+The provider that uses these is Exa-internal. On a spot-first fleet, "temporarily on-demand" is a state the autoscaler should model rather than a fact it should accept.
 
 ## The lifecycle edges a self-managed fleet hits
 

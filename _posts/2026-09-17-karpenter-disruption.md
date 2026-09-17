@@ -12,7 +12,7 @@ tags: [karpenter, kubernetes, autoscaling, spot, consolidation]
 > 4. [kraftsman: pricing the fleet](/posts/kraftsman-pricing/)
 {: .prompt-info }
 
-[Part 1](/posts/karpenter-internals/) followed a pod from Pending to a machine and ended on an asymmetry. The provisioner only ever adds capacity, because it only fires on pods that can't schedule. But placement is frozen the moment a pod binds. Jobs finish, spot prices move, reservations free up, and a node bought under yesterday's constraints just sits there costing list price. Nothing in the provisioning loop can see any of that, because none of it produces a pending pod.
+[Part 1](/posts/karpenter-internals/) followed a pod from Pending to a machine and ended on an asymmetry. The provisioner only adds capacity, because it only fires on pods that can't schedule. But placement is frozen the moment a pod binds. Jobs finish, spot prices move, reservations free up, and a node bought under yesterday's constraints just sits there costing list price. Nothing in the provisioning loop can see any of that, because none of it produces a pending pod.
 
 So what moves a running pod? Nothing does, directly. A second control loop takes the cheaper route. Every ten seconds it asks of every node whether its pods could run somewhere else for less money. If the answer is yes it deletes the node and lets the pods land wherever the simulation put them.
 
@@ -88,15 +88,15 @@ Both checks share the same spine: all pods must land somewhere, and any new capa
 
 ## What "cheaper" means
 
-Pricing deserves its own paragraph because it's stricter than it looks. A candidate's price isn't its list price. `resolveNodePrice` looks up the offering matching the node's actual zone and capacity type, so a node that launched spot in zone b gets compared against its real $0.47 rather than the $1.21 it would cost on-demand. A replacement's price goes the other way: the claim's options get filtered to instance types whose *worst-case* compatible offering still beats the candidate. A claim that might launch somewhere expensive can't be trusted to save money.
+A candidate's price isn't its list price. `resolveNodePrice` looks up the offering matching the node's actual zone and capacity type, so a node that launched spot in zone b gets compared against its real $0.47 rather than the $1.21 it would cost on-demand. A replacement's price goes the other way: the claim's options get filtered to instance types whose *worst-case* compatible offering still beats the candidate. A claim that might launch somewhere expensive can't be trusted to save money.
 
-Spot-to-spot moves get extra paranoia on top of that. Swapping one spot node for another is where autoscalers go to churn. Upstream gates it behind a feature flag, `SpotToSpotConsolidation`, which is off by default, and requires at least 15 cheaper instance type options before it'll fire (`MinInstanceTypesForSpotToSpotConsolidation` in [consolidation.go](https://github.com/kubernetes-sigs/karpenter/blob/1b4b3e8c829dea93c8a0429e0e27aa68edc98ed7/pkg/controllers/disruption/consolidation.go)). A spot launch picks among offerings by availability, so a replacement needs enough cheaper types that whichever one actually launches is still a win. A pool pinned to a single instance family can never present fifteen cheaper types and stays put.
+Spot-to-spot moves get extra paranoia on top of that. Swapping one spot node for another is how autoscalers churn. Upstream gates it behind a feature flag, `SpotToSpotConsolidation`, which is off by default, and requires at least 15 cheaper instance type options before it'll fire (`MinInstanceTypesForSpotToSpotConsolidation` in [consolidation.go](https://github.com/kubernetes-sigs/karpenter/blob/1b4b3e8c829dea93c8a0429e0e27aa68edc98ed7/pkg/controllers/disruption/consolidation.go)). A spot launch picks among offerings by availability, so a replacement needs enough cheaper types that whichever one actually launches is still a win. A pool pinned to a single instance family can never present fifteen cheaper types and stays put.
 
-And before any of that, candidates get sorted by `SavingsRatio` (node price divided by rescheduling disruption cost) descending. The walk goes after the most savings per unit of eviction pain first, which usually means expensive nodes running few pods rather than small cheap ones. That ordering matters for Part 3, where what happens when the walk can't finish becomes the whole story.
+And before any of that, candidates get sorted by `SavingsRatio` (node price divided by rescheduling disruption cost) descending. The walk goes after the most savings per unit of eviction pain first, which usually means expensive nodes running few pods rather than small cheap ones. Part 3 is about what happens when that walk can't finish.
 
 ## The command and the queue
 
-A computed command is still hypothetical, so execution goes through a queue with a very deliberate ordering. `StartCommand` in [queue.go](https://github.com/kubernetes-sigs/karpenter/blob/1b4b3e8c829dea93c8a0429e0e27aa68edc98ed7/pkg/controllers/disruption/queue.go) does four things in sequence:
+A computed command is still hypothetical, so execution goes through a queue with a deliberate ordering. `StartCommand` in [queue.go](https://github.com/kubernetes-sigs/karpenter/blob/1b4b3e8c829dea93c8a0429e0e27aa68edc98ed7/pkg/controllers/disruption/queue.go) does four things in sequence:
 
 ```text
   1. markDisrupted      taint candidates  karpenter.sh/disrupted:NoSchedule
@@ -137,7 +137,7 @@ Commands can die at every stage, and each failure has a defined cleanup. A repla
 
 ## What this costs you
 
-The design trades are worth naming plainly, because Part 3 is built on them:
+The design trades are the ground Part 3 is built on:
 
 | the design says | what it costs at scale |
 |---|---|
