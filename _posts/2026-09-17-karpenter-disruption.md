@@ -36,8 +36,8 @@ every 10s
 │    1. Emptiness      nodes with only DaemonSet pods  │
 │    2. StaticDrift    spec replicas changed           │
 │    3. Drift          node no longer matches templates│
-│    4. MultiNode      packs several nodes into fewer  │
-│    5. SingleNode     one node at a time              │
+│    4. MultiNode      several nodes → one or none     │
+│    5. SingleNode     one node → one or none          │
 │                                                      │
 │  first method returning commands wins                │
 └──────────────────────────────────────────────────────┘
@@ -47,6 +47,8 @@ every 10s
 ```
 
 The ordering is a preference ranking, not a pipeline. Empty nodes are free to delete, so they go first. Drift is a correctness issue wearing a cost costume (the node's spec diverged from its NodePool or NodeClass), so it beats price-based moves. Consolidation is last because it's the most disruptive and the most expensive to evaluate.
+
+The two consolidation methods differ in the shape of a move. MultiNode binary-searches the sorted candidate list for how many nodes can come out at once, their pods repacking onto the rest of the fleet plus at most one new claim. That catches joint moves no single candidate could make, like two half-full nodes whose pods won't fit anywhere alone but pack onto one node together. SingleNode is the fallback: one candidate at a time, deleted or swapped for one cheaper node.
 
 ## What makes a node a candidate
 
