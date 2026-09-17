@@ -63,7 +63,7 @@ One name to correct while we're here: the disruption reason is `Underutilized`, 
 
 ## The simulation, run backwards
 
-Part 1's scheduler matched pods to claims that don't exist yet. Consolidation runs the same machine in the other direction: pick a candidate, pretend it's gone, and replay its pods through `SimulateScheduling` against the rest of the fleet. Three outcomes are possible.
+[Part 1](/posts/karpenter-internals/)'s scheduler matched pods to claims that don't exist yet. Consolidation runs the same machine in the other direction: pick a candidate, pretend it's gone, and replay its pods through `SimulateScheduling` against the rest of the fleet. Three outcomes are possible.
 
 ```text
 candidate node: g5.2xlarge, on-demand, $1.21/hr, running pods {p, q}
@@ -100,7 +100,7 @@ Spot-to-spot moves get extra paranoia on top of that. Swapping one spot node for
 
 Upstream gates it behind a feature flag, `SpotToSpotConsolidation`, which is off by default, and requires at least 15 cheaper instance type options before it'll fire (`MinInstanceTypesForSpotToSpotConsolidation` in [consolidation.go](https://github.com/kubernetes-sigs/karpenter/blob/1b4b3e8c829dea93c8a0429e0e27aa68edc98ed7/pkg/controllers/disruption/consolidation.go)). A spot launch picks among offerings by availability, so a replacement needs enough cheaper types that whichever one actually launches is still a win. A pool pinned to a single instance family can never present fifteen cheaper types and stays put.
 
-And before any of that, candidates get sorted by `SavingsRatio` (node price divided by rescheduling disruption cost) descending. The walk goes after the most savings per unit of eviction pain first, which usually means expensive nodes running few pods rather than small cheap ones. Part 3 is about what happens when that walk can't finish.
+And before any of that, candidates get sorted by `SavingsRatio` (node price divided by rescheduling disruption cost) descending. The walk goes after the most savings per unit of eviction pain first, which usually means expensive nodes running few pods rather than small cheap ones. [Part 3](/posts/kraftsman-scale/) is about what happens when that walk can't finish.
 
 ## The command and the queue
 
@@ -177,7 +177,7 @@ An unrecoverable failure (a deleted replacement, an expired deadline) triggers r
 
 ## What this costs you
 
-The design trades are the ground Part 3 is built on:
+The design trades are the ground [Part 3](/posts/kraftsman-scale/) is built on:
 
 | the design says | what it costs at scale |
 |---|---|

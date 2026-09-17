@@ -197,4 +197,4 @@ None of this changes what Karpenter is. The architecture is upstream's, with the
 | all simulated claims are replacements | backlog claims held drift hostage | attribute only disrupted-pod claims |
 | simulation failure = log line | can't see pass behavior | stage timings, skip reasons, census |
 
-The other half of the fork is everything about how a node gets priced, and that's Part 4.
+The other half of the fork is everything about how a node gets priced, and that's [Part 4](/posts/kraftsman-pricing/).

@@ -33,7 +33,7 @@ The [kraftsman](https://github.com/exa-labs/kraftsman) changes follow a request 
 
 ## The DaemonSet tax, charged fairly
 
-Part 1 mentioned that every claim reserves the sum of its compatible DaemonSets before a workload pod is even considered, and what "compatible" means is where the subtlety lives.
+[Part 1](/posts/karpenter-internals/) mentioned that every claim reserves the sum of its compatible DaemonSets before a workload pod is even considered, and what "compatible" means is where the subtlety lives.
 
 A NodePool template's requirements are broad (several zones, several label realizations, several instance shapes), and different DaemonSets select different realizations. A GPU device plugin runs on GPU nodes, a TPU plugin on TPU nodes, the CNI agent on everything. No concrete node ever carries both plugins, because no node is both.
 
@@ -73,7 +73,7 @@ Two degradations keep it predictable: a placement with no priceable options fall
 
 ## The node that couldn't die
 
-Back to Part 2's third gap. Single-node consolidation upstream either deletes a node or replaces it 1:1 with something cheaper.
+Back to [Part 2](/posts/karpenter-disruption/)'s third gap. Single-node consolidation upstream either deletes a node or replaces it 1:1 with something cheaper.
 
 The fat half-empty node, the one holding most of the pool's idle spend, fails both checks: it's not empty, and its pods won't fit one cheaper node. So it stays, pass after pass, the best consolidation target in the fleet and an impossible one.
 
@@ -95,7 +95,7 @@ Budget-exhausted attempts record themselves as inconclusive rather than no-op, s
 
 ## When spot is the answer but only in some zones
 
-Part 2's worst-case pricing has a sharper version of the same problem. An on-demand candidate's replacement claim gets priced at its worst compatible offering across every zone the claim allows. One zone where spot spiked past the budget vetoes the whole replacement even when the other five offer real savings.
+[Part 2](/posts/karpenter-disruption/)'s worst-case pricing has a sharper version of the same problem. An on-demand candidate's replacement claim gets priced at its worst compatible offering across every zone the claim allows. One zone where spot spiked past the budget vetoes the whole replacement even when the other five offer real savings.
 
 ```text
 claim allows zones a..f; priced at the worst compatible offering:
@@ -172,6 +172,6 @@ Put next to upstream, the delta reads as one theme: every place upstream chose t
 | launch fails or succeeds | launch can defer, leases get reclaimed to spot |
 | 5m/15m global timeouts | per-pool registration + initialization timeouts |
 
-The architecture is still Part 1's. Pending pods become claims, claims become instances, a second loop asks whether the fleet could be cheaper, and a queue makes it so.
+The architecture is still [Part 1](/posts/karpenter-internals/)'s. Pending pods become claims, claims become instances, a second loop asks whether the fleet could be cheaper, and a queue makes it so.
 
 What the fork learned is that the assumptions inside that loop (what a node reserves, what a pod costs to place, what a replacement may become, how long boot can take) were all calibrated for a fleet where compute is cheap. Point the same loop at hardware that isn't, and it turns out the scheduler already knows how to solve the problem. You mostly have to let it see the prices.
