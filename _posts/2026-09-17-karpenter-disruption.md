@@ -16,7 +16,7 @@ tags: [karpenter, kubernetes, autoscaling, spot, consolidation]
 
 But placement is frozen the moment a pod binds. Jobs finish, spot prices move, reservations free up, and a node bought under yesterday's constraints just sits there costing list price. Nothing in the provisioning loop can see any of that, because none of it produces a pending pod.
 
-Nothing moves a running pod directly, so a second control loop takes the cheaper route. Every ten seconds it asks of every node whether its pods could run somewhere else for less money. If the answer is yes it deletes the node and lets the pods land wherever the simulation put them.
+Nothing moves a running pod directly, so a second control loop takes the cheaper route. Every ten seconds it asks of every node whether its pods could run somewhere else for less money. If the answer is yes it deletes the node and lets its pods reschedule. Nothing binds them to the simulated answer. The simulation only proved a landing spot exists, and kube-scheduler does the real placing.
 
 Let's walk one node through that loop, from candidate to drain.
 
@@ -63,7 +63,7 @@ One name to correct while we're here: the disruption reason is `Underutilized`, 
 
 ## The simulation, run backwards
 
-[Part 1](/posts/karpenter-internals/)'s scheduler matched pods to claims that don't exist yet. Consolidation runs the same machine in the other direction: it picks a candidate, pretends it's gone, and replays its pods through `SimulateScheduling` against the rest of the fleet. Three outcomes are possible.
+[Part 1](/posts/karpenter-internals/)'s scheduler matched pods to claims that don't exist yet. Consolidation runs the same machine in the other direction: it picks a candidate, pretends it's gone, and replays its pods through `SimulateScheduling` against the rest of the fleet. "Fits" means the same full check as provisioning: every requested resource, from cpu and memory to `nvidia.com/gpu`, plus taints, labels, and topology. Three outcomes are possible.
 
 ```text
 candidate node: g5.2xlarge, on-demand, $1.21/hr, running pods {p, q}
