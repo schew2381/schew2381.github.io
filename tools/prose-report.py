@@ -859,6 +859,7 @@ def check_judgment(post: Post) -> list[Finding]:
     found.extend(check_colons(post))
     found.extend(check_paragraph_seams(post))
     found.extend(check_counted_lists(post))
+    found.extend(check_paragraph_rhythm(post))
 
     if len(para_words) >= 8:
         spread = statistics.pstdev(para_words) / statistics.fmean(para_words)
@@ -927,6 +928,106 @@ def check_paragraph_seams(post: Post) -> list[Finding]:
                     f"{len(head.split())}w opener after {len(closing[-1].split())}w close: "
                     f"...{short(closing[-1], 44)} // {head}")
         )
+    return found
+
+
+def is_stub(para: Paragraph) -> bool:
+    """A one-sentence paragraph standing alone.
+
+    Lead-ins end on a colon because the block below them carries the content,
+    and a bare source link is a caption rather than prose, so neither counts.
+    """
+    if len(sentences(para.text)) != 1:
+        return False
+    return not para.raw.rstrip().endswith(":") and not is_caption(para)
+
+
+def break_lines(post: Post) -> list[int]:
+    """Every line that interrupts prose visually: headings, lists, tables,
+    blockquotes, and the full span of every fenced block."""
+    lines: set[int] = set()
+    for fence in post.fences:
+        lines.update(range(fence.start, fence.end + 1))
+    for section in post.sections:
+        lines.add(section.line)
+    for run in post.lists:
+        lines.update(range(run.start, run.start + run.items))
+    for number, _ in post.quote_lines:
+        lines.add(number)
+    for number, text in enumerate(post.raw_lines, start=1):
+        if text.strip().startswith("|"):
+            lines.add(number)
+    return sorted(lines)
+
+
+def prose_deserts(post: Post) -> list[tuple[int, int]]:
+    """(first paragraph line, word count) per stretch between visual breaks."""
+    bounds = break_lines(post) + [len(post.raw_lines) + 1]
+    out: list[tuple[int, int]] = []
+    previous = 0
+    for bound in bounds:
+        inside = [p for p in post.paragraphs if previous < p.start < bound]
+        if inside:
+            out.append((inside[0].start, sum(len(p.text.split()) for p in inside)))
+        previous = bound
+    return out
+
+
+def check_paragraph_rhythm(post: Post) -> list[Finding]:
+    """Flag paragraph rhythm that drifts post-wide, not per-paragraph.
+
+    Three shapes. A run of one-liners is staccato bullets without the bullets.
+    A mean sentence count far from two says the whole post settled at the
+    wrong grain. And a long stretch with nothing visual to rest on is the
+    wall-of-prose failure the guide's diagrams and lists exist to prevent.
+    None of these is a per-paragraph rule.
+    """
+    found: list[Finding] = []
+
+    run_start: int | None = None
+    run_len = 0
+    previous: Paragraph | None = None
+    for para in post.paragraphs:
+        adjacent = previous is not None and para.start - previous.end <= 2
+        if is_stub(para):
+            if adjacent:
+                run_len += 1
+            else:
+                run_start, run_len = para.start, 1
+        else:
+            if run_len >= 3 and run_start is not None:
+                found.append(
+                    Finding(run_start, "judgment", "stub-paragraphs",
+                            f"{run_len} one-sentence paragraphs in a row")
+                )
+            run_start, run_len = None, 0
+        previous = para
+    if run_len >= 3 and run_start is not None:
+        found.append(
+            Finding(run_start, "judgment", "stub-paragraphs",
+                    f"{run_len} one-sentence paragraphs in a row")
+        )
+
+    counts = [len(sentences(p.text)) for p in post.paragraphs]
+    if len(counts) >= 8:
+        mean = statistics.fmean(counts)
+        if mean < 1.75:
+            found.append(
+                Finding(post.paragraphs[0].start, "judgment", "thin-paragraphs",
+                        f"mean {mean:.1f} sentences across {len(counts)} paragraphs")
+            )
+        elif mean > 2.6:
+            found.append(
+                Finding(post.paragraphs[0].start, "judgment", "dense-paragraphs",
+                        f"mean {mean:.1f} sentences across {len(counts)} paragraphs")
+            )
+
+    for line, words in prose_deserts(post):
+        if words > 400:
+            found.append(
+                Finding(line, "judgment", "prose-desert",
+                        f"{words}w without a heading, list, table, or diagram")
+            )
     return found
 
 
@@ -1068,6 +1169,9 @@ def stats(post: Post) -> list[str]:
     second_person = len(re.findall(r"\b(you|you'?re|you'?ve|your)\b", prose))
     longest = max(post.sections, key=lambda s: s.words) if post.sections else None
     para_words = [len(p.text.split()) for p in post.paragraphs] or [0]
+    para_sents = [len(sentences(p.text)) for p in post.paragraphs]
+    stubs = sum(1 for p in post.paragraphs if is_stub(p))
+    desert = max((w for _, w in prose_deserts(post)), default=0)
     openers = [sentences(p.text)[0] for p in post.paragraphs if sentences(p.text)]
     short_openers = sum(1 for s in openers if len(s.split()) < 9)
     colon_lists = sum(1 for p in post.paragraphs for s in sentences(p.text) if COLON_LIST_RE.search(s))
@@ -1081,6 +1185,9 @@ def stats(post: Post) -> list[str]:
         f"paragraph words  mean {statistics.fmean(para_words):.1f}"
         f"   spread {statistics.pstdev(para_words) / max(statistics.fmean(para_words), 1):.2f}"
         f"   max {max(para_words)}",
+        f"paragraph sent   mean {statistics.fmean(para_sents):.2f}"
+        f"   one-sentence {stubs} of {len(para_sents)}"
+        f"   longest prose stretch {desert}w",
         f"opening {len(opening)} paragraphs, {len(opening_code)} code blocks before the first heading",
         f"lists {len(numbered)} numbered / {len(bullets)} bullet   tables {post.tables}"
         f"   diagrams {len(diagrams)}   code blocks {len(post.fences) - len(diagrams)}",
@@ -1137,6 +1244,10 @@ GUIDE = {
     "diagram-echo": "don't describe the diagram again (ASCII diagrams)",
     "long-section": "past 400 words is usually two sections (Section length)",
     "uniform-paragraphs": "uniform blocks are the strongest machine tell (Voice and tone)",
+    "stub-paragraphs": "one-liners in a row are bullets without the bullets (Voice and tone)",
+    "thin-paragraphs": "mean far under two sentences reads staccato post-wide (Voice and tone)",
+    "dense-paragraphs": "mean far over two sentences reads as blocks (Voice and tone)",
+    "prose-desert": "long prose stretches want a heading, list, table, or diagram (Narrative flow)",
     "bold-term-list": "the most recognisable AI pattern (Structure)",
 }
 
