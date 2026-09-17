@@ -18,9 +18,7 @@ Two minutes later an instance is booting, a Node object appears, and the pod bin
 
 That something is [Karpenter](https://github.com/kubernetes-sigs/karpenter). People call it an autoscaler, which is close but not quite the right shape. It's better held as one scheduling simulator driven by two control loops.
 
-A provisioning loop watches pending pods and asks what hardware would make them schedulable, then buys it. A disruption loop watches existing nodes and asks whether their pods could run elsewhere for less, then kills or replaces them.
-
-The first adds capacity, the second removes it, and pod binding stays with kube-scheduler.
+A provisioning loop watches pending pods and asks what hardware would make them schedulable, then buys it. A disruption loop watches existing nodes and asks whether their pods could run elsewhere for less, then kills or replaces them. The first adds capacity, the second removes it, and pod binding stays with kube-scheduler.
 
 So let's follow one pod from Pending to a machine, and meet the objects it passes through on the way.
 
@@ -60,9 +58,7 @@ ONE PENDING POD BECOMES ONE NODE
                     kube-scheduler finally binds the pod
 ```
 
-The actual pod binding happens at the bottom of that diagram, done by kube-scheduler on a node Karpenter bought. Karpenter never binds a pod in its life.
-
-Its scheduler is a simulator whose only output is a decision about hardware.
+The actual pod binding happens at the bottom of that diagram, done by kube-scheduler on a node Karpenter bought. Karpenter never binds a pod in its life. Its scheduler is a simulator whose only output is a decision about hardware.
 
 ## The vocabulary
 
@@ -74,17 +70,11 @@ The pod's trip passes through four object kinds, and the series leans on all of 
   you write     config        request       machine
 ```
 
-A NodePool is the policy surface. It says which instance types and zones are acceptable, which taints the nodes carry, how much of the pool may be disrupted at once, and which `nodeClassRef` the claims point at.
+A NodePool is the policy surface. It says which instance types and zones are acceptable, which taints the nodes carry, how much of the pool may be disrupted at once, and which `nodeClassRef` the claims point at. The NodeClass holds everything needed to actually boot a machine in the pool's shape, like an `EC2NodeClass` carrying the AMI family, subnet and security group selectors, and capacity reservation selectors on AWS.
 
-The NodeClass holds everything needed to actually boot a machine in the pool's shape, like an `EC2NodeClass` carrying the AMI family, subnet and security group selectors, and capacity reservation selectors on AWS.
+A NodeClaim is where the two meet. Karpenter stamps one per piece of capacity it wants, with the pool's requirements resolved against real pending pods. When the kubelet on the resulting instance registers with the apiserver, the Node object is what shows up, linked back to its claim by the provider ID.
 
-A NodeClaim is where the two meet. Karpenter stamps one per piece of capacity it wants, with the pool's requirements resolved against real pending pods.
-
-When the kubelet on the resulting instance registers with the apiserver, the Node object is what shows up, linked back to its claim by the provider ID.
-
-The pair people conflate is NodeClaim and Node. The claim is Karpenter's intent before hardware exists and the Node is the kubelet's presence after boot.
-
-Everything interesting about lifecycle is the gap between them, and the gap is bridged by matching `spec.providerID` to `node.spec.providerID`.
+The pair people conflate is NodeClaim and Node. The claim is Karpenter's intent before hardware exists and the Node is the kubelet's presence after boot, and everything interesting about lifecycle is the gap between them. The gap is bridged by matching `spec.providerID` to `node.spec.providerID`.
 
 ## One simulator, two loops
 
@@ -102,13 +92,9 @@ Everything interesting about lifecycle is the gap between them, and the gap is b
 
 Two consequences follow from putting the intelligence in a shared simulator rather than in either loop.
 
-First, the scheduler never places anything. kube-scheduler still binds every pod to a node, and Karpenter's [scheduling package](https://github.com/kubernetes-sigs/karpenter/blob/1b4b3e8c829dea93c8a0429e0e27aa68edc98ed7/pkg/controllers/provisioning/scheduling/scheduler.go) is a simulator answering a different question: if this pod needed a node, what would that node look like?
+First, the scheduler never places anything. kube-scheduler still binds every pod to a node, and Karpenter's [scheduling package](https://github.com/kubernetes-sigs/karpenter/blob/1b4b3e8c829dea93c8a0429e0e27aa68edc98ed7/pkg/controllers/provisioning/scheduling/scheduler.go) is a simulator answering a different question: if this pod needed a node, what would that node look like? Its outputs are NodeClaims, not bindings.
 
-Its outputs are NodeClaims, not bindings.
-
-Second, each loop only moves in one direction. The provisioner can add a node but never remove one, because a pod that can't schedule is never an argument for deleting capacity.
-
-The disruption loop owns every removal. What people picture as a separate repacker is the same fit simulation pointed at existing nodes instead of pending ones, which is also what lets a node's pods replay through the logic that placed them.
+Second, each loop only moves in one direction. The provisioner can add a node but never remove one, because a pod that can't schedule is never an argument for deleting capacity. The disruption loop owns every removal. What people picture as a separate repacker is the same fit simulation pointed at existing nodes instead of pending ones, which is also what lets a node's pods replay through the logic that placed them.
 
 That asymmetry is the whole reason Part 2 exists.
 
@@ -123,9 +109,7 @@ batches         └── batch A: {1,2,3} ──┘      └─ batch B: {4,5} 
                 (max 10s caps a sustained burst)
 ```
 
-Batching is the difference between autoscaling and just relaunching pods on nodes.
-
-Fifty pods arriving together can share one simulation and land on one right-sized node instead of racing through fifty separate launches. The knobs are `BATCH_IDLE_DURATION` (1s) and `BATCH_MAX_DURATION` (10s) in [options.go](https://github.com/kubernetes-sigs/karpenter/blob/1b4b3e8c829dea93c8a0429e0e27aa68edc98ed7/pkg/operator/options/options.go).
+Batching is the difference between autoscaling and just relaunching pods on nodes. Fifty pods arriving together can share one simulation and land on one right-sized node instead of racing through fifty separate launches. The knobs are `BATCH_IDLE_DURATION` (1s) and `BATCH_MAX_DURATION` (10s) in [options.go](https://github.com/kubernetes-sigs/karpenter/blob/1b4b3e8c829dea93c8a0429e0e27aa68edc98ed7/pkg/operator/options/options.go).
 
 Not every Pending pod joins the batch. `GetProvisionablePods` filters out the ones Karpenter has no business provisioning for:
 
@@ -140,9 +124,7 @@ The rest get fed to the simulator.
 
 The scheduler's job per batch is a greedy bin-pack with a twist: it can fabricate bins.
 
-It builds a NodeClaimTemplate per NodePool from the pool's requirements, labels, and taints plus the provider's instance type catalog, wraps every existing node as an ExistingNode, and walks the pod list sorted by descending resource requests.
-
-Each pod tries existing nodes first, then in-flight claims, then a fresh claim.
+It builds a NodeClaimTemplate per NodePool from the pool's requirements, labels, and taints plus the provider's instance type catalog, wraps every existing node as an ExistingNode, and walks the pod list sorted by descending resource requests. Each pod tries existing nodes first, then in-flight claims, then a fresh claim.
 
 So let's trace three pending pods through one pass. The pool allows three instance types in zones a and b.
 
@@ -179,9 +161,7 @@ step                     claim-1                              claim-2
    not as "largest allowed"
 ```
 
-The narrowing is the mechanism to remember. Every pod added to a claim intersects the pod's scheduling constraints into the claim's requirements and filters the claim's instance type options down to types that can still host everything on it.
-
-A claim that started life able to be any of three types can only be a GPU type after pod-b joins. pod-c doesn't fit the packed remainder, so it gets a claim of its own.
+The narrowing is the mechanism to remember. Every pod added to a claim intersects the pod's scheduling constraints into the claim's requirements and filters the claim's instance type options down to types that can still host everything on it. A claim that started life able to be any of three types can only be a GPU type after pod-b joins. pod-c doesn't fit the packed remainder, so it gets a claim of its own.
 
 Two details hide inside those steps:
 
@@ -223,9 +203,7 @@ Capacity type is the dimension that does the most work:
 - spot is the same hardware at a market price, typically a third to a tenth of on-demand, revocable on short notice (two minutes on AWS). Cheap and interruptible are the same property.
 - reserved is capacity you already bought. On AWS these are On-Demand Capacity Reservations, and they come in two match criteria. An *open* ODCR is filled automatically by any matching instance you launch. A *targeted* ODCR only fills when the launch names it explicitly, so Karpenter can't consume one by accident, and the NodeClass's `capacityReservationSelectorTerms` pick which reservations a pool may use.
 
-The AWS provider exposes reservations as a `reserved` capacity type priced at on-demand divided by ten million (see [reserved_capacity_resolver.go](https://github.com/aws/karpenter-provider-aws/blob/85eeae8f2321be5e58bb0ab2b0abc7e411a43668/pkg/providers/instancetype/offering/reserved_capacity_resolver.go)).
-
-Priced near zero, the scheduler prefers reserved capacity wherever the pod is eligible, and each offering carries its remaining `ReservationCapacity` so a reservation can't be oversubscribed. GPU capacity blocks (the `capacity-block` reservation type) ride the same path, which is how reserved GPU fleets work.
+The AWS provider exposes reservations as a `reserved` capacity type priced at on-demand divided by ten million (see [reserved_capacity_resolver.go](https://github.com/aws/karpenter-provider-aws/blob/85eeae8f2321be5e58bb0ab2b0abc7e411a43668/pkg/providers/instancetype/offering/reserved_capacity_resolver.go)). Priced near zero, the scheduler prefers reserved capacity wherever the pod is eligible, and each offering carries its remaining `ReservationCapacity` so a reservation can't be oversubscribed. GPU capacity blocks (the `capacity-block` reservation type) ride the same path, which is how reserved GPU fleets work.
 
 The price list isn't decorative. Instance types get sorted cheapest-first at materialization, offerings are priced per zone because spot markets are zonal, and Part 2's entire consolidation engine is "is there a cheaper offering for these pods."
 
@@ -249,24 +227,14 @@ A created NodeClaim is a promise. The lifecycle controller walks it through thre
 
 Each condition is a distinct way to be stuck, and the [liveness controller](https://github.com/kubernetes-sigs/karpenter/blob/1b4b3e8c829dea93c8a0429e0e27aa68edc98ed7/pkg/controllers/nodeclaim/lifecycle/liveness.go) times them out separately.
 
-A claim that never reaches `Launched` within five minutes is deleted and re-provisioned, since the provider API never materialized an instance. A claim that launches but doesn't register within fifteen minutes is deleted too.
+A claim that never reaches `Launched` within five minutes is deleted and re-provisioned, since the provider API never materialized an instance. A claim that launches but doesn't register within fifteen minutes is deleted too. The instance exists but the kubelet never showed up, which usually means a bad AMI, a bad bootstrap, or a network partition. The fleet is better off trying again elsewhere.
 
-The instance exists but the kubelet never showed up, which usually means a bad AMI, a bad bootstrap, or a network partition. The fleet is better off trying again elsewhere.
-
-`Initialized` is the condition that takes the longest in practice, because it's where the slow parts of boot live: image pulls, CNI setup, startup taints draining, and device plugins registering.
-
-A GPU pod's node isn't useful until `nvidia.com/gpu` appears in allocatable, and the Initialized condition is what waits for exactly that. Until the claim initializes, the `karpenter.sh/unregistered:NoExecute` taint keeps stray pods from landing on a node the simulation didn't account for.
+`Initialized` is the condition that takes the longest in practice, because it's where the slow parts of boot live: image pulls, CNI setup, startup taints draining, and device plugins registering. A GPU pod's node isn't useful until `nvidia.com/gpu` appears in allocatable, and the Initialized condition is what waits for exactly that. Until the claim initializes, the `karpenter.sh/unregistered:NoExecute` taint keeps stray pods from landing on a node the simulation didn't account for.
 
 ## The shadow cluster
 
-Every simulation above reads from an in-memory mirror, `state.Cluster`, rather than the apiserver. It holds a StateNode per real node and per in-flight claim, recording the node's labels and taints, its pods' summed requests, DaemonSet requests, host ports, volumes, and whether it's marked for deletion.
+Every simulation above reads from an in-memory mirror, `state.Cluster`, rather than the apiserver. It holds a StateNode per real node and per in-flight claim, recording the node's labels and taints, its pods' summed requests, DaemonSet requests, host ports, volumes, and whether it's marked for deletion. That's what makes the per-pass math cheap enough to run a scheduling simulation every time a pod batch or a disruption poll fires.
 
-That's what makes the per-pass math cheap enough to run a scheduling simulation every time a pod batch or a disruption poll fires.
+The mirror also solves the race the system creates for itself. When the disruption controller picks a node to replace, it nominates that node in cluster state, so the provisioner's next simulation knows the pods there are spoken for and doesn't double-provision for them. `NominateNodeForPod` in [cluster.go](https://github.com/kubernetes-sigs/karpenter/blob/1b4b3e8c829dea93c8a0429e0e27aa68edc98ed7/pkg/controllers/state/cluster.go) is the other half of the same mechanism, steering pending pods toward nodes that already have room.
 
-The mirror also solves the race the system creates for itself. When the disruption controller picks a node to replace, it nominates that node in cluster state, so the provisioner's next simulation knows the pods there are spoken for and doesn't double-provision for them.
-
-`NominateNodeForPod` in [cluster.go](https://github.com/kubernetes-sigs/karpenter/blob/1b4b3e8c829dea93c8a0429e0e27aa68edc98ed7/pkg/controllers/state/cluster.go) is the other half of the same mechanism, steering pending pods toward nodes that already have room.
-
-Everything so far only grows the cluster. The provisioner has no path that ends with fewer nodes and no reason to have one.
-
-Making the fleet smaller and cheaper is a different loop's job, running on a ten-second poll, and it's what Part 2 walks through.
+Everything so far only grows the cluster. The provisioner has no path that ends with fewer nodes and no reason to have one. Making the fleet smaller and cheaper is a different loop's job, running on a ten-second poll, and it's what Part 2 walks through.
