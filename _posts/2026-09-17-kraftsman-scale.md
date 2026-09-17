@@ -14,7 +14,11 @@ tags: [karpenter, kraftsman, kubernetes, autoscaling, performance]
 
 [Part 2](/posts/karpenter-disruption/) ended on what consolidation costs: every candidate node gets replayed through a full scheduling simulation inside a three-minute walk. On a hundred-node cluster that's a rounding error. On ours it stopped working.
 
-That fleet runs the kind of work that produces thousands of pending pods at once. The instances cost more per hour than a small web tier, the nodes are self-managed across two clouds, and the batch jobs on top are gang-scheduled. During one capacity ramp the pending backlog reached roughly 3,400 pods, and the comment that went in with the fix records the result. The simulation stage of a consolidation pass went from cheaper than scheduler construction to 16x its steady-state cost. The walk timed out in the middle of the candidate list every pass, so the tail of the list effectively didn't exist. Nodes that would have consolidated never got simulated at all.
+That fleet runs the kind of work that produces thousands of pending pods at once. The instances cost more per hour than a small web tier, the nodes are self-managed across two clouds, and the batch jobs on top are gang-scheduled.
+
+During one capacity ramp the pending backlog reached roughly 3,400 pods, and the comment that went in with the fix records the result. The simulation stage of a consolidation pass went from cheaper than scheduler construction to 16x its steady-state cost.
+
+The walk timed out in the middle of the candidate list every pass, so the tail of the list effectively didn't exist. Nodes that would have consolidated never got simulated at all.
 
 [Kraftsman](https://github.com/exa-labs/kraftsman) is Exa's fork, and the half of its delta that exists because of paragraphs like that one is about making the control loop fast enough to keep up with the fleet it controls.
 
@@ -31,9 +35,15 @@ per candidate in the walk:
   run simulation               O(pods × nodes × instance types × topology)
 ```
 
-None of these are API server calls (the reads hit the informer cache), so the load lands on the controller's own CPU rather than etcd. The failure mode isn't a melted apiserver, it's a pass that can't afford its own arithmetic. Multiply the per-candidate cost by a few hundred candidates inside a three-minute budget and the walk becomes a sampler of the first N candidates, where N keeps shrinking as the cluster grows.
+None of these are API server calls (the reads hit the informer cache), so the load lands on the controller's own CPU rather than etcd. The failure mode isn't a melted apiserver, it's a pass that can't afford its own arithmetic.
 
-There's a second leak on top. A disruption simulation schedules the whole pending backlog alongside the candidate's pods, because that's the right model of what competes for capacity. But upstream then treats every NodeClaim the simulation opened as the command's replacements, launching them, waiting on them, and pricing them against the candidate. When the backlog holds thousands of pods the provisioner is already handling, a single-node consolidation command ends up responsible for a hundred claims it never wanted, all priced against the one it did. The code comment in [helpers.go](https://github.com/exa-labs/kraftsman/blob/4ee8e09d8ec7ef8a2b2d96026e80b0bbc7ab59cc/pkg/controllers/disruption/helpers.go) tracks the result on the production fleet: the `multiple_replacements_required` skip rate per evaluated candidate ran near zero below 100 pending pods, hit 0.045 at 2,049, and 0.222 at 2,781.
+Multiply the per-candidate cost by a few hundred candidates inside a three-minute budget and the walk becomes a sampler of the first N candidates, where N keeps shrinking as the cluster grows.
+
+There's a second leak on top. A disruption simulation schedules the whole pending backlog alongside the candidate's pods, because that's the right model of what competes for capacity.
+
+But upstream then treats every NodeClaim the simulation opened as the command's replacements, launching them, waiting on them, and pricing them against the candidate. When the backlog holds thousands of pods the provisioner is already handling, a single-node consolidation command ends up responsible for a hundred claims it never wanted, all priced against the one it did.
+
+The code comment in [helpers.go](https://github.com/exa-labs/kraftsman/blob/4ee8e09d8ec7ef8a2b2d96026e80b0bbc7ab59cc/pkg/controllers/disruption/helpers.go) tracks the result on the production fleet: the `multiple_replacements_required` skip rate per evaluated candidate ran near zero below 100 pending pods, hit 0.045 at 2,049, and 0.222 at 2,781.
 
 So the fixes come in four layers, cheapest first:
 
@@ -48,27 +58,82 @@ Most of what a candidate reads doesn't vary with the candidate. The backlog is t
 
 The two that carry the most weight:
 
-1. `PassReads` memoizes the pending backlog and the PDB limits for the pass. One subtlety in [passreads.go](https://github.com/exa-labs/kraftsman/blob/4ee8e09d8ec7ef8a2b2d96026e80b0bbc7ab59cc/pkg/controllers/disruption/passreads.go): the memoized slice is copied out per call, because `SimulateScheduling` appends the candidate's pods to the backlog and would otherwise leak them into the next candidate. And only successes are cached, since a failed read belongs to whichever candidate got unlucky rather than to the pass.
-2. `SimulationCopy` changes what a state-node copy shares. Scheduling only mutates host-port and volume usage, so the copy shares the Node and NodeClaim objects, clones the pod-resource map shells, and precomputes each node's summed pod and DaemonSet requests once under the cluster lock. Previously every candidate re-merged every node's per-pod resource lists. Now the merge happens once per node per pass.
+1. `PassReads` memoizes the pending backlog and the PDB limits for the pass.
+2. `SimulationCopy` changes what a state-node copy shares.
 
-Behind those sits a fleet of narrower caches, each removing one repeated computation. They cover DaemonSet overhead per claim template, topology domain groups, node requirements, reservation capacity, NodeClaim templates, per-pass topology data, and inverse affinities. They're all context-scoped to one pass and dropped at the end, so they're memoization rather than a cache you have to invalidate. One exception: a validation that waits out its settling window installs fresh ones, so the re-simulation sees the cluster as it is after the wait.
+```text
+  UPSTREAM                            KRAFTSMAN
 
-The same logic runs one level down too. Pending pods the provisioner's last pass rejected for a cluster-state-independent reason (every NodePool incompatible on taints, requirements, or instance types) get excluded from disruption simulations for a TTL-bounded window. A pod that can't open a claim in any simulation only costs money to simulate, and with a big enough rejected backlog that cost was real. Verdicts expire and get re-derived, so a pod whose fortunes change comes back.
+  candidate 1 ──▶ read backlog        read backlog once per pass
+  candidate 2 ──▶ read backlog            │
+  candidate 3 ──▶ read backlog            ├─▶ candidate 1
+  ...                                   ├─▶ candidate 2
+  (same answer,                         └─▶ candidate 3
+   paid N times)                         (same answer, paid once)
+```
+
+One subtlety in [passreads.go](https://github.com/exa-labs/kraftsman/blob/4ee8e09d8ec7ef8a2b2d96026e80b0bbc7ab59cc/pkg/controllers/disruption/passreads.go): the memoized slice is copied out per call, because `SimulateScheduling` appends the candidate's pods to the backlog and would otherwise leak them into the next candidate. And only successes are cached, since a failed read belongs to whichever candidate got unlucky rather than to the pass.
+
+`SimulationCopy` is the same trick one level down. Scheduling only mutates host-port and volume usage, so the copy shares the Node and NodeClaim objects, clones the pod-resource map shells, and precomputes each node's summed pod and DaemonSet requests once under the cluster lock.
+
+```text
+  copy per candidate:                 share across copies:
+    every node object                   Node and NodeClaim objects
+    every per-pod request list          summed pod + DaemonSet requests
+
+  clone per candidate, because        previously: re-merge every node's
+  scheduling mutates it:              per-pod lists for every candidate
+    host-port usage, volume usage
+```
+
+Previously every candidate re-merged every node's per-pod resource lists. Now the merge happens once per node per pass.
+
+Behind those sits a fleet of narrower caches, each removing one repeated computation. They cover DaemonSet overhead per claim template, topology domain groups, node requirements, reservation capacity, NodeClaim templates, per-pass topology data, and inverse affinities.
+
+They're all context-scoped to one pass and dropped at the end, so they're memoization rather than a cache you have to invalidate. One exception: a validation that waits out its settling window installs fresh ones, so the re-simulation sees the cluster as it is after the wait.
+
+The same logic runs one level down too. Pending pods the provisioner's last pass rejected for a cluster-state-independent reason (every NodePool incompatible on taints, requirements, or instance types) get excluded from disruption simulations for a TTL-bounded window.
+
+A pod that can't open a claim in any simulation only costs money to simulate, and with a big enough rejected backlog that cost was real. Verdicts expire and get re-derived, so a pod whose fortunes change comes back.
 
 ## Surviving the timeout
 
-Sharing fixes the per-candidate cost. The next problem is what happens when even a cheaper walk can't finish: upstream, a timed-out pass throws away its position and the next pass restarts at the head of the sorted list. Sorted by savings ratio, the head is always the juiciest-looking candidates, so a starving walk re-evaluates the same first candidates every ten seconds while the tail is never reached. Kraftsman calls the fix the coverage cycle.
+Sharing fixes the per-candidate cost. The next problem is what happens when even a cheaper walk can't finish: upstream, a timed-out pass throws away its position and the next pass restarts at the head of the sorted list.
+
+Sorted by savings ratio, the head is always the juiciest-looking candidates, so a starving walk re-evaluates the same first candidates every ten seconds while the tail is never reached. Kraftsman calls the fix the coverage cycle.
 
 ```text
 upstream:   pass1 [A B C D |timeout| E F G]   pass2 [A B C D |timeout| E F G]   … E,F,G never seen
 kraftsman:  pass1 [A B C D |timeout| E F G]   pass2 [E F G |done, cycle complete|]  pass3 [A B C D …]
 ```
 
-`evaluatedThisCycle` tracks which candidates recent walks reached, and `resumeCoverageCycle` moves them behind the unreached ones. It's a position hint only: nothing simulated or decided carries across passes, and every candidate still gets simulated against live state. What it buys is a bound on how long any node can hide from evaluation. Alongside it, a per-candidate simulation budget (`consolidation-candidate-timeout`, default ten seconds) keeps one pathological candidate from eating the walk's whole budget. And a timed-out walk that already found proposals still gets to admit them under a separate admission budget instead of throwing them away.
+`evaluatedThisCycle` tracks which candidates recent walks reached, and `resumeCoverageCycle` moves them behind the unreached ones.
+
+It's a position hint only: nothing simulated or decided carries across passes, and every candidate still gets simulated against live state. What it buys is a bound on how long any node can hide from evaluation.
+
+Alongside it, a per-candidate simulation budget (`consolidation-candidate-timeout`, default ten seconds) keeps one pathological candidate from eating the walk's whole budget. And a timed-out walk that already found proposals still gets to admit them under a separate admission budget instead of throwing them away.
 
 ## Remembering no-ops
 
-The most common outcome of a consolidation simulation is nothing. The candidate's pods don't fit cheaper, the command is a no-op, and the same verdict gets recomputed next pass. Kraftsman's [negative result cache](https://github.com/exa-labs/kraftsman/blob/4ee8e09d8ec7ef8a2b2d96026e80b0bbc7ab59cc/pkg/controllers/disruption/negativeresultcache.go) stores those verdicts keyed by a fingerprint of everything the verdict could depend on. That covers the node's and claim's resource versions, the NodePool's UID and generation, its instance-type revision, and the UIDs and resource versions of the pods that would have to move.
+The most common outcome of a consolidation simulation is nothing. The candidate's pods don't fit cheaper, the command is a no-op, and the same verdict gets recomputed next pass.
+
+Kraftsman's [negative result cache](https://github.com/exa-labs/kraftsman/blob/4ee8e09d8ec7ef8a2b2d96026e80b0bbc7ab59cc/pkg/controllers/disruption/negativeresultcache.go) stores those verdicts keyed by a fingerprint of everything the verdict could depend on.
+
+```text
+  candidate simulates to no-op
+    │
+    ▼
+  fingerprint = node resource version + claim resource version
+              + NodePool UID & generation + instance-type revision
+              + UIDs & versions of every pod that would move
+    │
+    ▼
+  next pass on same candidate
+    ├─ fingerprint matches (within TTL, 5m) ──▶ skip the simulation
+    ├─ can't build a fingerprint ─────────────▶ simulate anyway
+    └─ any command completes through the
+        disruption queue ─────────────────────▶ clear the whole cache
+```
 
 Two properties make it safe rather than clever:
 
@@ -79,13 +144,47 @@ A pass that skipped candidates on cache hits deliberately can't mark the fleet c
 
 ## More than one command per pass
 
-Upstream admits at most one consolidation command per pass. It finds a winner, validates it, and ends. On a big fleet that's throughput the architecture leaves on the table, since the pass already paid to discover candidates. Kraftsman lets a pass hold several proposals and admit them in sequence.
+Upstream admits at most one consolidation command per pass. It finds a winner, validates it, and ends. On a big fleet that's throughput the architecture leaves on the table, since the pass already paid to discover candidates.
 
-The catch is correctness, and the sequencing in `admitProposals` is the safety property rather than an implementation detail. Each proposal gets validated against live state right before `StartCommand`. And `StartCommand` taints candidates, launches replacements, and marks them for deletion before returning. By the time the next proposal validates, the cluster it re-simulates against already contains every effect of the commands admitted before it. A proposal that depended on capacity an earlier command consumed fails validation, exactly the way a plan that drifted across the settling window does. Validating the batch up front and launching concurrently would lose precisely that.
+Kraftsman lets a pass hold several proposals and admit them in sequence.
 
-Admission runs on its own budget (the settling delay plus about twenty seconds per held proposal), because a walk that timed out holding proposals is the case where discarding them hurts most. The disruption budget mapping decrements as proposals are held, so a batched pass can't overspend a pool's allowance. Claims already named by a held proposal can't join a second command.
+The catch is correctness, and the sequencing in `admitProposals` is the safety property rather than an implementation detail. Each proposal gets validated against live state right before `StartCommand`.
 
-While we're in this code: the replacement-attribution fix from earlier lives here too. With `ConsolidationAttributeReplacements` (default on), only NodeClaims that actually host a disrupted pod count as a command's replacements, while backlog-only claims get dropped from the command and left to the provisioning loop that owns them. A drift command no longer waits on a hundred claims the backlog spawned, and consolidation pricing stops charging unrelated capacity against the candidate.
+```text
+  pass holds proposals {A, B, C}
+
+  for each, in order:
+    validate against LIVE state
+      │
+      ▼
+    StartCommand: taint candidates, launch replacements,
+    mark them for deletion
+      │
+      ▼
+    the next proposal validates against a cluster that
+    already contains every admitted effect
+```
+
+`StartCommand` taints candidates, launches replacements, and marks them for deletion before returning. By the time the next proposal validates, the cluster it re-simulates against already contains every effect of the commands admitted before it.
+
+A proposal that depended on capacity an earlier command consumed fails validation, exactly the way a plan that drifted across the settling window does. Validating the batch up front and launching concurrently would lose precisely that.
+
+Admission runs on its own budget (the settling delay plus about twenty seconds per held proposal), because a walk that timed out holding proposals is the case where discarding them hurts most. The disruption budget mapping decrements as proposals are held, so a batched pass can't overspend a pool's allowance.
+
+Claims already named by a held proposal can't join a second command.
+
+While we're in this code: the replacement-attribution fix from earlier lives here too. With `ConsolidationAttributeReplacements` (default on), only NodeClaims that actually host a disrupted pod count as a command's replacements.
+
+```text
+  simulation opened three claims for candidate's pods + backlog:
+
+    claim-A  hosts disrupted pods p,q   ──▶ counts as replacement
+    claim-B  hosts disrupted pod r      ──▶ counts as replacement
+    claim-C  hosts only backlog pods    ──▶ dropped from the command,
+                                            left to the provisioner
+```
+
+A drift command no longer waits on a hundred claims the backlog spawned, and consolidation pricing stops charging unrelated capacity against the candidate.
 
 ## The fixes that came along for the ride
 
@@ -98,15 +197,23 @@ Several smaller bugs only become visible at this scale, and the fork fixes them 
 
 ## Watching the watcher's math
 
-Almost every change above ships with a metric because the fleet got too big to reason about by log line. Pass outcomes and stage timings (state copy, pod gather, construction, simulation) split where the three minutes go. Per-candidate skip reasons say why the walk passed each node (budget exhausted, below threshold, claimed by a pending command, cached negative, timed out). Per-NodePool depth metrics show how far into each pool's candidates the walk gets before the budget runs out, and the walk-cycle gauge reports what fraction of the candidate list the current coverage cycle has reached.
+Almost every change above ships with a metric because the fleet got too big to reason about by log line.
 
-The biggest addition is the [census](https://github.com/exa-labs/kraftsman/blob/4ee8e09d8ec7ef8a2b2d96026e80b0bbc7ab59cc/pkg/controllers/disruption/census.go): every ten minutes a sweep simulates every candidate without executing anything and publishes actionable delete/replace counts by NodePool. The single-node walk's metrics can't answer "how many nodes could consolidate right now" because it stops at its first winner. The census answers it directly, in five minutes of simulation you weren't spending anyway.
+Pass outcomes and stage timings (state copy, pod gather, construction, simulation) split where the three minutes go. Per-candidate skip reasons say why the walk passed each node (budget exhausted, below threshold, claimed by a pending command, cached negative, timed out). Per-NodePool depth metrics show how far into each pool's candidates the walk gets before the budget runs out, and the walk-cycle gauge reports what fraction of the candidate list the current coverage cycle has reached.
 
-Termination accounting got the same treatment. NodeClaim lifetime and termination-duration histograms are now labeled by instance type, capacity type, and cause. The cause distinguishes cloud interruption (stamped via a termination-cause annotation on the claim), the disruption reason the queue recorded, and `never_initialized`. Lifetime is split by whether the claim came from provisioning or from a disruption replacement, so "how long do replacement nodes live compared to provisioned ones" stopped being a grep question.
+The biggest addition is the [census](https://github.com/exa-labs/kraftsman/blob/4ee8e09d8ec7ef8a2b2d96026e80b0bbc7ab59cc/pkg/controllers/disruption/census.go): every ten minutes a sweep simulates every candidate without executing anything and publishes actionable delete/replace counts by NodePool.
+
+The single-node walk's metrics can't answer "how many nodes could consolidate right now" because it stops at its first winner. The census answers it directly, in five minutes of simulation you weren't spending anyway.
+
+Termination accounting got the same treatment. NodeClaim lifetime and termination-duration histograms are now labeled by instance type, capacity type, and cause. The cause distinguishes cloud interruption (stamped via a termination-cause annotation on the claim), the disruption reason the queue recorded, and `never_initialized`.
+
+Lifetime is split by whether the claim came from provisioning or from a disruption replacement, so "how long do replacement nodes live compared to provisioned ones" stopped being a grep question.
 
 ## What the fork actually changed
 
-None of this changes what Karpenter is. The architecture is upstream's, with the same primitives, the same simulate-then-commit split, and the same launch-then-drain ordering. What changes is that each mechanism now survives being multiplied by the size of the fleet it manages.
+None of this changes what Karpenter is. The architecture is upstream's, with the same primitives, the same simulate-then-commit split, and the same launch-then-drain ordering.
+
+What changes is that each mechanism now survives being multiplied by the size of the fleet it manages.
 
 | upstream assumption | what scale does to it | kraftsman's answer |
 |---|---|---|

@@ -12,15 +12,34 @@ tags: [karpenter, kraftsman, kubernetes, spot, gpu, cost]
 > 4. kraftsman: pricing the fleet (this post)
 {: .prompt-info }
 
-[Part 3](/posts/kraftsman-scale/) was about the control loop keeping up. The other thing a GPU fleet does is spend money, and this is where upstream's model shows its assumptions. Karpenter was built to be safe first. A replacement gets priced at its worst-case compatible offering, one node replaces into at most one node, and packing is first-fit. Those are reasonable defaults when instances are cheap and workloads are latency-sensitive. But they leave money on the table in three specific ways on a fleet where a node is eight accelerators and the workloads are durable batch jobs.
+[Part 3](/posts/kraftsman-scale/) was about the control loop keeping up. The other thing a GPU fleet does is spend money, and this is where upstream's model shows its assumptions.
 
-A claim priced at its worst case gets vetoed by the single most expensive zone it might land in, so a spot pool with one spiked zone kills savings available in five others. First-fit packing ignores that growing a claim can cost more than opening a cheaper one. And the 1:1 replacement rule hits the node with the most to save hardest. A fat node running half-empty can never consolidate, because its pods won't fit a single cheaper node.
+Karpenter was built to be safe first. A replacement gets priced at its worst-case compatible offering, one node replaces into at most one node, and packing is first-fit. Those are reasonable defaults when instances are cheap and workloads are latency-sensitive.
+
+But they leave money on the table in three specific ways on a fleet where a node is eight accelerators and the workloads are durable batch jobs.
+
+A claim priced at its worst case gets vetoed by the single most expensive zone it might land in, so a spot pool with one spiked zone kills savings available in five others. First-fit packing ignores that growing a claim can cost more than opening a cheaper one.
+
+And the 1:1 replacement rule hits the node with the most to save hardest. A fat node running half-empty can never consolidate, because its pods won't fit a single cheaper node.
 
 The [kraftsman](https://github.com/exa-labs/kraftsman) changes follow a request through its life: what a claim reserves before it exists, what a pod costs to place, and what a node takes to die.
 
+```text
+  a request's life, and where the fork touches it:
+
+    claim reserves   DaemonSet overhead, charged per realization
+    pod places       first-fit or marginal-cost
+    claim launches   spot-first, deferrable, lease-backed
+    node dies        splits, OD→spot retry, lease reclaim
+```
+
 ## The DaemonSet tax, charged fairly
 
-Part 1 mentioned that every claim reserves the sum of its compatible DaemonSets before a workload pod is even considered. "Compatible" is where the subtlety lives. A NodePool template's requirements are broad (several zones, several label realizations, several instance shapes), and different DaemonSets select different realizations. A GPU device plugin runs on GPU nodes, a TPU plugin on TPU nodes, the CNI agent on everything. No concrete node ever carries both plugins, because no node is both.
+Part 1 mentioned that every claim reserves the sum of its compatible DaemonSets before a workload pod is even considered, and what "compatible" means is where the subtlety lives.
+
+A NodePool template's requirements are broad (several zones, several label realizations, several instance shapes), and different DaemonSets select different realizations. A GPU device plugin runs on GPU nodes, a TPU plugin on TPU nodes, the CNI agent on everything.
+
+No concrete node ever carries both plugins, because no node is both.
 
 Upstream sums every DaemonSet compatible with the broad template, which charges each claim for DaemonSets that can't co-reside. On a pool spanning accelerator classes that's a double tax on every node, and oversized claims are the visible symptom, nodes bought one size up to hold capacity for daemons that were never coming.
 
@@ -37,13 +56,19 @@ upstream charges every claim:     200+500+300 = 1000m   ← a node that can't ex
 realization-aware charges:        max(200+500, 200+300) = 700m per resource
 ```
 
-OR semantics in `nodeSelectorTerms` and absent labels are handled conservatively, so a DaemonSet that might match a realization is charged to it. Past 4,096 realizations it falls back to the old over-reservation rather than blow up. The result is claims sized for daemons that could actually coexist, which on a mixed-accelerator pool is the difference between a node that fits the workload and a node that's one size too big.
+OR semantics in `nodeSelectorTerms` and absent labels are handled conservatively, so a DaemonSet that might match a realization is charged to it. Past 4,096 realizations it falls back to the old over-reservation rather than blow up.
+
+The result is claims sized for daemons that could actually coexist, which on a mixed-accelerator pool is the difference between a node that fits the workload and a node that's one size too big.
 
 ## What a pod costs to place
 
-Provisioning packing is first-fit: a pending pod joins the first in-flight claim that can hold it, and a new claim opens only when nothing fits. That's the right default for bin-packing since it fills claims, but it treats "fits" as the only criterion, and fits isn't free. Growing a claim can force it onto a bigger instance type, and the difference between "fits" and "cheap" is a price nobody computed.
+Provisioning packing is first-fit: a pending pod joins the first in-flight claim that can hold it, and a new claim opens only when nothing fits. That's the right default for bin-packing since it fills claims, but it treats "fits" as the only criterion, and fits isn't free.
 
-The `marginal-cost` packing policy, selected per pool via the `karpenter.sh/nodepool-packing-policy` annotation in [packing.go](https://github.com/exa-labs/kraftsman/blob/4ee8e09d8ec7ef8a2b2d96026e80b0bbc7ab59cc/pkg/controllers/provisioning/scheduling/packing.go), prices every candidate placement. Growing an in-flight claim costs the increase in its cheapest launch price, and opening a new claim costs that claim's cheapest price. The pod goes wherever the delta is smaller, with ties preferring the in-flight claim.
+Growing a claim can force it onto a bigger instance type, and the difference between "fits" and "cheap" is a price nobody computed.
+
+The `marginal-cost` packing policy, selected per pool via the `karpenter.sh/nodepool-packing-policy` annotation in [packing.go](https://github.com/exa-labs/kraftsman/blob/4ee8e09d8ec7ef8a2b2d96026e80b0bbc7ab59cc/pkg/controllers/provisioning/scheduling/packing.go), prices every candidate placement. Growing an in-flight claim costs the increase in its cheapest launch price, and opening a new claim costs that claim's cheapest price.
+
+The pod goes wherever the delta is smaller, with ties preferring the in-flight claim.
 
 ```text
 pod: 8 cpu.  claim-1 is a g5.2xlarge-shaped claim with room.
@@ -56,11 +81,15 @@ pod: 8 cpu.  claim-1 is a g5.2xlarge-shaped claim with room.
   marginal-cost:  pod opens claim-2, $0.17 beats $1.21
 ```
 
-Two degradations keep it predictable: a placement with no priceable options falls back to binpacking rather than splitting arbitrarily, and binpack pools price every move at zero so behavior is untouched unless you opt in. On pools where instance types have big price steps (anything with accelerators), "does the pod fit" stops being the only question worth asking.
+Two degradations keep it predictable: a placement with no priceable options falls back to binpacking rather than splitting arbitrarily, and binpack pools price every move at zero so behavior is untouched unless you opt in.
+
+On pools where instance types have big price steps (anything with accelerators), "does the pod fit" stops being the only question worth asking.
 
 ## The node that couldn't die
 
-Back to Part 2's third gap. Single-node consolidation upstream either deletes a node or replaces it 1:1 with something cheaper. The fat half-empty node, the one holding most of the pool's idle spend, fails both checks: it's not empty, and its pods won't fit one cheaper node. So it stays, pass after pass, the best consolidation target in the fleet and an impossible one.
+Back to Part 2's third gap. Single-node consolidation upstream either deletes a node or replaces it 1:1 with something cheaper.
+
+The fat half-empty node, the one holding most of the pool's idle spend, fails both checks: it's not empty, and its pods won't fit one cheaper node. So it stays, pass after pass, the best consolidation target in the fleet and an impossible one.
 
 Kraftsman's split fallback re-runs the same candidate under a price ceiling. The re-simulation forbids replacement capacity priced at or above the candidate's own price, and the scheduler does what it naturally does: split the pods across several claims that each come in under the ceiling.
 
@@ -74,13 +103,35 @@ split:      ceiling $30 on every new claim
             total $14 < $30, margin ≥ 5%   → REPLACE 1 → 2
 ```
 
-The guardrails are what make it a fallback and not a landmine. It only applies to single-candidate consolidations with at least two reschedulable pods. The replacement count is bounded by `max-consolidation-replacements`, and attempts are capped per pass by `consolidation-split-max-attempts` because each one costs a full simulation. The split also has to beat a minimum savings margin (`consolidation-split-min-savings`, default 5%), so a node doesn't churn into three nodes for pocket change. Budget-exhausted attempts record themselves as inconclusive rather than no-op, so a later pass can try again instead of caching the wrong verdict.
+The guardrails are what make it a fallback and not a landmine. It only applies to single-candidate consolidations with at least two reschedulable pods.
+
+The replacement count is bounded by `max-consolidation-replacements`, and attempts are capped per pass by `consolidation-split-max-attempts` because each one costs a full simulation. The split also has to beat a minimum savings margin (`consolidation-split-min-savings`, default 5%), so a node doesn't churn into three nodes for pocket change.
+
+Budget-exhausted attempts record themselves as inconclusive rather than no-op, so a later pass can try again instead of caching the wrong verdict.
 
 ## When spot is the answer but only in some zones
 
-Part 2's worst-case pricing has a sharper version of the same problem. An on-demand candidate's replacement claim gets priced at its worst compatible offering across every zone the claim allows. One zone where spot spiked past the budget vetoes the whole replacement even when the other five offer real savings.
+Part 2's worst-case pricing has a sharper version of the same problem. An on-demand candidate's replacement claim gets priced at its worst compatible offering across every zone the claim allows.
 
-The OD-to-spot retry in [consolidation.go](https://github.com/exa-labs/kraftsman/blob/4ee8e09d8ec7ef8a2b2d96026e80b0bbc7ab59cc/pkg/controllers/disruption/consolidation.go) re-prices the empty-handed claims: narrow each to spot only and to the zones whose spot offerings beat the budget, then check again. The narrowing is also the guarantee. The launched claim is pinned to those zones and to spot, so the worst case the retry priced is the worst the launch can do. Insufficient spot capacity fails the launch instead of silently falling back to another on-demand node at the price you were trying to leave. It's enabled by default (`OD_TO_SPOT_CONSOLIDATION`) because "the on-demand node stays" is a safe failure and "a spot node appears in a cheap zone" is a common success on a multi-zone pool.
+One zone where spot spiked past the budget vetoes the whole replacement even when the other five offer real savings.
+
+```text
+claim allows zones a..f; priced at the worst compatible offering:
+
+  a  spot $0.51   b  spot $0.47   c  spot $0.62
+  d  spot $0.58   e  spot $0.55   f  spot $1.40  ← one spiked zone
+
+  worst case $1.40 > candidate $1.21     → vetoed, nothing happens
+
+  retry, spot only, zones that beat the budget:
+  a..e  worst case $0.62 < $1.21         → pinned to spot in a..e
+```
+
+The OD-to-spot retry in [consolidation.go](https://github.com/exa-labs/kraftsman/blob/4ee8e09d8ec7ef8a2b2d96026e80b0bbc7ab59cc/pkg/controllers/disruption/consolidation.go) re-prices the empty-handed claims: narrow each to spot only and to the zones whose spot offerings beat the budget, then check again.
+
+The narrowing is also the guarantee. The launched claim is pinned to those zones and to spot, so the worst case the retry priced is the worst the launch can do. Insufficient spot capacity fails the launch instead of silently falling back to another on-demand node at the price you were trying to leave.
+
+It's enabled by default (`OD_TO_SPOT_CONSOLIDATION`) because "the on-demand node stays" is a safe failure and "a spot node appears in a cheap zone" is a common success on a multi-zone pool.
 
 Two related knobs round out the price checks:
 
@@ -89,11 +140,33 @@ Two related knobs round out the price checks:
 
 ## When the cloud can't sell yet
 
-All of the above treats capacity markets as something you query. There's a second mode a spot-heavy provider wants: treat them as something you wait on and probe. Kraftsman adds three hooks in [spotfirst.go](https://github.com/exa-labs/kraftsman/blob/4ee8e09d8ec7ef8a2b2d96026e80b0bbc7ab59cc/pkg/cloudprovider/spotfirst.go) for providers that prefer spot but may temporarily fall back to on-demand:
+All of the above treats capacity markets as something you query. There's a second mode a spot-heavy provider wants: treat them as something you wait on and probe.
+
+Kraftsman adds three hooks in [spotfirst.go](https://github.com/exa-labs/kraftsman/blob/4ee8e09d8ec7ef8a2b2d96026e80b0bbc7ab59cc/pkg/cloudprovider/spotfirst.go) for providers that prefer spot but may temporarily fall back to on-demand:
 
 1. `LaunchDeferredError` lets the provider say "not yet" instead of "failed." A deferred launch requeues on the provider's `RetryAfter` cadence rather than controller backoff, and it doesn't burn the five-minute launch timeout because a deferred request isn't a stuck one.
 2. `WithUnavailableOfferingsIgnored` bypasses the insufficient-capacity cache for chosen capacity types. The ICE cache exists to stop hammering a sold-out market, but a market you stopped probing is a market you can't notice refilling. Structural incompatibilities stay unavailable regardless.
-3. `DriftReasonOnDemandLeaseExpired` is the reclaim path. When the provider falls back to on-demand under a lease, it marks the NodeClaim drifted with this reason once the lease expires. The drift controller sorts those candidates first and pins their replacements to spot, so an insufficient-capacity launch fails the command (and keeps the on-demand node) instead of falling back to another on-demand node. The lease swap is price correction, not template drift, and it gets scheduled like one.
+3. `DriftReasonOnDemandLeaseExpired` is the reclaim path. When the provider falls back to on-demand under a lease, it marks the NodeClaim drifted with this reason once the lease expires. The drift controller sorts those candidates first and pins their replacements to spot, so an insufficient-capacity launch fails the command (and keeps the on-demand node) instead of falling back to another on-demand node.
+
+The lease reclaim path, laid out:
+
+```text
+  spot unavailable at launch
+    │
+    ▼
+  provider falls back to on-demand under a lease
+    │
+    ▼
+  lease expires ──▶ claim marked drifted (OnDemandLeaseExpired)
+    │
+    ▼
+  drift sorts it first, replacement pinned to spot
+    │
+    ├─ spot capacity exists ────▶ swap completes
+    └─ insufficient capacity ───▶ launch fails, on-demand stays
+```
+
+The lease swap is price correction, not template drift, and it gets scheduled like one.
 
 The provider that uses these is Exa-internal. On a spot-first fleet, "temporarily on-demand" is a state the autoscaler should model rather than a fact it should accept.
 
@@ -123,4 +196,6 @@ Put next to upstream, the delta reads as one theme: every place upstream chose t
 | launch fails or succeeds | launch can defer, leases get reclaimed to spot |
 | 5m/15m global timeouts | per-pool registration + initialization timeouts |
 
-The architecture is still Part 1's. Pending pods become claims, claims become instances, a second loop asks whether the fleet could be cheaper, and a queue makes it so. What the fork learned is that the assumptions inside that loop (what a node reserves, what a pod costs to place, what a replacement may become, how long boot can take) were all calibrated for a fleet where compute is cheap. Point the same loop at hardware that isn't, and it turns out the scheduler already knows how to solve the problem. You mostly have to let it see the prices.
+The architecture is still Part 1's. Pending pods become claims, claims become instances, a second loop asks whether the fleet could be cheaper, and a queue makes it so.
+
+What the fork learned is that the assumptions inside that loop (what a node reserves, what a pod costs to place, what a replacement may become, how long boot can take) were all calibrated for a fleet where compute is cheap. Point the same loop at hardware that isn't, and it turns out the scheduler already knows how to solve the problem. You mostly have to let it see the prices.
