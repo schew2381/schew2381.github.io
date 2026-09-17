@@ -84,9 +84,9 @@ candidate node: g5.2xlarge, on-demand, $1.21/hr, running pods {p, q}
      fit anywhere                                      1 node into N)
 ```
 
-A worked pass with real numbers. Six nodes, and the walk reaches node `ip-10-0-1-7`, a $5.67/hr g5.12xlarge running one 4-GPU job.
+A worked pass with real numbers. Six nodes, and the walk reaches node `bar`, a $5.67/hr g5.12xlarge running one 4-GPU job.
 
-The simulation evicts its pod hypothetically and finds it fits on `ip-10-0-2-3`, which has a free GPU nobody's using. Zero new claims, so the command is a plain delete: the node dies, the pod reschedules, and the fleet saves $5.67 an hour for zero new hardware.
+The simulation evicts its pod hypothetically and finds it fits on `foo`, which has a free GPU nobody's using. Zero new claims, so the command is a plain delete: the node dies, the pod reschedules, and the fleet saves $5.67 an hour for zero new hardware.
 
 The next candidate is a $1.21/hr on-demand g5.2xlarge whose pod doesn't fit anywhere. The simulation opens a new claim for it. The cheapest compatible offering is the same instance type on spot at $0.51. One replacement prices below the candidate, so the command is a replace: launch the spot node, wait for it to initialize, then delete the on-demand one.
 
