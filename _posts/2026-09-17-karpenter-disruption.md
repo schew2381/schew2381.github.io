@@ -24,7 +24,7 @@ Let's walk one node through that loop, from candidate to drain.
 
 The [disruption controller](https://github.com/kubernetes-sigs/karpenter/blob/1b4b3e8c829dea93c8a0429e0e27aa68edc98ed7/pkg/controllers/disruption/controller.go) is a singleton reconciler on a ten-second poll. Each pass walks a fixed ladder of methods. For each one it builds that method's candidate set and per-NodePool disruption budgets, then asks it for commands.
 
-Methods run in order, not in parallel, and the pass stops at the first one that returns commands. The rest don't run.
+Methods run in order, not in parallel, and the pass stops at the first one that returns commands without trying the rest.
 
 ```text
 every 10s
