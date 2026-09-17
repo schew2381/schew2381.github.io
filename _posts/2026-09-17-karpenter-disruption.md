@@ -22,7 +22,9 @@ Let's walk one node through that loop, from candidate to drain.
 
 ## The loop and its ladder
 
-The [disruption controller](https://github.com/kubernetes-sigs/karpenter/blob/1b4b3e8c829dea93c8a0429e0e27aa68edc98ed7/pkg/controllers/disruption/controller.go) is a singleton reconciler on a ten-second poll. Each pass builds the candidate set, computes per-NodePool disruption budgets, then hands candidates to a fixed ladder of methods. They're tried in order, not in parallel, and the pass stops at the first method that returns commands. The rest don't run.
+The [disruption controller](https://github.com/kubernetes-sigs/karpenter/blob/1b4b3e8c829dea93c8a0429e0e27aa68edc98ed7/pkg/controllers/disruption/controller.go) is a singleton reconciler on a ten-second poll. Each pass walks a fixed ladder of methods. For each one it builds that method's candidate set and per-NodePool disruption budgets, then asks it for commands.
+
+Methods run in order, not in parallel, and the pass stops at the first one that returns commands. The rest don't run.
 
 ```text
 every 10s
@@ -33,8 +35,8 @@ every 10s
 │  budgets    = per-pool max simultaneous terminations │
 │                                                      │
 │  for each method, in order:                          │
-│    1. Emptiness      nodes with only DaemonSet pods  │
-│    2. StaticDrift    spec replicas changed           │
+│    1. Emptiness      nodes with no evictable pods    │
+│    2. StaticDrift    drift in a replicas-pinned pool │
 │    3. Drift          node no longer matches templates│
 │    4. MultiNode      several nodes → one or none     │
 │    5. SingleNode     one node → one or none          │
@@ -100,7 +102,7 @@ A replacement's price goes the other way: the claim's options get filtered to in
 
 Spot-to-spot moves get extra paranoia on top of that. Swapping one spot node for another is how autoscalers churn.
 
-Upstream gates it behind a feature flag, `SpotToSpotConsolidation`, which is off by default. It also requires at least 15 cheaper instance type options before it'll fire (`MinInstanceTypesForSpotToSpotConsolidation` in [consolidation.go](https://github.com/kubernetes-sigs/karpenter/blob/1b4b3e8c829dea93c8a0429e0e27aa68edc98ed7/pkg/controllers/disruption/consolidation.go)). A spot launch picks among offerings by availability, so a replacement needs enough cheaper types that whichever one actually launches is still a win.
+Upstream gates it behind a feature flag, `SpotToSpotConsolidation`, which is off by default. It also requires at least 15 cheaper instance type options before it'll fire (`MinInstanceTypesForSpotToSpotConsolidation` in [consolidation.go](https://github.com/kubernetes-sigs/karpenter/blob/1b4b3e8c829dea93c8a0429e0e27aa68edc98ed7/pkg/controllers/disruption/consolidation.go)). A spot launch picks among offerings by availability, so a replacement needs enough cheaper types that whichever one actually launches is still a win. The candidate itself must also sit outside those fifteen cheapest, or the swap is just churn.
 
 A pool pinned to a single instance family can never present fifteen cheaper types and stays put.
 
@@ -141,12 +143,12 @@ Steps 2 and 3 are in that order on purpose, and the code comments say why. Swap 
 
 It's the double-launch race, and the ordering is the fix.
 
-The queue then runs the command asynchronously, up to 100 concurrent reconciles with one command per candidate provider ID. A node can only be inside one command at a time.
+The queue then runs the command asynchronously. Concurrency scales with the machine, from 100 reconciles on one core to 1,000 on a large one, with one command per candidate provider ID. A node can only be inside one command at a time.
 
 ```text
   waitOrTerminate loop
     │
-    ├─ every replacement Initialized? ──no──▶ requeue (10s base backoff)
+    ├─ every replacement Initialized? ──no──▶ requeue (1s, backing off to 10s)
     │
     yes
     ▼

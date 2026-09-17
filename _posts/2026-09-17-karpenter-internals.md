@@ -74,7 +74,7 @@ A NodePool is the policy surface. It lists the acceptable instance types and zon
 
 A NodeClaim is where the two meet. Karpenter stamps one per piece of capacity it wants, with the pool's requirements resolved against real pending pods. When the kubelet on the resulting instance registers with the apiserver, the Node object is what shows up, linked back to its claim by the provider ID.
 
-The pair people conflate is NodeClaim and Node. The claim is Karpenter's intent before hardware exists while the Node is the kubelet's presence after it. Everything interesting about lifecycle lives in the gap between them, bridged by matching `spec.providerID` to `node.spec.providerID`.
+The pair people conflate is NodeClaim and Node. The claim is Karpenter's intent before hardware exists while the Node is the kubelet's presence after it. Everything interesting about lifecycle lives in the gap between them, bridged by matching the claim's `status.providerID` to `node.spec.providerID`.
 
 ## One simulator, two loops
 
@@ -117,20 +117,19 @@ batches         └── batch A: {1,2,3} ──┘      └─ batch B: {4,5} 
 
 Batching is the difference between autoscaling and just relaunching pods on nodes. Fifty pods arriving together can share one simulation and land on one right-sized node instead of racing through fifty separate launches. The knobs are `BATCH_IDLE_DURATION` (1s) and `BATCH_MAX_DURATION` (10s) in [options.go](https://github.com/kubernetes-sigs/karpenter/blob/1b4b3e8c829dea93c8a0429e0e27aa68edc98ed7/pkg/operator/options/options.go).
 
-Not every Pending pod joins the batch. `GetProvisionablePods` filters out the ones Karpenter has no business provisioning for:
+Not every Pending pod joins the batch. The entry ticket is a pod kube-scheduler has already tried and marked Unschedulable. `GetProvisionablePods` then drops the ones Karpenter has no business provisioning for:
 
-- DaemonSet pods, which manage their own placement
+- DaemonSet pods and static pods, which manage their own placement
 - pods kube-scheduler already won a preemption for (`status.nominatedNodeName` is set), because they're about to land on capacity that eviction frees
-- pods with a `nodeName` already, or terminal pods
-- pods that fail validation, like one whose PVC topology can't be satisfied
+- pods that already have a `nodeName`
 
-The rest get fed to the simulator.
+The provisioner also validates what's left, rejecting a pod whose PVC topology can't be satisfied or whose selector names a NodePool that doesn't exist. The rest get fed to the simulator.
 
 ## The simulation, walked through
 
 The scheduler's job per batch is a greedy bin-pack with a twist: it can fabricate bins.
 
-Per NodePool it builds a NodeClaimTemplate from the pool's requirements, labels, and taints plus the provider's instance type catalog. Every existing node gets wrapped as an ExistingNode. Then it walks the pod list, sorted by descending resource requests, and each pod tries existing nodes first, then in-flight claims, then a fresh claim.
+Per NodePool it builds a NodeClaimTemplate from the pool's requirements, labels, and taints plus the provider's instance type catalog. Every existing node gets wrapped as an ExistingNode. Then it walks the pod list, sorted by cpu then memory with the largest first, and each pod tries existing nodes first, then in-flight claims, then a fresh claim.
 
 So let's trace three pending pods through one pass. The pool allows three instance types in zones a and b.
 
@@ -190,7 +189,7 @@ Then `provisioner.CreateNodeClaims` writes the objects, and the launch path hand
 
 ## What the cloud provider sells
 
-The whole hardware catalog arrives as data through a small CloudProvider interface: `List`/`Get` instance types, `Create`/`Delete` NodeClaims, and `IsDrifted`.
+The whole hardware catalog arrives as data through a small CloudProvider interface: `GetInstanceTypes` for the catalog, `Create`/`Delete`/`Get`/`List` for NodeClaims, and `IsDrifted`.
 
 An InstanceType is a name, a capacity map, a requirements set, and a list of Offerings. Each offering is the atom of pricing, one (instance type, zone, capacity type) tuple with a price and an availability bit.
 
@@ -240,7 +239,7 @@ A claim that never reaches `Launched` within five minutes is deleted and re-prov
 
 A claim that launches but doesn't register within fifteen minutes is deleted too. The instance exists but the kubelet never showed up, which usually means a bad AMI, a bad bootstrap, or a network partition. The fleet is better off trying again elsewhere.
 
-`Initialized` is the condition that takes the longest in practice, because it's where the slow parts of boot live: image pulls, CNI setup, startup taints draining, and device plugins registering. A GPU pod's node isn't useful until `nvidia.com/gpu` appears in allocatable, and the Initialized condition is what waits for exactly that. Until the claim initializes, the `karpenter.sh/unregistered:NoExecute` taint keeps stray pods from landing on a node the simulation didn't account for.
+`Initialized` is the condition that takes the longest in practice, because it's where the slow parts of boot live: image pulls, CNI setup, startup taints draining, and device plugins registering. A GPU pod's node isn't useful until `nvidia.com/gpu` appears in allocatable, and the Initialized condition is what waits for exactly that. Until the claim registers, the `karpenter.sh/unregistered:NoExecute` taint keeps stray pods off a node the simulation didn't account for. Between registration and initialization the pool's startup taints do the same job.
 
 ## The shadow cluster
 

@@ -14,11 +14,11 @@ tags: [karpenter, kraftsman, kubernetes, spot, gpu, cost]
 
 [Part 3](/posts/kraftsman-scale/) was about the control loop keeping up. The other thing a GPU fleet does is spend money, and this is where upstream's model shows its assumptions.
 
-Karpenter was built to be safe first. A replacement gets priced at its worst-case compatible offering, one node replaces into at most one node, and packing is first-fit. Those are reasonable defaults when instances are cheap and workloads are latency-sensitive.
+Karpenter was built to be safe first. A replacement gets priced at its worst-case compatible offering, one node replaces into at most one node, and packing only asks whether a pod fits. Those are reasonable defaults when instances are cheap and workloads are latency-sensitive.
 
 But they leave money on the table in three specific ways on a fleet where a node is eight accelerators and the workloads are durable batch jobs. A claim priced at its worst case gets vetoed by the single most expensive zone it might land in. A spot pool with one spiked zone loses the savings available in five others.
 
-First-fit packing ignores that growing a claim can cost more than opening a cheaper one. And the 1:1 replacement rule hits the node with the most to save hardest: a fat node running half-empty can never consolidate, because its pods won't fit a single cheaper node.
+Fit-only packing ignores that growing a claim can cost more than opening a cheaper one. And the 1:1 replacement rule hits the node with the most to save hardest: a fat node running half-empty can never consolidate, because its pods won't fit a single cheaper node.
 
 The [kraftsman](https://github.com/exa-labs/kraftsman) changes follow a request through its life: what a claim reserves before it exists, what a pod costs to place, and what a node takes to die.
 
@@ -26,7 +26,7 @@ The [kraftsman](https://github.com/exa-labs/kraftsman) changes follow a request 
   a request's life, and where the fork touches it:
 
     claim reserves   DaemonSet overhead, charged per realization
-    pod places       first-fit or marginal-cost
+    pod places       fit-only or marginal-cost
     claim launches   spot-first, deferrable, lease-backed
     node dies        splits, OD→spot retry, lease reclaim
 ```
@@ -37,7 +37,7 @@ The [kraftsman](https://github.com/exa-labs/kraftsman) changes follow a request 
 
 A NodePool template's requirements are broad: several zones, several label realizations, several instance shapes. Different DaemonSets select different realizations. A GPU device plugin runs on GPU nodes, a TPU plugin on TPU nodes, the CNI agent on everything. No concrete node ever carries both plugins, because no node is both.
 
-Upstream sums every DaemonSet compatible with the broad template, which charges each claim for DaemonSets that can't co-reside. On a pool spanning accelerator classes that's a double tax on every node. The visible symptom is oversized claims: nodes bought one size up to hold capacity for daemons that were never coming.
+Upstream checks a DaemonSet's compatibility against the instance type's labels only. A selector on a label the instance type doesn't carry (a zone, a custom accelerator label) counts as compatible, so every such DaemonSet gets summed into the claim, including ones that can't co-reside. On a pool spanning accelerator classes that's a double tax on every node. The visible symptom is oversized claims: nodes bought one size up to hold capacity for daemons that were never coming.
 
 Kraftsman's [daemonoverhead.go](https://github.com/exa-labs/kraftsman/blob/4ee8e09d8ec7ef8a2b2d96026e80b0bbc7ab59cc/pkg/controllers/provisioning/scheduling/daemonoverhead.go) instead enumerates the label realizations where DaemonSets disagree. It sums the DaemonSet requests within each realization and charges the element-wise maximum across them.
 
@@ -58,11 +58,11 @@ The result is claims sized for daemons that could actually coexist. On a mixed-a
 
 ## What a pod costs to place
 
-Provisioning packing is first-fit: a pending pod joins the first in-flight claim that can hold it, and a new claim opens only when nothing fits. That's the right default for bin-packing since it fills claims, but "fits" is the only criterion it checks and fitting isn't free.
+Provisioning packing is fit-only: a pending pod joins the least-loaded in-flight claim that can hold it, and a new claim opens only when nothing fits. That's the right default for bin-packing since it fills claims, but "fits" is the only criterion it checks and fitting isn't free.
 
 Growing a claim can force it onto a bigger instance type. The difference between "fits" and "cheap" is a price nobody computed.
 
-The `marginal-cost` packing policy, selected per pool via the `karpenter.sh/nodepool-packing-policy` annotation in [packing.go](https://github.com/exa-labs/kraftsman/blob/4ee8e09d8ec7ef8a2b2d96026e80b0bbc7ab59cc/pkg/controllers/provisioning/scheduling/packing.go), prices every candidate placement.
+The `marginal-cost` packing policy, selected per pool via the `karpenter.sh/nodeclaim-packing-policy` annotation in [packing.go](https://github.com/exa-labs/kraftsman/blob/4ee8e09d8ec7ef8a2b2d96026e80b0bbc7ab59cc/pkg/controllers/provisioning/scheduling/packing.go), prices every candidate placement.
 
 Growing an in-flight claim costs the increase in its cheapest launch price. Opening a new claim costs that claim's cheapest price. The pod goes wherever the delta is smaller, with ties preferring the in-flight claim.
 
@@ -101,7 +101,7 @@ split:      ceiling $30 on every new claim
 
 The guardrails are what make it a fallback and not a landmine: it only applies to single-candidate consolidations with at least two reschedulable pods.
 
-The replacement count is bounded by `max-consolidation-replacements`. Attempts are also capped per pass by `consolidation-split-max-attempts`, because each one costs a full simulation. The split also has to beat a minimum savings margin (`consolidation-split-min-savings`, default 5%), so a node doesn't churn into three nodes for pocket change.
+The replacement count is bounded by `max-consolidation-replacements`, which defaults to one. That makes the split doubly opt-in: set `CONSOLIDATION_SPLIT_FALLBACK=true` and raise the bound. Attempts are also capped per pass by `consolidation-split-max-attempts`, because each one costs a full simulation. The split also has to beat a minimum savings margin (`consolidation-split-min-savings`, default 5%), so a node doesn't churn into three nodes for pocket change.
 
 Budget-exhausted attempts record themselves as inconclusive rather than no-op, so a later pass can try again instead of caching the wrong verdict.
 
@@ -136,7 +136,7 @@ Two related knobs round out the price checks:
 
 All of the above treats capacity markets as something you query. There's a second mode a spot-heavy provider wants: treat them as something you wait on and probe. Kraftsman adds three hooks in [spotfirst.go](https://github.com/exa-labs/kraftsman/blob/4ee8e09d8ec7ef8a2b2d96026e80b0bbc7ab59cc/pkg/cloudprovider/spotfirst.go) for providers that prefer spot but may temporarily fall back to on-demand:
 
-1. `LaunchDeferredError` lets the provider say "not yet" instead of "failed." A deferred launch requeues on the provider's `RetryAfter` cadence rather than controller backoff. It also doesn't burn the five-minute launch timeout, because a deferred request isn't a stuck one.
+1. `LaunchDeferredError` lets the provider say "not yet" instead of "failed." A deferred launch requeues on the provider's `RetryAfter` cadence rather than controller backoff. The deferral isn't counted as a failure, though the five-minute launch clock keeps running from claim creation.
 2. `WithUnavailableOfferingsIgnored` bypasses the insufficient-capacity cache for chosen capacity types. The ICE cache exists to stop hammering a sold-out market, but a market you stopped probing is a market you can't notice refilling. Structural incompatibilities stay unavailable regardless.
 3. `DriftReasonOnDemandLeaseExpired` is the reclaim path. When the provider falls back to on-demand under a lease, it marks the NodeClaim drifted with this reason once the lease expires. The drift controller sorts those candidates first and pins their replacements to spot. An insufficient-capacity launch then fails the command (and keeps the on-demand node) instead of falling back to another on-demand node.
 
@@ -162,10 +162,10 @@ The lease swap is price correction rather than template drift, and it gets sched
 
 ## The lifecycle edges a self-managed fleet hits
 
-Upstream's two timeouts (five minutes to launch, fifteen to register) assume launch providers and boot times from a managed-node world. The fork's fleet boots things that violate both. Two of the timeouts became configurable and a third one got added.
+Upstream's two timeouts (five minutes to launch, fifteen to register) assume launch providers and boot times from a managed-node world. The fork's fleet boots things that violate both. The registration timeout became configurable per pool and a third, opt-in timeout got added.
 
 - `karpenter.sh/nodeclaim-registration-timeout` on a NodePool overrides the fifteen-minute registration budget per pool. Some accelerator capacity legitimately takes fifteen to twenty-five minutes from insert to kubelet. The upstream default deletes those claims mid-boot, replacing a slow node with a fresh timeout forever.
-- `NODECLAIM_INITIALIZATION_TIMEOUT` covers the gap after registration. A node can register and then never initialize: startup taints never clear, extended resources never appear. Upstream keeps it forever: an instance billing full price, running no workload, and distorting every simulation that models its phantom capacity. The timeout deletes it like the others. It's measured from registration rather than creation, so the clock only starts once boot could plausibly have finished.
+- `NODECLAIM_INITIALIZATION_TIMEOUT` covers the gap after registration. A node can register and then never initialize: startup taints never clear, extended resources never appear. Upstream keeps it forever: an instance billing full price, running no workload, and distorting every simulation that models its phantom capacity. The timeout deletes it like the others. It's a fleet-wide setting, off unless you set it, and measured from registration rather than creation so the clock only starts once boot could plausibly have finished.
 - The garbage collector reclaims claims that launched but never registered, once the instance has verifiably vanished. That covers a spot preemption during boot or an insert that failed after being accepted. A five-minute grace period covers the provider's list-after-create consistency window first. Upstream holds those claims until the registration timeout, holding their pending pods hostage the whole time.
 - And the inverse leak: a kubelet that registers after its claim was already being deleted creates a Node with no owner reference and no termination finalizer. On a managed cloud the cloud-controller-manager reaps it when the instance disappears. On a self-managed one nothing does, so it sits NotReady forever. The lifecycle controller deletes those nodes once the provider confirms the instance is gone.
 
@@ -178,13 +178,13 @@ Put next to upstream, the delta reads as one theme: every place upstream chose t
 | upstream | kraftsman |
 |---|---|
 | daemonset tax = sum of everything compatible | element-wise max across realizations |
-| first-fit packing | per-pool marginal-cost pricing |
+| fit-only packing | per-pool marginal-cost pricing |
 | replace 1:1 or delete | bounded 1→N splits with a savings floor |
 | worst-case price vetoes the claim | re-price spot-only in the cheap zones |
 | spot-to-spot needs 15 cheaper types | configurable floor, launch capped to priced set |
 | any cheaper replacement wins | minimum savings margins |
 | launch fails or succeeds | launch can defer, leases get reclaimed to spot |
-| 5m/15m global timeouts | per-pool registration + initialization timeouts |
+| 5m/15m global timeouts | per-pool registration timeout, opt-in initialization timeout |
 
 The architecture is still [Part 1](/posts/karpenter-internals/)'s. Pending pods become claims, claims become instances, a second loop asks whether the fleet could be cheaper, and a queue makes it so.
 

@@ -41,7 +41,7 @@ Multiply the per-candidate cost by a few hundred candidates inside a three-minut
 
 There's a second leak on top. A disruption simulation schedules the whole pending backlog alongside the candidate's pods, because that's the right model of what competes for capacity.
 
-But upstream then treats every NodeClaim the simulation opened as the command's replacements, launching them, waiting on them, and pricing them against the candidate. When the backlog holds thousands of pods the provisioner is already handling, a single-node command ends up responsible for a hundred claims it never wanted, all priced against the one it did.
+But upstream then treats every NodeClaim the simulation opened as the command's replacements. For consolidation, more than one replacement means the command is thrown away as a no-op. For drift, the command launches and waits on all of them. When the backlog holds thousands of pods the provisioner is already handling, a consolidation candidate never passes and a drift command ends up responsible for a hundred claims it never wanted.
 
 The code comment in [helpers.go](https://github.com/exa-labs/kraftsman/blob/4ee8e09d8ec7ef8a2b2d96026e80b0bbc7ab59cc/pkg/controllers/disruption/helpers.go) tracks the result on the production fleet. The `multiple_replacements_required` skip rate per evaluated candidate ran near zero below 100 pending pods, hit 0.045 at 2,049, and 0.222 at 2,781.
 
@@ -96,9 +96,9 @@ A pod that can't open a claim in any simulation only costs money to simulate, an
 
 ## Surviving the timeout
 
-Sharing fixes the per-candidate cost. The next problem is what happens when even a cheaper walk can't finish. Upstream, a timed-out pass throws away its position and the next pass restarts at the head of the sorted list.
+Sharing fixes the per-candidate cost. The next problem is what happens when even a cheaper walk can't finish. Upstream, a timed-out pass remembers which NodePools it never reached and puts them first next time, but inside a pool the next pass restarts at the head of the sorted list.
 
-The head is always the juiciest-looking candidates, so a starving walk re-evaluates the same few every ten seconds while the tail is never reached. Kraftsman calls the fix the coverage cycle.
+The head is always the juiciest-looking candidates, so a starving walk re-evaluates the same few every ten seconds while a big pool's tail is never reached. Kraftsman's coverage cycle takes upstream's per-pool memory down to the per-candidate level.
 
 ```text
 upstream:   pass1 [A B C D |timeout| E F G]   pass2 [A B C D |timeout| E F G]   … E,F,G never seen
@@ -113,7 +113,7 @@ Alongside it, a per-candidate simulation budget (`consolidation-candidate-timeou
 
 ## Remembering no-ops
 
-The most common outcome of a consolidation simulation is nothing. The candidate's pods don't fit cheaper, the command is a no-op, and the same verdict gets recomputed next pass. Kraftsman's [negative result cache](https://github.com/exa-labs/kraftsman/blob/4ee8e09d8ec7ef8a2b2d96026e80b0bbc7ab59cc/pkg/controllers/disruption/negativeresultcache.go) stores those verdicts keyed by a fingerprint of everything the verdict could depend on.
+The most common outcome of a consolidation simulation is nothing. The candidate's pods don't fit cheaper, the command is a no-op, and the same verdict gets recomputed next pass. Kraftsman's [negative result cache](https://github.com/exa-labs/kraftsman/blob/4ee8e09d8ec7ef8a2b2d96026e80b0bbc7ab59cc/pkg/controllers/disruption/negativeresultcache.go) stores those verdicts keyed by a fingerprint of everything the verdict could depend on. Skipping on a hit is opt-in (`consolidation-skip-unchanged-negatives`, off by default), so the cache can run in observe-only mode and report its hit rate before it's trusted to skip anything.
 
 ```text
   candidate simulates to no-op
@@ -122,6 +122,7 @@ The most common outcome of a consolidation simulation is nothing. The candidate'
   fingerprint = node resource version + claim resource version
               + NodePool UID & generation + instance-type revision
               + UIDs & versions of every pod that would move
+              + every ready NodePool's UID, generation & revision
     │
     ▼
   next pass on same candidate
@@ -136,7 +137,7 @@ Two properties make it safe rather than clever:
 1. Only no-ops are cached. A stale entry can delay a consolidation, never cause a wrong one, and a fingerprint that can't be built fails closed with no skip.
 2. The TTL (default five minutes) bounds what the fingerprint can't see. Spot prices and transient offerings aren't fingerprinted, so a verdict is only trusted for as long as "the fleet didn't change underneath it" is plausible. Any command completing through the disruption queue (from any method, since it might free capacity a cached verdict was computed without) clears the cache entirely.
 
-A pass that skipped candidates on cache hits deliberately can't mark the fleet consolidated, because expiry only runs when a pass looks entries up.
+A pass that skipped candidates on cache hits can't mark the fleet consolidated, since it didn't actually look at everything. Expiry runs inside the pass too, on lookup and in a sweep at the end, never in the background.
 
 ## More than one command per pass
 
@@ -183,7 +184,6 @@ A drift command no longer waits on a hundred claims the backlog spawned. Consoli
 Several smaller bugs only become visible at this scale. The fork fixes them where it found them:
 
 - `IsPreempting` treats `nominatedNodeName` as "kube-scheduler already freed capacity for this pod," so the pod is skipped for provisioning. Volcano sets the same field on gang members stuck behind an unmet `minAvailable` and never clears it. Karpenter saw nominated pods, provisioned nothing, and partially-satisfiable gangs starved forever. Volcano-scheduled pods no longer count as preempting.
-- An unnarrowed `Exists` requirement got resolved to a random invented value, stamping labels like `efa=1490613278757040451` on nodes that match nothing selecting on a real value. Unnarrowed `Exists` now leaves the label unset.
 - Domain groups were seeded with every domain any NodePool could supply. A pod pinned to one pool then computed its `DoNotSchedule` spread against zero-pod domains only other pools offered. The result was a permanently unsatisfiable spread that blocked drift and consolidation replacements. Domains now track which pool can supply them, and pods only count domains they can reach.
 - The queue reconciled by fetching the candidate NodeClaim named in the request and looking its command up by provider ID. A candidate deleted out from under an in-flight command (spot preemption, GC, an operator) left the command unable to terminate its remaining candidates or untaint them. The queue now resolves requests against its own bookkeeping by candidate name.
 
