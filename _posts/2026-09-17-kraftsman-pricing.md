@@ -1,6 +1,6 @@
 ---
 title: "(Pt. 4) kraftsman: pricing the fleet"
-date: 2026-09-17 10:30:00 -0700
+date: 2026-09-17 03:00:00 -0700
 categories: [kubernetes, internals]
 tags: [karpenter, kraftsman, kubernetes, spot, gpu, cost]
 ---

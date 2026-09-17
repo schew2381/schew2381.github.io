@@ -1,6 +1,6 @@
 ---
 title: "(Pt. 1) karpenter: how a pending pod becomes a node"
-date: 2026-09-17 09:00:00 -0700
+date: 2026-09-17 01:30:00 -0700
 categories: [kubernetes, internals]
 tags: [karpenter, kubernetes, autoscaling, scheduling, spot]
 ---

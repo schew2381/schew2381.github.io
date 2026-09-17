@@ -1,6 +1,6 @@
 ---
 title: "(Pt. 2) karpenter: how a node earns its deletion"
-date: 2026-09-17 09:30:00 -0700
+date: 2026-09-17 02:00:00 -0700
 categories: [kubernetes, internals]
 tags: [karpenter, kubernetes, autoscaling, spot, consolidation]
 ---

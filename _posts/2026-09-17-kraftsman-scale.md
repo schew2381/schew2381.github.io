@@ -1,6 +1,6 @@
 ---
 title: "(Pt. 3) kraftsman: when the control loop is the bottleneck"
-date: 2026-09-17 10:00:00 -0700
+date: 2026-09-17 02:30:00 -0700
 categories: [kubernetes, internals]
 tags: [karpenter, kraftsman, kubernetes, autoscaling, performance]
 ---
