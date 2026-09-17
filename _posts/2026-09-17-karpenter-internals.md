@@ -79,15 +79,19 @@ The pair people conflate is NodeClaim and Node. The claim is Karpenter's intent 
 ## One simulator, two loops
 
 ```text
-  KUBE-SCHEDULER                  KARPENTER'S SCHEDULER
+  KUBE-SCHEDULER                   KARPENTER'S SCHEDULER
 
-  pod pending?                    pod pending?
-       │                               │
-  nodes that exist               nodes that exist
-       │                           + nodes that could exist
-       ▼                               │
-  pick one, bind the pod               ▼
-                                 pick shapes, create claims
+  pod pending?                     provisioner           disruption
+       │                           pod pending,          pretend a node
+  nodes that exist                 what node fits it?    is gone, where do
+       │                                  │              its pods land?
+       ▼                                  ▼                     │
+  pick one, bind the pod           create claims                ▼
+                                   (adds capacity)       delete or replace
+                                                         (removes capacity)
+
+                                   both run the same fit simulation
+                                   over nodes that exist + could exist
 ```
 
 Two consequences follow from putting the intelligence in a shared simulator rather than in either loop.
