@@ -22,7 +22,7 @@ Let's walk one node through that loop, from candidate to drain.
 
 ## The loop and its ladder
 
-The [disruption controller](https://github.com/kubernetes-sigs/karpenter/blob/1b4b3e8c829dea93c8a0429e0e27aa68edc98ed7/pkg/controllers/disruption/controller.go) is a singleton reconciler on a ten-second poll. Each pass builds the candidate set, computes per-NodePool disruption budgets, then hands candidates to a fixed ladder of methods. Each method either returns commands to execute or passes, and the first method to return commands wins.
+The [disruption controller](https://github.com/kubernetes-sigs/karpenter/blob/1b4b3e8c829dea93c8a0429e0e27aa68edc98ed7/pkg/controllers/disruption/controller.go) is a singleton reconciler on a ten-second poll. Each pass builds the candidate set, computes per-NodePool disruption budgets, then hands candidates to a fixed ladder of methods. They're tried in order, not in parallel, and the pass stops at the first method that returns commands. The rest don't run.
 
 ```text
 every 10s
@@ -39,7 +39,7 @@ every 10s
 │    4. MultiNode      several nodes → one or none     │
 │    5. SingleNode     one node → one or none          │
 │                                                      │
-│  first method returning commands wins                │
+│  stop at first method that returns commands          │
 └──────────────────────────────────────────────────────┘
     │
     ▼
