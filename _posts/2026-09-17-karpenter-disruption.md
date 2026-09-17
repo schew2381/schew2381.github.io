@@ -16,7 +16,7 @@ tags: [karpenter, kubernetes, autoscaling, spot, consolidation]
 
 But placement is frozen the moment a pod binds. Jobs finish, spot prices move, reservations free up, and a node bought under yesterday's constraints just sits there costing list price. Nothing in the provisioning loop can see any of that, because none of it produces a pending pod.
 
-So what moves a running pod? Nothing does, directly. A second control loop takes the cheaper route. Every ten seconds it asks of every node whether its pods could run somewhere else for less money. If the answer is yes it deletes the node and lets the pods land wherever the simulation put them.
+Nothing moves a running pod directly, so a second control loop takes the cheaper route. Every ten seconds it asks of every node whether its pods could run somewhere else for less money. If the answer is yes it deletes the node and lets the pods land wherever the simulation put them.
 
 Let's walk one node through that loop, from candidate to drain.
 
@@ -63,7 +63,7 @@ One name to correct while we're here: the disruption reason is `Underutilized`, 
 
 ## The simulation, run backwards
 
-[Part 1](/posts/karpenter-internals/)'s scheduler matched pods to claims that don't exist yet. Consolidation runs the same machine in the other direction: pick a candidate, pretend it's gone, and replay its pods through `SimulateScheduling` against the rest of the fleet. Three outcomes are possible.
+[Part 1](/posts/karpenter-internals/)'s scheduler matched pods to claims that don't exist yet. Consolidation runs the same machine in the other direction: it picks a candidate, pretends it's gone, and replays its pods through `SimulateScheduling` against the rest of the fleet. Three outcomes are possible.
 
 ```text
 candidate node: g5.2xlarge, on-demand, $1.21/hr, running pods {p, q}
@@ -86,19 +86,21 @@ A worked pass with real numbers. Six nodes, and the walk reaches node `ip-10-0-1
 
 The simulation evicts its pod hypothetically and finds it fits on `ip-10-0-2-3`, which has a free GPU nobody's using. Zero new claims, so the command is a plain delete: the node dies, the pod reschedules, and the fleet saves $5.67 an hour for zero new hardware.
 
-The next candidate is a $1.21/hr on-demand g5.2xlarge whose pod doesn't fit anywhere. The simulation opens a new claim for it, and the cheapest compatible offering is the same instance type on spot at $0.51. One replacement priced below the candidate, so the command is a replace: launch the spot node, wait for it to initialize, then delete the on-demand one.
+The next candidate is a $1.21/hr on-demand g5.2xlarge whose pod doesn't fit anywhere. The simulation opens a new claim for it. The cheapest compatible offering is the same instance type on spot at $0.51. One replacement prices below the candidate, so the command is a replace: launch the spot node, wait for it to initialize, then delete the on-demand one.
 
 Both checks share the same spine: all pods must land somewhere, and any new capacity must price below what's being removed. A candidate that fails either check produces nothing, and the walk moves on.
 
 ## What "cheaper" means
 
-A candidate's price isn't its list price. `resolveNodePrice` looks up the offering matching the node's actual zone and capacity type, so a node that launched spot in zone b gets compared against its real $0.47 rather than the $1.21 it would cost on-demand.
+A candidate's price isn't its list price. `resolveNodePrice` looks up the offering matching the node's actual zone and capacity type. A node that launched spot in zone b gets compared against its real $0.47 rather than the $1.21 it would cost on-demand.
 
 A replacement's price goes the other way: the claim's options get filtered to instance types whose *worst-case* compatible offering still beats the candidate. A claim that might launch somewhere expensive can't be trusted to save money.
 
 Spot-to-spot moves get extra paranoia on top of that. Swapping one spot node for another is how autoscalers churn.
 
-Upstream gates it behind a feature flag, `SpotToSpotConsolidation`, which is off by default, and requires at least 15 cheaper instance type options before it'll fire (`MinInstanceTypesForSpotToSpotConsolidation` in [consolidation.go](https://github.com/kubernetes-sigs/karpenter/blob/1b4b3e8c829dea93c8a0429e0e27aa68edc98ed7/pkg/controllers/disruption/consolidation.go)). A spot launch picks among offerings by availability, so a replacement needs enough cheaper types that whichever one actually launches is still a win. A pool pinned to a single instance family can never present fifteen cheaper types and stays put.
+Upstream gates it behind a feature flag, `SpotToSpotConsolidation`, which is off by default. It also requires at least 15 cheaper instance type options before it'll fire (`MinInstanceTypesForSpotToSpotConsolidation` in [consolidation.go](https://github.com/kubernetes-sigs/karpenter/blob/1b4b3e8c829dea93c8a0429e0e27aa68edc98ed7/pkg/controllers/disruption/consolidation.go)). A spot launch picks among offerings by availability, so a replacement needs enough cheaper types that whichever one actually launches is still a win.
+
+A pool pinned to a single instance family can never present fifteen cheaper types and stays put.
 
 And before any of that, candidates get sorted by `SavingsRatio` (node price divided by rescheduling disruption cost) descending. The walk goes after the most savings per unit of eviction pain first, which usually means expensive nodes running few pods rather than small cheap ones. [Part 3](/posts/kraftsman-scale/) is about what happens when that walk can't finish.
 
@@ -137,7 +139,7 @@ Steps 2 and 3 are in that order on purpose, and the code comments say why. Swap 
 
 It's the double-launch race, and the ordering is the fix.
 
-The queue then runs the command asynchronously, up to 100 concurrent reconciles with one command per candidate provider ID, so a node can only be in one command at a time.
+The queue then runs the command asynchronously, up to 100 concurrent reconciles with one command per candidate provider ID. A node can only be inside one command at a time.
 
 ```text
   waitOrTerminate loop
@@ -152,7 +154,7 @@ The queue then runs the command asynchronously, up to 100 concurrent reconciles 
   termination controller: drain nodes, delete instances, remove finalizers
 ```
 
-Waiting for `Initialized` is the safety property. The old node doesn't die until the new one has proven it can run pods, meaning Ready with its resources accounted for rather than merely launched or registered. On a GPU pool that means waiting for the device plugin to register `nvidia.com/gpu`, which is exactly the checkpoint you want before evicting a training job.
+Waiting for `Initialized` is the safety property. The old node doesn't die until the new one has proven it can run pods, meaning Ready with its resources accounted for rather than merely launched or registered. On a GPU pool that means waiting for the device plugin to register `nvidia.com/gpu`. That's exactly the checkpoint you want before evicting a training job.
 
 ## Validation, or the cluster moved under us
 
@@ -173,7 +175,7 @@ A rejected command costs one pass. An executed command computed against a cluste
 
 Commands can die at every stage, and each failure has a defined cleanup. A replacement that never initializes turns the wait into a timeout after `maxRetryDuration` (scaled by queue depth).
 
-An unrecoverable failure (a deleted replacement, an expired deadline) triggers rollback. Candidates get untainted, the disruption reason condition clears, cluster state unmarks them for deletion, and the command's provider ID mappings drop so the nodes can be re-evaluated by a later pass. Failed launches get counted in `DisruptionQueueFailuresTotal` so you can watch the queue's health as a metric rather than a log line.
+An unrecoverable failure (a deleted replacement, an expired deadline) triggers rollback. Candidates get untainted, the disruption reason condition clears, and cluster state unmarks them for deletion. The command's provider ID mappings drop so the nodes can be re-evaluated by a later pass. Failed launches get counted in `DisruptionQueueFailuresTotal` so you can watch the queue's health as a metric rather than a log line.
 
 ## What this costs you
 
